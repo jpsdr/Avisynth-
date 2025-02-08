@@ -36,7 +36,8 @@
 #include <avisynth.h>
 #include <avs/win.h>
 
-#include <streams.h>
+//#include <streams.h>
+#include <../../../../Visual_2019/AviSynth/Deps/DSS/include/streams.h>
 #include <stdio.h>
 
 

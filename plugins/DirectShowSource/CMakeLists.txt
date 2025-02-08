@@ -4,15 +4,15 @@ set(PluginName "DirectShowSource")
 set(ProjectName "Plugin${PluginName}")
 
 # Sensible defaults that should just work if WINSDK is installed and baseclasses built
-set(DEFAULT_BASECLASSES_PATH "C:/Program Files/Microsoft SDKs/Windows/v7.1/Samples/multimedia/directshow/baseclasses")
+set(DEFAULT_BASECLASSES_PATH "F:/PRG/Visual_2019/AviSynth")
 if(CMAKE_SIZEOF_VOID_P EQUAL 4) # 32-bit
-  set(DEFAULT_BASECLASSES_LIB "${DEFAULT_BASECLASSES_PATH}/Release_MBCS/strmbase.lib")
+  set(DEFAULT_BASECLASSES_LIB "${DEFAULT_BASECLASSES_PATH}/Deps/DSS/lib/x86/strmbase.lib")
 else() # 64-bit
-  set(DEFAULT_BASECLASSES_LIB "${DEFAULT_BASECLASSES_PATH}/x64/Release_MBCS/strmbase.lib")
+  set(DEFAULT_BASECLASSES_LIB "${DEFAULT_BASECLASSES_PATH}/Deps/DSS/lib/x64/strmbase.lib")
 endif()
 
 # We need these variables set by the user to compile successfully
-set(DSHOWSRC_BASECLASSES_PATH "${DEFAULT_BASECLASSES_PATH}" CACHE STRING   "Folder path to the DirectShow example baseclasses.")
+set(DSHOWSRC_BASECLASSES_PATH "${DEFAULT_BASECLASSES_PATH}/DSS_Baseclasses/Build" CACHE STRING   "Folder path to the DirectShow example baseclasses.")
 set(DSHOWSRC_BASECLASSES_LIB  "${DEFAULT_BASECLASSES_LIB}"  CACHE FILEPATH "File path to the DirectShow example baseclasses precompiled static library ('strmbase.lib').")
 
 # Create library
