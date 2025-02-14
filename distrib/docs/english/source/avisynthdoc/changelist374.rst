@@ -32,33 +32,35 @@ Additions, changes
     Integer decimal constants are automatically promoted to 64 bit double if they do not even fit into a 64 bit long.
     (But values stored as 'only' integers behave as 64 bit long in math operations).
   - New syntax element ``L`` (or ``l``) suffix for hexadecimal constants for interpreting 64 bit data (``$800000001010L``)
+    Hexadecimal literals without L suffix still remain 32 bit integers. This ensures compatibility so that 
+    color constants exceeding $7FFFFFFF (such as $FFFFFFFF) are still interpreted as 32-bit 
+    integers and not as 64-bit long integers.
   - Floating point constants (literals) stored as 64 bit double (formerly only with 32 bit float precision)
-    otherwise the constant remains 32 bit integer. (Compatibility: otherwise color constants 
-    over ``$7FFFFFFF`` (like ``$FFFFFFFF``) would all turn into 64 bit long instead of integer)
   - ``IsInt()`` returns true for any 32 or 64 bit integer
-  - ``IsLong()`` returns true only if underlying variable is long (64 bit integer)
+  - ``IsLongStrict()`` returns true only if underlying variable is long (64 bit integer)
   - ``IsFloat()`` returns true for any 32 or 64 bit floating point content (float or double and for any integers - as before)
-  - ``IsFloatF()`` returns true only if value is _not_ double.
-  - ``Float()`` by default casts to double. In case of the integer input is in +/-16777216 range, it casts to 32 bit float.
-    (fits into float without precision loss).
-    If the original value is already a floating point value, its type will remain untouched (no automatic float->double conversion).
+  - ``IsFloatfStrict()`` returns true only if value is exactly a 32 bit single-precision float.
+  - ``Float()`` by default casts to double, but 32-bit floating point numbers are kept in 32-bit float format 
+    (no automatic float-to-double conversion).
   - New ``Double()`` converts always to 64 bit double
   - New ``Floatf()`` converts always to 32 bit float
   - New ``Long()`` converts always to 64 bit long
   - New ``IntI()`` converts always to 32 bit integer
   - Function ``Pi`` returns real double precision constant.
-  - ``VersionNumber()`` still returns 32 bit float, but the exact value is adjusted a bit for compatibility reasons, because the script 
-    constant ``2.6`` is stored in double precision which makes troubles if compared to a 32 bit float version of 2.6.
-    E.g. to have 2.6 (double) >= 2.6f (float) in order not to break scripts which contain ``IsAvs26 = VersionNumber() >= 2.6``.
+  - ``VersionNumber()`` still returns a 32-bit float, but the exact value is adjusted slightly for compatibility 
+    reasons. This is because the script constant 2.6 is now stored in 64-bit double precision, which can cause issues when 
+    compared to a 32-bit float version of 2.6. For example, to ensure 2.6 (double) >= 2.6f (float) and 
+    avoid breaking scripts that contain ``IsAvs26 = VersionNumber() >= 2.6`` .
   - Floating point mathematical functions (``Sin``, etc..) return double precision results.
   - Floating point arithmetic (addition, subtraction, multiplication, division) uses double precision, except when both operands
     are 32-bit floats, in which case the result is also a 32-bit float. 
     (32-bit float / 32-bit float results in a 32-bit float)
-  - Integer mathematical operation operate on 64 bit data. When result is within a 
-    32 bit integer range, it is technically stored as 32 bit integer, which is automatically promoted to 64 bit long if needed.
+  - Integer mathematical operation operate on 64 bit data. 
+    When result is within a 32 bit integer range, it is stored as 32 bit integer internally, which is 
+    automatically promoted to 64 bit long if needed.
   - ``For``-loops are using 64 bit integer for initial value, step and end-value.
   - ``Animate``: using 64 bit precision inside.
-  - ``Bit-related`` functions now have distinctly named 64-bit integer versions, while the old ones continue to work with plain integers.
+  - ``Bit-related`` functions now have distinctly named 64-bit integer versions, while the old ones continue to work with plain 32-bit integers.
   
     - ``BitAnd64``, ``BitNot64``, ``BitOr64``, ``BitXor64``,
     - ``bitshl64``, ``bitsal64``: shift left (providing two versions; though arithmetic and logical is the same)
@@ -68,7 +70,7 @@ Additions, changes
     - ``bitsetcount64`` counts the set bits (or sum of set bits) of one or more parameter values.
   - New: ``HexValue64()`` for 64-bit long result. The original ``HexValue()`` keeps returning 32 bit integer 
     so ``HexValue("FFFFFFFF")`` is still ``-1``, but ``HexValue64("FFFFFFFF")`` will be ``4294967295`` (64 bit number)
-  - Integer and float frame property read and writes work on real 64 bit integers and float.
+  - Integer and float frame property read and writes work on real 64 bit integers and doubles.
   - Formatting functions (``String()``, etc.) to 64 bit data type aware.
   - ``AudioLength()`` now returns 64 bit integer
   - ``AudioLengthF()`` returns data to double instead of 32 bit float (though it's now useless and still can lose precision).
@@ -113,10 +115,16 @@ Build environment, Interface
 
 Bugfixes
 ~~~~~~~~
+- Fix: ScriptClip and other runtime functions / frame prop read would crash if called from Avs2.5 or Pre-v11 C 
+  IScriptEnvironment, which would happen is there is an old C plugin within ScriptClip
+  The C part was an intermediate development issue, but for Avs 2.5 plugins probably it always crashed.
+- Fix: audio cache would overflow over int sized count and position differences
+- Fix: "Info" overflowed and displayed negative hours/minutes/audio length at longer clips, use int64
 - Fix "SetLogParams" defaults - mentioned in #391
 - Fix corrupt Turn functions when a planar RGB turn would be followed by a YUV Turn.
   Regression since TurnXXXX supports planar RGB (2016.08.23; probably since r2081 commit dba954e2de0c9c6218d17fc5c4974f4c28b627c3)
 - Fix #386: Interleave to call plugin destructor like StackXXXX (memory leak in case of script errors)
+  additional code reorg in r4192
 - Fix #384: swapped ShowGreen/ShowBlue for planar RGB sources
 - Fix: allow use of "local" in ConditionalSelect string version (fixed wrong function signature)
 - "Info" now can display a line which is only partially visible (instead of not showing it at all)

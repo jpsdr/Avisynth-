@@ -1202,6 +1202,33 @@ public:
 };
 
 /* ---------------------------------------------------------------------------------
+*  Interface transformation hack
+* ---------------------------------------------------------------------------------
+*/
+InternalEnvironment* GetAndRevealCamouflagedEnv(IScriptEnvironment* env) {
+  InternalEnvironment* IEnv;
+
+  // This function is called from CacheGuard::GetFrame/GetAudio, Prefetcher::GetFrame/GetAudio,
+  // ScriptClip::GetFrame, ConditionalFilter::GetFrame, and other runtime filters.
+  // When GetFrame is called from an AviSynth C++ 2.5 or PreV11C plugin constructor (xx_Create),
+  // or such a plugin is inside a runtime function, then
+  // 'env' is a disguised IScriptEnvironment_Avs25/AvsPreV11C, which we cannot
+  // static_cast to InternalEnvironment directly.
+  // We need to determine whether the environment is v2.5/PreV11C and act accordingly.
+
+  if (env->ManageCache((int)MC_QueryAvs25, nullptr) == (intptr_t*)1) {
+    IEnv = static_cast<InternalEnvironment*>(reinterpret_cast<IScriptEnvironment_Avs25*>(env));
+  }
+  else if (env->ManageCache((int)MC_QueryAvsPreV11C, nullptr) == (intptr_t*)1) {
+    IEnv = static_cast<InternalEnvironment*>(reinterpret_cast<IScriptEnvironment_AvsPreV11C*>(env));
+  }
+  else {
+    IEnv = static_cast<InternalEnvironment*>(env);
+  }
+  return IEnv;
+}
+
+/* ---------------------------------------------------------------------------------
 *  Per thread data
 * ---------------------------------------------------------------------------------
 */
@@ -1758,9 +1785,9 @@ public:
       throw NotFound();
 
     // 2.5 plugins don't know about long and double types.
-    if (result.IsLong()) // real 64 bit integer
+    if (result.GetType() == AvsValueType::VALUE_TYPE_LONG) // real 64 bit integer
       result = result.AsInt();
-    else if (result.IsFloat() && !result.IsFloatf()) // real 64 bit double
+    else if (result.GetType() == AvsValueType::VALUE_TYPE_DOUBLE) // real 64 bit double
       result = result.AsFloatf();
 
     return result;
@@ -1787,9 +1814,9 @@ public:
     // to look into whether it contains 64 bit elements accidentally.
     // Neither is an old C plugin expected to handle array return values.
     // Anyway, proper dyn array support comes only from v11 on C API.
-    if (result.IsLong()) // real 64 bit integer
+    if (result.GetType() == AvsValueType::VALUE_TYPE_LONG) // real 64 bit integer
       result = result.AsInt(); // to 32 bit integer
-    else if (result.IsFloat() && !result.IsFloatf()) // real 64 bit double
+    else if (result.GetType() == AvsValueType::VALUE_TYPE_DOUBLE) // real 64 bit double
       result = result.AsFloatf(); // to 32 bit float
 
     return result;
@@ -4360,13 +4387,13 @@ static void ListArguments(const char *name, const AVSValue& args, int &level, bo
       fprintf(stdout, "Undefined\r\n");
     else if (args.IsBool())
       fprintf(stdout, "Bool %s\r\n", args.AsBool() ? "true" : "false");
-    else if (args.IsLong()) // before IsInt() !
+    else if (args.GetType() == AvsValueType::VALUE_TYPE_LONG) // before IsInt() !
       fprintf(stdout, "Long " PRId64 "\r\n", args.AsLong());
     else if (args.IsInt())
       fprintf(stdout, "Int %d\r\n", args.AsInt());
     else if (args.IsString())
       fprintf(stdout, "String %s\r\n", args.AsString());
-    else if (args.IsFloatf()) // before IsFloat() !
+    else if (args.GetType() == AvsValueType::VALUE_TYPE_FLOAT) // before IsFloat() !
       fprintf(stdout, "Float %f\r\n", args.AsFloatf());
     else if (args.IsFloat())
       fprintf(stdout, "Float/Double %lf\r\n", args.AsFloat());
