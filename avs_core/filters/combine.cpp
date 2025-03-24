@@ -194,7 +194,7 @@ MultiOverlay::MultiOverlay(const std::vector<PClip>& child_array, const std::vec
 
   // 0th is the base clip
   // 1.. the clips to overlay
-  for (auto i = 1; i < children.size(); ++i) {
+  for (size_t i = 1; i < children.size(); ++i) {
     const VideoInfo& vin = children[i]->GetVideoInfo();
     if (!vi.IsSameColorspace(vin))
       env->ThrowError("MultiOverlay: image format must match with the base");
@@ -219,7 +219,7 @@ MultiOverlay::MultiOverlay(const std::vector<PClip>& child_array, const std::vec
   const int mask_h = (1 << shift_h) - 1;
 
   auto params_per_clip = param_count / copy_paste_count;
-  for (auto i = 0; i < copy_paste_count; i++) {
+  for (size_t i = 0; i < copy_paste_count; i++) {
     const VideoInfo& vin = children[i + 1]->GetVideoInfo();
 
     const int target_x = positions[i * params_per_clip + 0];
@@ -269,8 +269,6 @@ PVideoFrame __stdcall MultiOverlay::GetFrame(int n, IScriptEnvironment* env)
   PVideoFrame dst = frames[0]; // multioverlay target clip
   env->MakeWritable(&dst);
 
-  const int pixelsize = vi.ComponentSize();
-
   const size_t copy_paste_count = children.size() - 1;
   const size_t param_count = positions.size();
   const size_t params_per_clip = param_count / copy_paste_count; // 2 or 6
@@ -295,7 +293,7 @@ PVideoFrame __stdcall MultiOverlay::GetFrame(int n, IScriptEnvironment* env)
     const int dst_height = dst->GetHeight(plane);
 
     // 0th was the target
-    for (auto i = 1; i < frames.size(); i++)
+    for (size_t i = 1; i < frames.size(); i++)
     {
       const auto& src = frames[i];
       const int src_rowsize = src->GetRowSize(plane);

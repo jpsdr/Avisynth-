@@ -34,6 +34,7 @@
 
 #include "transform.h"
 #include "../convert/convert_matrix.h"
+#include "../convert/convert_helper.h"
 #include <avs/minmax.h>
 #include "../core/bitblt.h"
 #include <stdint.h>
@@ -41,6 +42,7 @@
 #include "../convert/convert_planar.h"
 #include "combine.h"
 #include <vector>
+#include <cmath>
 
 
 
@@ -675,6 +677,7 @@ PVideoFrame AddBorders::GetFrame(int n, IScriptEnvironment* env)
 static PClip AddBorderPostProcess(PClip child,
   int left, int top, int right, int bottom,
   const AVSValue& _resample, const AVSValue& _param1, const AVSValue& _param2, const AVSValue& _param3, const AVSValue& _flt_rad,
+  int forced_chroma_placement,
   IScriptEnvironment* env) {
 
   // filtering radius, default 0: no transient area filtering
@@ -724,32 +727,17 @@ static PClip AddBorderPostProcess(PClip child,
   // adjust radius for worst case chroma
   r = (r + (1 << shift) - 1) & ~((1 << shift) - 1); // chroma friendly
 
-  // just a decision
-  constexpr int MIN_FILTERING_EXTENT = 10; 
-  // +/- 10, ideally symmetric around the new border boundary.
+  const int MIN_FILTERING_EXTENT = 10; // +/-
   // but if one of the margins are smaller, e.g. 5, the the 2*10 is achieved as 5+15 pixel wide (high) parts
-
   // We always filter a larger area, but only copy the 2*radius (r) pixels from it.
-  int filtering_width = MIN_FILTERING_EXTENT;
+  // a radius plus the filter support size overrides
+  int filtering_width = max(MIN_FILTERING_EXTENT, r + (int)std::ceil(filter->support()));
+
   // adjust the filtering width for the worst case, considering the chroma subsampling
   filtering_width = (filtering_width + (1 << shift) - 1) & ~((1 << shift) - 1);
-
   // active area before adding the new borders
   const int orig_width = vi.width - left - right;
   const int orig_height = vi.height - top - bottom;
-
-  filtering_width = max(filtering_width, r); // a larger radius might be specified
-
-  while (1) {
-    // avoid "Resize: Source image too small for this resize method. Width=%d, Support=%d", source_size, int(ceil(filter_support))"
-    // there may be another check at specific circumstances, I hope, filtering width was chosen to big enough to avoid it
-    const int width = 2 * filtering_width;
-    // int source_size, double crop_size, int target_size
-    // We use the resizer as convolution filter (no size change), all parameters are the same here
-    if (filter->CheckValidity(width, width, width))
-      break;
-    filtering_width += (1 << shift);
-  }
 
   // End of safety adjustments
   // Radius "r" and "filtering_width" are both +/- values and are chroma and resizer friendly.
@@ -875,6 +863,10 @@ static PClip AddBorderPostProcess(PClip child,
     }
 
     int safe_flt_rad_inner = both_side ? safe_flt_rad : 0;
+
+    int safe_flt_rad_inner_horiz = std::min(bar.extent_inner_horiz, safe_flt_rad_inner);
+    int safe_flt_rad_inner_vert = std::min(bar.extent_inner_vert, safe_flt_rad_inner);
+
     // Set force direction
     bar.force = templates[i].direction;
 
@@ -882,8 +874,8 @@ static PClip AddBorderPostProcess(PClip child,
     if (isHorizontallyFiltered && isVerticallyFiltered) { // corners
       bar.target_width = bar.extent_outer_horiz + bar.extent_inner_horiz;
       bar.target_height = bar.extent_outer_vert + bar.extent_inner_vert;
-      bar.src_width = safe_flt_rad + safe_flt_rad_inner;
-      bar.src_height = safe_flt_rad + safe_flt_rad_inner;
+      bar.src_width = safe_flt_rad + safe_flt_rad_inner_horiz;
+      bar.src_height = safe_flt_rad + safe_flt_rad_inner_vert;
 
       if (side == 4 || side == 6) {  // Top Left Bottom Left
         bar.crop_x = left - bar.extent_outer_horiz;
@@ -892,8 +884,8 @@ static PClip AddBorderPostProcess(PClip child,
       }
       else {  // Top Right Bottom Right
         bar.crop_x = left + orig_width - bar.extent_inner_horiz;
-        bar.target_x = left + orig_width - safe_flt_rad_inner;
-        bar.src_x = bar.extent_inner_horiz - safe_flt_rad_inner;
+        bar.target_x = left + orig_width - safe_flt_rad_inner_horiz;
+        bar.src_x = bar.extent_inner_horiz - safe_flt_rad_inner_horiz;
       }
 
       if (side == 4 || side == 5) {  // Top Left Top Right
@@ -903,15 +895,15 @@ static PClip AddBorderPostProcess(PClip child,
       }
       else {  // Bottom Left Bottom Right
         bar.crop_y = top + orig_height - bar.extent_inner_vert;
-        bar.target_y = top + orig_height - safe_flt_rad_inner;
-        bar.src_y = bar.extent_inner_vert - safe_flt_rad_inner;
+        bar.target_y = top + orig_height - safe_flt_rad_inner_vert;
+        bar.src_y = bar.extent_inner_vert - safe_flt_rad_inner_vert;
       }
     }
     else if (isHorizontallyFiltered) {
       // Vertical but horizontally filtered bars on the left/right side
       bar.target_width = bar.extent_outer_horiz + bar.extent_inner_horiz;
       bar.target_height = orig_height;
-      bar.src_width = safe_flt_rad + safe_flt_rad_inner;
+      bar.src_width = safe_flt_rad + safe_flt_rad_inner_horiz;
       bar.src_height = orig_height;
 
       if (side == 0) {  // Left
@@ -925,9 +917,9 @@ static PClip AddBorderPostProcess(PClip child,
       else {  // Right
         bar.crop_x = left + orig_width - bar.extent_inner_horiz;
         bar.crop_y = top;
-        bar.target_x = left + orig_width - safe_flt_rad_inner;
+        bar.target_x = left + orig_width - safe_flt_rad_inner_horiz;
         bar.target_y = top;
-        bar.src_x = bar.extent_inner_horiz - safe_flt_rad_inner;
+        bar.src_x = bar.extent_inner_horiz - safe_flt_rad_inner_horiz;
       }
      
       bar.src_y = 0;
@@ -937,7 +929,7 @@ static PClip AddBorderPostProcess(PClip child,
       bar.target_width = orig_width;
       bar.target_height = bar.extent_outer_vert + bar.extent_inner_vert;
       bar.src_width = orig_width;
-      bar.src_height = safe_flt_rad + safe_flt_rad_inner;
+      bar.src_height = safe_flt_rad + safe_flt_rad_inner_vert;
 
       if (side == 2) {  // Top
         bar.crop_x = left;
@@ -950,8 +942,8 @@ static PClip AddBorderPostProcess(PClip child,
         bar.crop_x = left;
         bar.crop_y = top + orig_height - bar.extent_inner_vert;
         bar.target_x = left;
-        bar.target_y = top + orig_height - safe_flt_rad_inner;
-        bar.src_y = bar.extent_inner_vert - safe_flt_rad_inner;
+        bar.target_y = top + orig_height - safe_flt_rad_inner_vert;
+        bar.src_y = bar.extent_inner_vert - safe_flt_rad_inner_vert;
       }
 
       bar.src_x = 0;
@@ -962,13 +954,10 @@ static PClip AddBorderPostProcess(PClip child,
     // all are the same here
     // whether H or V resizing is forced, only check for that dimension
     bool ok = true;
-    if (isHorizontallyFiltered)
-      ok = ok && (filter->CheckValidity(bar.target_width, bar.target_width, bar.target_width));
-    if (isVerticallyFiltered)
-      ok = ok && (filter->CheckValidity(bar.target_height, bar.target_height, bar.target_height));
-
-    // But we can still get later: if (src_size < resampling_program->filter_size) {
-    // env->ThrowError("Source height (%d) is too small for this resizing method, must be minimum of %d", vi.height, resampling_program_luma->filter_size);
+    if (isHorizontallyFiltered && bar.target_width <= 0) ok = false;
+    if (isVerticallyFiltered && bar.target_height <= 0) ok = false;
+    // size is indifferent since avs 3.7.4, resizers are robust, accept anything, 
+    // no other size constraint check is needed.
 
     if(ok)
       bars.push_back(bar);
@@ -976,6 +965,11 @@ static PClip AddBorderPostProcess(PClip child,
 
   std::vector<PClip> child_array = { child };
   std::vector<int> position_array = { };
+
+  const bool preserve_center = true;
+  const char* placement_name = nullptr; 
+  // along with forced_chroma_placement, does not read frame props again in eight child resizers
+  // _ChromaLocation - if any - was read in AddBorders - once - and passed here
 
   for (auto& bar : bars) {
     // or use [src_left]f[src_top]f[src_width]f[src_height]f
@@ -985,9 +979,12 @@ static PClip AddBorderPostProcess(PClip child,
     bar.clip = FilteredResize::CreateResize(child, bar.target_width, bar.target_height, args_left_top_w_h, bar.force, filter, env);
     */
     AVSValue args_left_top_w_h[4] = { 0, 0, AVSValue(), AVSValue() }; // left, top, width (auto), height (auto)
+
     bar.clip = FilteredResize::CreateResize(
       new Crop(bar.crop_x, bar.crop_y, bar.target_width, bar.target_height, 0, child, env),
-      bar.target_width, bar.target_height, args_left_top_w_h, bar.force, filter, env);
+      bar.target_width, bar.target_height, args_left_top_w_h, bar.force, filter, 
+      preserve_center, placement_name, forced_chroma_placement,
+      env);
 
 
     // Add to vector
@@ -1003,6 +1000,8 @@ static PClip AddBorderPostProcess(PClip child,
   }
 
   PClip clip = new MultiOverlay(child_array, position_array, env);
+
+  delete filter;
 
   return clip;
 }
@@ -1035,11 +1034,25 @@ AVSValue __cdecl AddBorders::Create(AVSValue args, void*, IScriptEnvironment* en
   const int right = max(0, args[3].AsInt());
   const int bottom = max(0, args[4].AsInt());
 
+  int forced_chroma_placement = ChromaLocation_e::AVS_CHROMA_UNUSED;
+  if (vi.IsYV411() || vi.Is420() || vi.Is422()) {
+     auto frame0 = args[0].AsClip()->GetFrame(0, env);
+    const AVSMap* props = env->getFramePropsRO(frame0);
+    if (props) {
+      if (env->propNumElements(props, "_ChromaLocation") > 0) {
+        forced_chroma_placement = (int)env->propGetIntSaturated(props, "_ChromaLocation", 0, nullptr);
+      }
+    }
+  }
+
+  // here we have read _ChromaLocation, in order to pass it directly to the many blurring resizers to prevent them
+  // to read up to 8x GetFrame(0) in their init for getting the same frame properties like we had.
+
   PClip clip = new AddBorders( left, top, right, bottom, color, color_as_yuv, args[0].AsClip(), env);
 
   // args[7], args[8], args[9], args[10], args[11], // [resample]s[param1]f[param2]f[param3]f[r]i
 
-  clip = AddBorderPostProcess(clip, left, top, right, bottom, args[7], args[8], args[9], args[10], args[11], env);
+  clip = AddBorderPostProcess(clip, left, top, right, bottom, args[7], args[8], args[9], args[10], args[11], forced_chroma_placement, env);
 
   return clip;
 }
@@ -1111,11 +1124,22 @@ AVSValue __cdecl Create_Letterbox(AVSValue args, void*, IScriptEnvironment* env)
   right = max(0, right);
   bottom = max(0, bottom);
 
+  int forced_chroma_placement = ChromaLocation_e::AVS_CHROMA_UNUSED;
+  if (vi.IsYV411() || vi.Is420() || vi.Is422()) {
+    auto frame0 = clip->GetFrame(0, env);
+    const AVSMap* props = env->getFramePropsRO(frame0);
+    if (props) {
+      if (env->propNumElements(props, "_ChromaLocation") > 0) {
+        forced_chroma_placement = (int)env->propGetIntSaturated(props, "_ChromaLocation", 0, nullptr);
+      }
+    }
+  }
+
   clip = new AddBorders(left, top, right, bottom, color, color_as_yuv, new Crop(left, top, vi.width-left-right, vi.height-top-bottom, 0, clip, env), env);
 
   // args[7], args[8], args[9], args[10], args[11], // [resample]s[param1]f[param2]f[param3]f[r]i
 
-  clip = AddBorderPostProcess(clip, left, top, right, bottom, args[7], args[8], args[9], args[10], args[11], env);
+  clip = AddBorderPostProcess(clip, left, top, right, bottom, args[7], args[8], args[9], args[10], args[11], forced_chroma_placement, env);
 
   return clip;
 
