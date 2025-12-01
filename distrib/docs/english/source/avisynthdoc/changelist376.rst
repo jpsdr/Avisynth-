@@ -28,8 +28,17 @@ Build environment, Interface
   see :ref:`global lock support<cplusplus_acquiregloballock>`
 - v12 interface: ApplyMessageEx supporting utf8 parameter.
   see :ref:`ApplyMessageEx<cplusplus_applymessage>`
+- v12 interface: inform plugins about the effective thread count after Prefetch()
+  via cache hints:
+
+  * ``CachePolicyHint::CACHE_INFORM_NUM_THREADS`` (C++)
+  * ``AVS_CACHE_INFORM_NUM_THREADS`` (C)
+
+  See :ref:`SetCacheHints<cplusplus_setcachehints>` .
 - the internal IScriptEnvironment2 methods AddAutoLoadDir and ListAutoLoadDirs explicitely
   work in UTF-8.
+- Add CPUF_AVX512VNNI to CpuFlags, AVS_CPUF_AVX512VNNI to avisynth_c.h,
+  Optimize AVX512 features display in Info()
 
 Bugfixes
 ~~~~~~~~
@@ -62,9 +71,11 @@ Optimizations
   * introduce a SIMD-like C header (avs_simd_c.h) for smart auto-vectorizing compilers.
   * restore vertical float performance (3.7.4 was slower than 3.7.3) + SSE2 special optimization
   * further optimize verticals, use ``AVS_RESTRICT``
-  * (Work In Progress) optimize horizontal resampler for small (<=4) kernel sizes.
+  * optimize SSSE3 and AVX2 horizontal resampler for 32-bit float for small (<=4) kernel sizes
+  * optimize 32-bit float vertical avx2
   * (Work In Progress) add AVX512 code path
   * (Work In Progress) unifify horizontal and vertical place processing flow
+
 
 Documentation
 ~~~~~~~~~~~~~
@@ -73,13 +84,15 @@ Documentation
 - Extend ``env->Allocate/Free`` see at :ref:`Allocate <cplusplus_allocate>`
 - Interface V12 changes: see :ref:`api_v12_whats_new` for more details.
 - Add folder macro description to AddAutoLoadPlugins
-- Update :doc:`Overlay <./corefilters/overlay>` 
+- Update :doc:`Overlay <./corefilters/overlay>`
+- Update :ref:`SetCacheHints<cplusplus_setcachehints>`
+- Update Russian GPL notice in UTF-8 format
 
 
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
 
-$Date: 2025/11/18 12:53:00 $
+$Date: 2025/11/30 11:34:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus

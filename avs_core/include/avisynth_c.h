@@ -131,6 +131,7 @@
 //         New AVS_ApplyFuncR type
 // 20250415 V11.1 Fix AVS_Value 64 bit data member declaration for 64-bit non Intel (other than X86_X64) systems.
 // 20250601 V12 Global lock acquire and release: avs_acquire_global_lock, avs_release_global_lock
+// 20251127 V12 AVS_CACHE_INFORM_NUM_THREADS constant to inform the filter about the number of threads by avs_set_cache_hints
 
 // Notes.
 // Choose either method:
@@ -507,6 +508,10 @@ enum {
   // By returning IS_MTGUARD_ANS to IS_MTGUARD_REQ, we tell the caller we are an mt guard
   AVS_CACHE_IS_MTGUARD_REQ = 512,
   AVS_CACHE_IS_MTGUARD_ANS = 513,
+
+  // v12
+  AVS_CACHE_INFORM_NUM_THREADS = 514, // Allows a filter to receive the number of prefetch threads via set_cache_hints
+
 
   AVS_CACHE_AVSPLUS_CUDA_CONSTANTS = 600,
 
@@ -1248,7 +1253,8 @@ enum {
   AVS_CPUF_AVX512BW   = 0x2000000, // AVX-512 BW (Byte/Word granular) Instructions
   AVS_CPUF_AVX512VL   = 0x4000000, // AVX-512 VL (128/256 Vector Length) Extensions
   AVS_CPUF_AVX512IFMA = 0x8000000, // AVX-512 IFMA integer 52 bit
-  AVS_CPUF_AVX512VBMI = 0x10000000 // AVX-512 VBMI
+  AVS_CPUF_AVX512VBMI = 0x10000000, // AVX-512 VBMI
+  AVS_CPUF_AVX512VNNI = 0x20000000 // AVX-512 VNNI accumulated dot product on 8/16 bit integers
 };
 
 
