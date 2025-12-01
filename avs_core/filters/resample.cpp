@@ -71,14 +71,33 @@
 // while maintaining correct coefficient positioning and proper zero padding.
 
 
+static void checkAndSetOverread(int end_pos, SafeLimit& safelimit, int start_pos, int i, int source_size) {
+  if (end_pos >= source_size) {
+    if (!safelimit.overread_possible) {
+      safelimit.overread_possible = true;
+      safelimit.source_overread_offset = start_pos;
+      safelimit.source_overread_beyond_targetx = i;
+    }
+  }
+}
+
+
 void resize_prepare_coeffs(ResamplingProgram* p, IScriptEnvironment* env, int filter_size_alignment) {
   p->filter_size_alignment = filter_size_alignment;
-  p->overread_possible = false;
+  p->safelimit_filter_size_aligned.overread_possible = false;
+  p->safelimit_4_pixels.overread_possible = false;
+  p->safelimit_8_pixels.overread_possible = false;
+  p->safelimit_16_pixels.overread_possible = false;
+  p->safelimit_32_pixels.overread_possible = false;
+  p->safelimit_8_pixels_each8th_target.overread_possible = false;
 
   // note: filter_size_real was the max(kernel_sizes[])
   int filter_size_aligned = AlignNumber(p->filter_size_real, p->filter_size_alignment);
 
   int target_size_aligned = AlignNumber(p->target_size, ALIGN_RESIZER_TARGET_SIZE);
+
+  // align target_size to 8 units to allow safe up to 8 pixels/cycle in H resizers. modded later.
+  p->target_size_alignment = ALIGN_RESIZER_TARGET_SIZE;
 
   // Common variables for both float and integer paths
   void* new_coeff = nullptr;
@@ -117,6 +136,11 @@ void resize_prepare_coeffs(ResamplingProgram* p, IScriptEnvironment* env, int fi
     const int last_coeff_index = offset + p->filter_size_real - 1;
     const int shift_needed = last_coeff_index > last_line ? p->filter_size_real - kernel_size : 0;
 
+    // In order to be able to read 'filter_size_real' number of coefficients safely at the
+    // image boundaries, we right-align the actual coefficients within the allocated filter
+    // size. This will require adjusting (shifting) the pixel offsets as well, and increasing
+    // the kernel sizes, to reflect the new effective size: filter_size_real.
+
     // Copy coefficients with appropriate shift
     if (p->bits_per_pixel == 32) {
       float* dst = (float*)new_coeff + i * filter_size_aligned;
@@ -146,36 +170,41 @@ void resize_prepare_coeffs(ResamplingProgram* p, IScriptEnvironment* env, int fi
     // we must protect against source scanline overread.
     // Using this not in only 32-bit float resizers is new in 3.7.4.
     const int start_pos = p->pixel_offset[i];
-    const int end_pos_aligned = start_pos + filter_size_aligned - 1;
     const int end_pos = start_pos + p->filter_size_real - 1;
     if (end_pos >= p->source_size) {
       // This issue has already been fixed, so it cannot occur.
     }
 
-    // Check for SIMD optimization limits
-    if (end_pos_aligned >= p->source_size) {
-      if (!p->overread_possible) {
-        // Register the first occurrence, because we are entering the danger zone from here.
-        // Up to this point, template-based alignment-aware quick code can be used
-        // in H resizers. But beyond this point an e.g. _mm256_loadu_si256() would read into 
-        // invalid memory area at the end of the frame buffer.
-        p->overread_possible = true;
-        p->source_overread_offset = start_pos;
-        p->source_overread_beyond_targetx = i; 
+    // Check for SIMD optimization limits and record first danger positions.
+    // If reading N pixels starting from `start_pos` would reach past the end
+    // of the source (>= source_size), register that first occurrence for
+    // the corresponding SafeLimit entry so resizers can avoid unsafe wide loads.
+
+    checkAndSetOverread(start_pos + filter_size_aligned - 1, p->safelimit_filter_size_aligned, start_pos, i, p->source_size);
+    checkAndSetOverread(start_pos + 4 - 1, p->safelimit_4_pixels, start_pos, i, p->source_size);
+    checkAndSetOverread(start_pos + 8 - 1, p->safelimit_8_pixels, start_pos, i, p->source_size);
+    checkAndSetOverread(start_pos + 16 - 1, p->safelimit_16_pixels, start_pos, i, p->source_size);
+    checkAndSetOverread(start_pos + 32 - 1, p->safelimit_32_pixels, start_pos, i, p->source_size);
+    // for permutex-based AVX2 ks4 float H resizers, where we read 8 pixels at a time exactly from
+    // start_pos of each Nth pixel output block
+    if (i % 8 == 0)
+      checkAndSetOverread(start_pos + 8 - 1, p->safelimit_8_pixels_each8th_target, start_pos, i, p->source_size);
+
       }
-    }
-  }
 
   // Fill the extra offset after target_size with fake values.
-  // Our aim is to have a safe, up to 8 pixels/cycle simd loop for V resizers.
+  // Our aim is to have a safe, up to 8-32 pixels/cycle simd loop for V and specific H resizers.
   // Their coeffs will be 0, so they don't count if such coeffs
-  // are multiplied with invalid pixels.
+  // are multiplied with invalid, though existing pixels.
   if (p->target_size < target_size_aligned) {
     p->kernel_sizes.resize(target_size_aligned);
     p->pixel_offset.resize(target_size_aligned);
+    int last_offset = p->pixel_offset[p->target_size - 1];
     for (int i = p->target_size; i < target_size_aligned; ++i) {
       p->kernel_sizes[i] = p->filter_size_real;
-      p->pixel_offset[i] = 0; // 0th pixel offset makes no harm
+      p->pixel_offset[i] = last_offset; // repeat last valid offset, helps permutex-based H resizers
+      // even if this ensures the in-line safety, alternative H resizer implementations must
+      // not read beyond last line, where y>=height.
     }
   }
 
@@ -1044,7 +1073,7 @@ void resizer_h_c_generic_uint8_16_vectorized(BYTE* dst8, const BYTE* src8, int d
   dst_pitch /= sizeof(pixel_t);
   src_pitch /= sizeof(pixel_t);
 
-  const int w_safe_mod8 = (program->overread_possible ? program->source_overread_beyond_targetx : width) / 8 * 8;
+  const int w_safe_mod8 = (program->safelimit_filter_size_aligned.overread_possible ? program->safelimit_filter_size_aligned.source_overread_beyond_targetx : width) / 8 * 8;
 
   for (int y = 0; y < height; y++) {
     const short* current_coeff_base = program->pixel_coefficient;
@@ -1585,10 +1614,24 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
   else { //if (pixelsize == 4)
 #ifdef INTEL_INTRINSICS
     if (CPU & CPUF_AVX2) {
-      return resizer_h_avx2_generic_float;
+      // up to 4 coeffs it can be highly optimized with transposes, gather/permutex choice
+      switch (program->filter_size_real) {
+      case 1: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<1>; break;
+      case 2: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<2>; break;
+      case 3: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<3>; break;
+      case 4: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<0>; break;
+      default: return resizer_h_avx2_generic_float;
+      }
     }
     if (CPU & CPUF_SSSE3) {
-      return resizer_h_ssse3_generic_float;
+      // up to 4 coeffs it can be highly optimized with transposes
+      switch (program->filter_size_real) {
+      case 1: return resize_h_planar_float_sse_transpose_vstripe_ks4<1>; break;
+      case 2: return resize_h_planar_float_sse_transpose_vstripe_ks4<2>; break;
+      case 3: return resize_h_planar_float_sse_transpose_vstripe_ks4<3>; break;
+      case 4: return resize_h_planar_float_sse_transpose_vstripe_ks4<0>; break;
+      default: return resizer_h_ssse3_generic_float;
+      }
     }
 #endif
     return resize_h_c_planar<float, 0>;
@@ -1789,7 +1832,8 @@ ResamplerV FilteredResizeV::GetResampler(int CPU, int pixelsize, int bits_per_pi
     {
 #ifdef INTEL_INTRINSICS
       if (CPU & CPUF_AVX2) {
-        return resize_v_avx2_planar_float;
+        return resize_v_avx2_planar_float_w_sr;
+        // a memory-optimized version of resize_v_avx2_planar_float
       }
       if (CPU & CPUF_SSE2) {
         return resize_v_sse2_planar_float;
