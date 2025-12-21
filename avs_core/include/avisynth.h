@@ -57,6 +57,8 @@
 // 20250601  V12 Global lock aquire and release: AcquireGlobalLock, ReleaseGlobalLock
 //               New ApplyMessageEx
 // 20251127  V12 CACHE_INFORM_NUM_THREADS CachePolicyHint enum to inform the filter about the number of threads by SetCacheHints
+//               New env property AEP_CACHESIZE_L2
+// 20251202      GetCPUFlagsEx returning full 64 bit flags, new AVX-512 group flags, ARM64 CPU flags.
 
 // http://avisynth.nl
 
@@ -1536,6 +1538,7 @@ enum AvsEnvProperty {
   AEP_HOST_SYSTEM_ENDIANNESS = 7,
   AEP_INTERFACE_VERSION = 8,
   AEP_INTERFACE_BUGFIX = 9,
+  AEP_CACHESIZE_L2 = 10,
 
   // Neo additionals
   AEP_NUM_DEVICES = 901,
@@ -1727,7 +1730,7 @@ public:
   virtual void __stdcall ReleaseGlobalLock(const char* name) = 0;
   virtual void __stdcall ApplyMessageEx(PVideoFrame* frame, const VideoInfo& vi, const char* message, int size,
     int textcolor, int halocolor, int bgcolor, bool utf8) = 0;
-
+  virtual int64_t __stdcall GetCPUFlagsEx() = 0;
 }; // end class IScriptEnvironment. Order is important. Avoid overloads with the same name.
 
 

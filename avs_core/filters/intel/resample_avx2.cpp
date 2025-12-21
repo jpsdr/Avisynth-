@@ -32,21 +32,25 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
-#include "resample_sse.h"
-#include <avs/config.h>
-#include "../core/internal.h"
-
-#include <avs/alignment.h>
-#include <avs/minmax.h>
-
-// experimental simd includes for avx2 compiled files
-#if defined (__GNUC__) && ! defined (__INTEL_COMPILER)
-#include <x86intrin.h>
-// x86intrin.h includes header files for whatever instruction
-// sets are specified on the compiler command line, such as: xopintrin.h, fma4intrin.h
-#else
+// Intrinsics base header + really required extension headers
+#if defined(_MSC_VER)
+#include <intrin.h> // MSVC, Clang-CL, and Intel C++ (in MSVC mode)
+#include <emmintrin.h>
+#include <smmintrin.h>
 #include <immintrin.h> // MS version of immintrin.h covers AVX, AVX2 and FMA3
-#endif // __GNUC__
+#else 
+#include <x86intrin.h> // GCC/MinGW, Clang (Linux/GNU mode), and Intel C++ (in non-MSVC mode) (__GNUC__, __clang__, __INTEL_COMPILER, etc.)
+#endif
+
+#include <vector>
+#include <avisynth.h>
+#include <avs/config.h>
+#include <avs/types.h>
+#include <cstdint>
+#include "../resample_functions.h"
+#include <cassert>
+#include <type_traits>
+#include <algorithm>
 
 #if !defined(__FMA__)
 // Assume that all processors that have AVX2 also have FMA3
@@ -430,7 +434,7 @@ void resizer_h_avx2_generic_uint16_t(BYTE* dst8, const BYTE* src8, int dst_pitch
 // AVX2 Horizontal float
 
 // 2x8 pixels of two consecutive offset entries.
-AVS_FORCEINLINE static void process_two_8pixels_h_float_core(const float* src, int begin1, int begin2, int i, float* current_coeff, int filter_size, __m256& result1, __m256& result2) {
+AVS_FORCEINLINE static void process_pix2_coeff8_h_float_core(const float* src, int begin1, int begin2, int i, float* current_coeff, int filter_size, __m256& result1, __m256& result2) {
   __m256 data_1 = _mm256_loadu_ps(src + begin1 + i);
   __m256 data_2 = _mm256_loadu_ps(src + begin2 + i);
   __m256 coeff_1 = _mm256_load_ps(current_coeff); // 8 coeffs
@@ -453,7 +457,7 @@ AVS_FORCEINLINE static void process_two_pixels_h_float(const float* src_ptr, int
 
   // Process 8 elements at a time
   for (; i < ksmod8; i += 8) {
-    process_two_8pixels_h_float_core(src_ptr, begin1, begin2, i, current_coeff + i, filter_size, result1, result2);
+    process_pix2_coeff8_h_float_core(src_ptr, begin1, begin2, i, current_coeff + i, filter_size, result1, result2);
   }
 
   if constexpr (!safe_aligned_mode) {
@@ -586,7 +590,7 @@ static void internal_resizer_h_avx2_generic_float(BYTE* dst8, const BYTE* src8, 
   dst_pitch = dst_pitch / sizeof(float);
   src_pitch = src_pitch / sizeof(float);
 
-  const int w_safe_mod8 = (program->safelimit_filter_size_aligned.overread_possible ? program->safelimit_filter_size_aligned.source_overread_beyond_targetx : width) / 8 * 8;
+  const int w_safe_mod8 = (program->safelimit_8_pixels.overread_possible ? program->safelimit_8_pixels.source_overread_beyond_targetx : width) / 8 * 8;
 
   for (int y = 0; y < height; y++) {
     float* current_coeff_base = program->pixel_coefficient_float;
@@ -608,6 +612,7 @@ static void internal_resizer_h_avx2_generic_float(BYTE* dst8, const BYTE* src8, 
   }
 }
 
+// here we cover filter sizes up to 32 (4x8) efficiently through template specialization
 void resizer_h_avx2_generic_float(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel) {
   const int filter_size = program->filter_size;
   assert(program->filter_size_alignment == 8);
@@ -1351,7 +1356,7 @@ template void resize_h_planar_float_avx_transpose_vstripe_ks4<3>(BYTE* dst8, con
  *   }
  *
  * See also:
- * - resize_h_planar_float_avx2_gather_vstripe_ks4
+ * - resize_h_planar_float_avx2_transpose_vstripe_ks4
  * - resize_h_planar_float_avx2_permutex_vstripe_ks4
  * - resize_h_planar_float_avx_transpose_vstripe_ks4
  * - resizer_h_avx2_generic_float
@@ -1400,7 +1405,7 @@ BilinearResize(int(width*0.97), height) # gather, H kernel size 3
  * Out of bounds target pixels coefficients are padded with zeros up to program->filter_size_alignment.
 */
 
-// returns true if gather method is needed, false if permutex method can be used
+// returns true if only transpose method is allowed, false if permutex method can be used
 bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(ResamplingProgram* program)
 {
   // 'target_size_alignment' ensures we can safely access pixel_offset[] entries using offsets like
@@ -1418,16 +1423,92 @@ bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(ResamplingProg
     // This is ensured during the resampling program setup in resize_prepare_coeffs()
     int end_off = program->pixel_offset[x + 7] + 3;
     if ((end_off - start_off) >= 8) {
-      return true; // gather
+      return true; // only transpose is allowed
     }
   }
   return false; // permute is OK.
 }
 
+// returns true if only transpose method is allowed, false if permutex method can be used
+bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_pix16_check(ResamplingProgram* program)
+{
+  // 'target_size_alignment' ensures we can safely access pixel_offset[] entries using offsets like
+  // pixel_offset[x + 0] to pixel_offset[x + 15] per 16-pixel block processing
+  assert(program->target_size_alignment >= 16);
+
+  // Ensure that coefficient loading is safe for 4 float loads
+  assert(program->filter_size_alignment >= 4);
+
+  for (int x = 0; x < program->target_size; x += 16)
+  {
+    int start_off = program->pixel_offset[x + 0];
+    // program->pixel_offset[x + 15] is still valid, since program->target_size_alignment >= 16
+    // and pixel_offset[] values for x >= target_size are the same as for x=target_size-1.
+    // This is ensured during the resampling program setup in resize_prepare_coeffs()
+    int end_off = program->pixel_offset[x + 15] + 3;
+    if ((end_off - start_off) >= 16) {
+      return true; // only transpose is allowed
+    }
+  }
+  return false; // permute is OK.
+}
+
+/*
+ * OPTIMAL SCANLINE CALCULATION NOTES (L2 CACHE BLOCKING)
+ *
+ * This function calculates the optimal vertical strip size (max_scanline)
+ * to be processed in a cache-blocked horizontal resizing operation.
+ *
+ * CONTEXT: Single-threaded, high-throughput workload with private L2 cache.
+ * The high FPS target justifies a more aggressive cache reservation factor.
+ *
+ * 1. COEFFICIENT TABLE EXCLUSION (Horizontal 2x resize of fullhd content):
+ * The coefficient table (~245 KB) is excluded from the calculation. It is
+ * treated as a streamed resource due to its size relative to L2 (512 KB).
+ * The hardware prefetcher is expected to handle its sequential access pattern
+ * efficiently without residing fully in the reserved L2 working set.
+ *
+ * 2. CACHE RESERVATION HEURISTIC:
+ * A factor of 0.75 (3/4) is reserved for the working set. This is an aggressive
+ * approach for a single-threaded task with a private L2 cache, minimizing
+ * cache thrashing risk from OS context switches while maximizing block size.
+ *
+ * 3. CONCRETE SCENARIO (512 KB L2, 1920->3840 upscale):
+ * Reserved L2 space: 512 KB * 0.75 = 384 KB (393,216 bytes).
+ * One scanline strip (src + tgt) is 23,040 bytes.
+ * The resulting max_scanline is 17 (393,216 / 23,040 ~ 17.06).
+ */
+static constexpr double CACHE_RESERVE_FACTOR = 0.75;
+
+int resampler_h_float_detect_optimal_scanline(int src_width, int tgt_width, size_t l2_cache_size_bytes) {
+  // sizeof(float) is 4 bytes
+  constexpr size_t PIXEL_SIZE = sizeof(float);
+
+  // Calculate the bytes needed for one (Source + Destination) scanline strip
+  size_t scanline_bytes = (static_cast<size_t>(src_width) + static_cast<size_t>(tgt_width)) * PIXEL_SIZE;
+
+  // Calculate the reserved bytes based on the aggressive factor
+  // Use floating point math for precision, then cast to size_t
+  size_t reserved_l2_bytes = static_cast<size_t>(
+    static_cast<double>(l2_cache_size_bytes) * CACHE_RESERVE_FACTOR
+    );
+
+  // Calculate max_scanline (integer division for floor)
+  int max_scanline = static_cast<int>(reserved_l2_bytes / scanline_bytes);
+
+  // Clamp to practical bounds (4 to 64 is typical range for strip size)
+  if (max_scanline < 4) {
+    max_scanline = 4;
+  }
+  if (max_scanline > 64) {
+    max_scanline = 64;
+  }
+  return max_scanline;
+}
 
 // resize_h_planar_float_avx2_xxx_vstripe_ks4 method #1: gather-based
 template<int filtersizemod4>
-void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel)
+void resize_h_planar_float_avx2_transpose_vstripe_ks4(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel)
 {
   assert(filtersizemod4 >= 0 && filtersizemod4 <= 3);
 
@@ -1438,8 +1519,6 @@ void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8,
 
   float* src = (float*)src8;
   float* dst = (float*)dst8;
-
-  const float* AVS_RESTRICT current_coeff = (const float* AVS_RESTRICT)program->pixel_coefficient_float;
 
   constexpr int PIXELS_AT_A_TIME = 8; // Process eight pixels in parallel using AVX2 (2x4 using m128 lanes)
 
@@ -1460,6 +1539,21 @@ void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8,
   // Ensure that coefficient loading beyond the valid target size is safe for 4x4 float loads.
   assert(program->filter_size_alignment >= 4);
 
+  // Split to H-stripes to make better source data locality in L2 cache (if L2 present per core ?)
+  constexpr int STRIPE_ALIGN = 8;  // this must be multiple of PIXELS_AT_A_TIME 
+
+  const size_t cache_size_L2 = program->cache_size_L2;
+  int max_scanlines = resampler_h_float_detect_optimal_scanline(program->source_size, program->target_size, cache_size_L2)
+    / STRIPE_ALIGN * STRIPE_ALIGN;
+  //max_scanlines = program->target_size; // test
+  if (max_scanlines < STRIPE_ALIGN) max_scanlines = STRIPE_ALIGN;
+
+  for (auto y_from = 0; y_from < height; y_from += max_scanlines) {
+    size_t y_to = std::min(y_from + max_scanlines, height);
+
+    // Reset current_coeff for the start of the stripe
+    const float* AVS_RESTRICT current_coeff = program->pixel_coefficient_float; // +iYstart * filter_size;
+
   int x = 0;
 
   // This 'auto' lambda construct replaces the need of templates
@@ -1476,9 +1570,6 @@ void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8,
 
     _MM_TRANSPOSE8_LANE4_PS(coef_1_coef_5, coef_2_coef_6, coef_3_coef_7, coef_4_coef_8);
 
-    float* AVS_RESTRICT dst_ptr = dst + x;
-    const float* src_ptr = src;
-
     // Pixel offsets for the current target x-positions.
     // Even for x >= width, these offsets are guaranteed to be within the allocated 'target_size_alignment'.
     const int begin1 = program->pixel_offset[x + 0];
@@ -1490,8 +1581,14 @@ void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8,
     const int begin7 = program->pixel_offset[x + 6];
     const int begin8 = program->pixel_offset[x + 7];
 
-    for (int y = 0; y < height; y++)
-    {
+      size_t y = y_from;
+
+      float* AVS_RESTRICT dst_ptr = dst + y * dst_pitch + x;
+      const float* src_ptr = src + y * src_pitch;
+      for (; y < y_to; ++y) {
+        //float* AVS_RESTRICT dst_ptr = dst + y * dst_pitch + x;
+        //const float* src_ptr = src + y * src_pitch;
+
       __m256 data_1_data_5;
       __m256 data_2_data_6;
       __m256 data_3_data_7;
@@ -1536,8 +1633,7 @@ void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8,
       result = _mm256_fmadd_ps(data_3_data_7, coef_3_coef_7, result);
       result = _mm256_fmadd_ps(data_4_data_8, coef_4_coef_8, result);
 
-      _mm256_store_ps(dst_ptr, result);
-
+        _mm256_stream_ps(dst_ptr, result);
       dst_ptr += dst_pitch;
       src_ptr += src_pitch;
     } // y
@@ -1547,13 +1643,14 @@ void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8,
   // Process the 'safe zone' where direct full unaligned loads are acceptable.
   for (; x < width_safe_mod; x += PIXELS_AT_A_TIME)
   {
-    do_h_float_core(std::false_type{}); // partial_load == false, use direct _mm_loadu_ps
+      do_h_float_core(std::false_type{}); // partial_load == false, use direct _mm256_loadu_ps
   }
 
   // Process the potentially 'unsafe zone' near the image edge, using safe loading.
   for (; x < width; x += PIXELS_AT_A_TIME)
   {
-    do_h_float_core(std::true_type{}); // partial_load == true, use the safer '_mm256_load_partial_safe_2_m128'
+      do_h_float_core(std::true_type{}); // partial_load == true, use the safer _mm256_load_partial_safe_2_m128
+    }
   }
 }
 
@@ -1592,8 +1689,6 @@ void resize_h_planar_float_avx2_permutex_vstripe_ks4(BYTE* dst8, const BYTE* src
   float* src = (float*)src8;
   float* dst = (float*)dst8;
 
-  const float* AVS_RESTRICT current_coeff = (const float* AVS_RESTRICT)program->pixel_coefficient_float;
-
   constexpr int PIXELS_AT_A_TIME = 8; // Process eight pixels in parallel in AVX2
 
   // Pre-checked for permutex-based upsampling: the source pixels will surely fit within single 8 float loads
@@ -1626,6 +1721,15 @@ void resize_h_planar_float_avx2_permutex_vstripe_ks4(BYTE* dst8, const BYTE* src
   // Ensure that coefficient loading is safe for 4 float loads,
   // if less than 4, padded with zeros till filter_size_alignment.
   assert(program->filter_size_alignment >= 4);
+
+  // e.g. i7-11700 typical L2 if 512K per core.
+  const size_t cache_size_L2 = program->cache_size_L2;
+  int max_scanlines = resampler_h_float_detect_optimal_scanline(program->source_size, program->target_size, cache_size_L2);
+
+  for (int y_from = 0; y_from < height; y_from += max_scanlines) {
+    int y_to = std::min(y_from + max_scanlines, height);
+    // Reset current_coeff for the start of the stripe
+    const float* AVS_RESTRICT current_coeff = program->pixel_coefficient_float; // +iYstart * filter_size;
 
   int x = 0;
 
@@ -1661,16 +1765,16 @@ void resize_h_planar_float_avx2_permutex_vstripe_ks4(BYTE* dst8, const BYTE* src
     __m256i perm_3 = _mm256_add_epi32(perm_2, one_epi32); // begin8_rel+3, begin7_rel+3, ... begin2_rel+3, begin1_rel+3
     // These indexes are guaranteed to be 0..7 due to the earlier analysis,
     // and can be used for the indexing parameter in _mm256_permutevar8x32_ps
-
-    float* AVS_RESTRICT dst_ptr = dst + x;
-    const float* src_ptr = src + begin1; // all permute offsets relative to this start offset
+      float* AVS_RESTRICT dst_ptr = dst + x + y_from * dst_pitch;
+      const float* src_ptr = src + begin1 + y_from * src_pitch;
 
     // for partial_load only
-    const int remaining =  program->source_size - begin1;
+      const int remaining = program->source_size - begin1;
     const int floats_to_load = remaining >= 8 ? 8 : remaining;
 
-    for (int y = 0; y < height; y++)
-    {
+      for (int y = y_from; y < y_to; ++y) {
+
+        // process scanline y
       __m256 data_src;
       // We'll need exactly 8 floats starting from src+begin1
       if constexpr (partial_load) {
@@ -1699,7 +1803,8 @@ void resize_h_planar_float_avx2_permutex_vstripe_ks4(BYTE* dst8, const BYTE* src
       result0 = _mm256_fmadd_ps(data_1, coef_1, result0);
       result1 = _mm256_fmadd_ps(data_3, coef_3, result1);
 
-      _mm256_store_ps(dst_ptr, _mm256_add_ps(result0, result1));
+        // this must be stream until partial tile interface done
+        _mm256_stream_ps(dst_ptr, _mm256_add_ps(result0, result1));
 
       dst_ptr += dst_pitch;
       src_ptr += src_pitch;
@@ -1718,8 +1823,425 @@ void resize_h_planar_float_avx2_permutex_vstripe_ks4(BYTE* dst8, const BYTE* src
   {
     do_h_float_core(std::true_type{}); // partial_load == true, use the safer '_mm256_load_partial_safe'
   }
+  }
+}
+
+
+// Simulating the AVX512 case, where 16-way permutes are possible.
+// H, kernel size 4, 2x8 pix version, 16 output pixels.
+// Same as plain ks4, but 2x8 pixels instead of 1x8 pixels at a time.
+// Since AVX2 only supports 256 bit and 8xfloat permute, we have to simulate 16 pixel permute, with
+// handling cross-lane indices 0..15, but since the intrinsic support is only for 0..7 we have to use
+// two separate permutes, masks and then blend the results together.
+
+// Structure to hold all precalculated vectors for ONE set of coefficients/taps (e.g., perm_0)
+// Since we have 4 taps (perm_0 to perm_3), you would need 4 instances of this structure.
+typedef struct {
+  // Permutation Indices (4 __m256i vectors)
+  __m256i PL_A; // Low output half, source A indices (0-7)
+  __m256i PL_B; // Low output half, source B indices (0-7)
+  __m256i PH_A; // High output half, source A indices (0-7)
+  __m256i PH_B; // High output half, source B indices (0-7)
+
+  // Mask Vectors (2 __m256 vectors for blendv_ps)
+  __m256 ML_B; // Low output half mask (1s select B, 0s select A)
+  __m256 MH_B; // High output half mask (1s select B, 0s select A)
+} PermuteVectors_AVX2;
+
+static void precalculate_cross_perm_avx2(
+  const int* pixel_offset,
+  int x,
+  PermuteVectors_AVX2* tap_vectors[4])
+{
+  // The base offset for the first loaded register A is pixel_offset[x + 0]
+  const int begin1 = pixel_offset[x + 0];
+
+  // Broadcast the constant 8 and the base offset 'begin1'
+  const __m256i v_8 = _mm256_set1_epi32(8);
+  const __m256i v_begin1 = _mm256_set1_epi32(begin1);
+
+  // A constant 0 for index in the ignored lane
+  const __m256i v_zero = _mm256_setzero_si256();
+
+  // Loop through all 4 taps independently
+  for (int tap = 0; tap < 4; ++tap) {
+
+    // 1. Prepare the 16 absolute indices (I_k) by adding 'tap'
+    // This still requires a temporary array or two separate loads/SIMD additions
+
+    // Use temporary arrays of 8 elements for simplicity, but could be done directly in SIMD
+    int I_k_low[8];
+    int I_k_high[8];
+    for (int k = 0; k < 8; ++k) {
+      I_k_low[k] = pixel_offset[x + k] + tap;
+      I_k_high[k] = pixel_offset[x + k + 8] + tap;
+    }
+
+    // Load the 16 absolute indices, split into two __m256i vectors
+    __m256i v_I_low = _mm256_loadu_si256((const __m256i*)I_k_low);
+    __m256i v_I_high = _mm256_loadu_si256((const __m256i*)I_k_high);
+
+    // --- Calculate Relative Indices (J_k = I_k - begin1) ---
+
+    __m256i v_J_low = _mm256_sub_epi32(v_I_low, v_begin1);
+    __m256i v_J_high = _mm256_sub_epi32(v_I_high, v_begin1);
+
+    // --- Calculate Mask B (ML_B and MH_B) ---
+    // Mask: 0xFFFFFFFF if J_k >= 8, 0x00000000 if J_k < 8
+    // _mm256_cmpgt_epi32(a, b) computes a > b. We want J_k >= 8, so we use J_k > 7.
+    const __m256i v_7 = _mm256_set1_epi32(7);
+
+    __m256i v_Mask_low = _mm256_cmpgt_epi32(v_J_low, v_7);
+    __m256i v_Mask_high = _mm256_cmpgt_epi32(v_J_high, v_7);
+
+    // Store the float mask vectors (Mask B)
+    tap_vectors[tap]->ML_B = _mm256_castsi256_ps(v_Mask_low);
+    tap_vectors[tap]->MH_B = _mm256_castsi256_ps(v_Mask_high);
+
+    // --- Calculate Permutation Indices for Source B (PH_B and PL_B) ---
+    // Index B is J_k - 8 (only for elements where J_k >= 8)
+    __m256i v_Jm8_low = _mm256_sub_epi32(v_J_low, v_8);
+    __m256i v_Jm8_high = _mm256_sub_epi32(v_J_high, v_8);
+
+    // Select: (Mask B) ? (J_k - 8) : 0
+    // _mm256_blendv_epi8 can be used as a general purpose blend for 32-bit integers
+    // Note: The index '0' for the ignored lane doesn't matter, as the corresponding
+    // output element will be selected from Source A, not B.
+    tap_vectors[tap]->PL_B = _mm256_blendv_epi8(v_zero, v_Jm8_low, v_Mask_low);
+    tap_vectors[tap]->PH_B = _mm256_blendv_epi8(v_zero, v_Jm8_high, v_Mask_high);
+
+    // --- Calculate Permutation Indices for Source A (PH_A and PL_A) ---
+    // Index A is J_k (only for elements where J_k < 8)
+    // Select: (Mask B) ? 0 : J_k
+    // The inverse mask can be created by NOTting the mask (using XOR with all ones, or NOT equivalent)
+    // Since we want NOT Mask B to select J_k, we use the original mask to select 0.
+
+    // A simpler way: J_k already contains the correct index (0-7). We just need to zero it out
+    // where it's NOT needed (i.e., where Mask B is set).
+
+    // Inverse Mask: 0xFFFFFFFF if J_k < 8, 0x00000000 if J_k >= 8
+    __m256i v_InvMask_low = _mm256_xor_si256(v_Mask_low, _mm256_set1_epi32(0xFFFFFFFF));
+    __m256i v_InvMask_high = _mm256_xor_si256(v_Mask_high, _mm256_set1_epi32(0xFFFFFFFF));
+
+    // Select: (Inv Mask) ? J_k : 0 
+    tap_vectors[tap]->PL_A = _mm256_blendv_epi8(v_zero, v_J_low, v_InvMask_low);
+    tap_vectors[tap]->PH_A = _mm256_blendv_epi8(v_zero, v_J_high, v_InvMask_high);
+  }
+}
+
+// Helper for permutex style horizontal resampling 32 bit float
+// Safe partial load for 1-15 floats, padding with zeros to avoid NaN contamination
+// Using jump tables instead of multiple if-else, each case is extremely
+// optimized looking at the generated assembly..
+static void _mm256_load_512_partial_safe(__m256 &A, __m256 &B, const float* src_ptr, int floats_to_load) {
+  if (floats_to_load == 1) {
+    A = _mm256_setr_ps(src_ptr[0], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 2) {
+    A = _mm256_setr_ps(src_ptr[0], src_ptr[1], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 3) {
+    A = _mm256_setr_ps(src_ptr[0], src_ptr[1], src_ptr[2], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 4) {
+    A = _mm256_setr_ps(src_ptr[0], src_ptr[1], src_ptr[2], src_ptr[3], 0.0f, 0.0f, 0.0f, 0.0f);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 5) {
+    A = _mm256_setr_ps(src_ptr[0], src_ptr[1], src_ptr[2], src_ptr[3], src_ptr[4], 0.0f, 0.0f, 0.0f);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 6) {
+    A = _mm256_setr_ps(src_ptr[0], src_ptr[1], src_ptr[2], src_ptr[3], src_ptr[4], src_ptr[5], 0.0f, 0.0f);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 7) {
+    A = _mm256_setr_ps(src_ptr[0], src_ptr[1], src_ptr[2], src_ptr[3], src_ptr[4], src_ptr[5], src_ptr[6], 0.0f);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 8) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setzero_ps();
+  }
+  else if (floats_to_load == 9) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setr_ps(src_ptr[8], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  else if (floats_to_load == 10) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setr_ps(src_ptr[8], src_ptr[9], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  else if (floats_to_load == 11) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setr_ps(src_ptr[8], src_ptr[9], src_ptr[10], 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  else if (floats_to_load == 12) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setr_ps(src_ptr[8], src_ptr[9], src_ptr[10], src_ptr[11], 0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  else if (floats_to_load == 13) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setr_ps(src_ptr[8], src_ptr[9], src_ptr[10], src_ptr[11], src_ptr[12], 0.0f, 0.0f, 0.0f);
+}
+  else if (floats_to_load == 14) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setr_ps(src_ptr[8], src_ptr[9], src_ptr[10], src_ptr[11], src_ptr[12], src_ptr[13], 0.0f, 0.0f);
+  }
+  else if (floats_to_load == 15) {
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_setr_ps(src_ptr[8], src_ptr[9], src_ptr[10], src_ptr[11], src_ptr[12], src_ptr[13], src_ptr[14], 0.0f);
+  }
+  else if (floats_to_load == 16) { // cannot happen
+    A = _mm256_loadu_ps(src_ptr);
+    B = _mm256_loadu_ps(src_ptr + 8);
+  }
+  else {
+    A = _mm256_setzero_ps(); // n/a cannot happen
+    B = _mm256_setzero_ps(); // n/a cannot happen
+  }
+}
+
+
+// resize_h_planar_float_avx2_xxx_vstripe_ks4 method #2: permutex-based, 16 pixel test version
+// like resize_h_planar_float_avx512_permutex_vstripe_ks4
+void resize_h_planar_float_avx2_permutex_vstripe_ks4_pix16(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel)
+{
+  const int filter_size = program->filter_size; // aligned, practically the coeff table stride
+
+  src_pitch /= sizeof(float);
+  dst_pitch /= sizeof(float);
+
+  float* src = (float*)src8;
+  float* dst = (float*)dst8;
+
+  constexpr int PIXELS_AT_A_TIME = 2 * 8; // Process eight pixels in parallel in AVX2
+
+  // Pre-checked for permutex-based upsampling: the source pixels will surely fit within single 2x8 float loads
+  // The right edge handling will be done via safe partial loads when needed, loading 2x8 pixels at once
+  // may not be safe there.
+
+  // 'source_overread_beyond_targetx' marks the x position in the target (output) scanline where,
+  // if we process N pixels at a time (e.g., 8 for AVX2), the filter kernel may overread the source
+  // buffer near the right edge due to kernel size and pixel offsets. Beyond this value, it is no
+  // longer safe to read N source pixels at once from pixel_offset[].
+
+  // For x positions < source_overread_beyond_targetx, it is safe to load N source pixels at once.
+  // For x positions >= source_overread_beyond_targetx, we must use a safer loading method (e.g.,
+  // partial loads with padding) to avoid out-of-bounds memory access.
+
+  // permutex is even more special: the safety analysis is performed only for the beginning of each
+  // block of 16 pixels processed at a time, so only the source loads for the offset position of
+  // every 16th target pixel are considered. This is 'safelimit_16_pixels_each16th_target'.
+  // The program's safe limits are pre-calculated during program setup.
+
+  const int width_safe_mod = (program->safelimit_16_pixels_each16th_target.overread_possible ? program->safelimit_16_pixels_each16th_target.source_overread_beyond_targetx : width) / PIXELS_AT_A_TIME * PIXELS_AT_A_TIME;
+
+  // Preconditions:
+  assert(program->filter_size_real <= 4); // We preload all relevant coefficients (up to 4) before the height loop.
+
+  // 'target_size_alignment' ensures we can safely access coefficients using offsets like
+  // coeff + filter_size*0 to filter_size*7 when processing 16 H pixels at a time
+  assert(program->target_size_alignment >= 16);
+
+  // Ensure that coefficient loading is safe for 4 float loads,
+  // if less than 4, padded with zeros till filter_size_alignment.
+  assert(program->filter_size_alignment >= 4);
+
+  // e.g. i7-11700 typical L2 if 512K per core.
+  const size_t cache_size_L2 = program->cache_size_L2;
+  int max_scanlines = resampler_h_float_detect_optimal_scanline(program->source_size, program->target_size, cache_size_L2);
+
+  // Example setup before the main loop (assuming memory allocation for 4 instances)
+  PermuteVectors_AVX2 taps[4];
+  PermuteVectors_AVX2* tap_pointers[4] = { &taps[0], &taps[1], &taps[2], &taps[3] };
+
+  for (int y_from = 0; y_from < height; y_from += max_scanlines) {
+    int y_to = std::min((int)(y_from + max_scanlines), height);
+    // Reset current_coeff for the start of the stripe
+    const float* AVS_RESTRICT current_coeff = program->pixel_coefficient_float; // +iYstart * filter_size;
+
+    int x = 0;
+
+    // This 'auto' lambda construct replaces the need of templates
+    auto do_h_float_core = [&](auto partial_load) {
+
+      // Call precalculation once per x position
+      precalculate_cross_perm_avx2(program->pixel_offset.data(), x, tap_pointers);
+
+      // Assumes 'filter_size_alignment' <= 4, 'target_size_alignment' >= 16
+      // Prepare 4 coefs per pixel for 16 pixels in transposed V-form at once before the height loop.
+
+      // ---------------------------------------------------------------------------
+      // 1. Load Coefficients
+      // ---------------------------------------------------------------------------
+      // We process 16 pixels total.
+      // Low Group (Pixels 0-7): Loaded into coef_0..coef_3
+      // High Group (Pixels 8-15): Loaded into coef_4..coef_7
+
+      // filter_size is typically the stride in floats (e.g., 4)
+
+      // -- Load Low Group (Pixels 0,1,2,3 and 4,5,6,7 interleaved for Transpose macro) --
+      __m256 coef_0 = _mm256_load_2_m128(current_coeff + filter_size * 0, current_coeff + filter_size * 4);
+      __m256 coef_1 = _mm256_load_2_m128(current_coeff + filter_size * 1, current_coeff + filter_size * 5);
+      __m256 coef_2 = _mm256_load_2_m128(current_coeff + filter_size * 2, current_coeff + filter_size * 6);
+      __m256 coef_3 = _mm256_load_2_m128(current_coeff + filter_size * 3, current_coeff + filter_size * 7);
+
+      // -- Load High Group (Pixels 8,9,10,11 and 12,13,14,15 interleaved) --
+      // Note: Offsets are shifted by 8 relative to the Low Group
+      __m256 coef_4 = _mm256_load_2_m128(current_coeff + filter_size * 8, current_coeff + filter_size * 12);
+      __m256 coef_5 = _mm256_load_2_m128(current_coeff + filter_size * 9, current_coeff + filter_size * 13);
+      __m256 coef_6 = _mm256_load_2_m128(current_coeff + filter_size * 10, current_coeff + filter_size * 14);
+      __m256 coef_7 = _mm256_load_2_m128(current_coeff + filter_size * 11, current_coeff + filter_size * 15);
+
+      // ---------------------------------------------------------------------------
+      // 2. Transpose
+      // ---------------------------------------------------------------------------
+      // After transpose:
+      // coef_0 -> Tap 0 for Pixels 0-7
+      // coef_1 -> Tap 1 for Pixels 0-7 ... etc
+      _MM_TRANSPOSE8_LANE4_PS(coef_0, coef_1, coef_2, coef_3);
+
+      // coef_4 -> Tap 0 for Pixels 8-15
+      // coef_5 -> Tap 1 for Pixels 8-15 ... etc
+      _MM_TRANSPOSE8_LANE4_PS(coef_4, coef_5, coef_6, coef_7);
+
+      const int begin1 = program->pixel_offset[x + 0];
+      // These indexes are guaranteed to be 0..15 due to the earlier analysis,
+      // and can be used for the indexing parameter in combiner blendm mask, _mm256_permutevar8x32_ps
+      float* AVS_RESTRICT dst_ptr = dst + x + y_from * dst_pitch;
+      const float* src_ptr = src + begin1 + y_from * src_pitch;
+
+      // for partial_load only
+      const int remaining = program->source_size - begin1;
+      const int floats_to_load = remaining >= 16 ? 16 : remaining;
+
+      for (int y = y_from; y < y_to; ++y) {
+
+        // process scanline y
+        __m256 A;
+        __m256 B;
+
+        //__m256 data_src;
+        // We'll need exactly 2x8 floats starting from src+begin1
+        if constexpr (partial_load) {
+          // In the potentially unsafe zone (near the right edge of the image), we use a safe loading function
+          // to prevent reading beyond the allocated source scanline. This handles cases where loading 8 floats
+          // starting from 'src_ptr + beginX' might exceed the source buffer.
+          _mm256_load_512_partial_safe(/*ref*/A, /*ref*/B, src_ptr, floats_to_load);
+        }
+        else {
+          A = _mm256_loadu_ps(src_ptr);
+          B = _mm256_loadu_ps(src_ptr + 8);
+          // data_src = _mm256_loadu_ps(src_ptr); // load 8 source pixels, can contain garbage beyond the right edge in the last loop
+        }
+
+        // After we load 2x8 source pixels starting from begin1, we can be sure, that pixel_offset[x+0] .. pixel_offset[x+15] + 3 is
+        // within valid source range. Pre-check chooses permutex method only if all needed pixels fit within these 16 loaded pixels.
+
+        // Permute and Blend for Tap 0 (data_0)
+        __m256 A_perm_0L = _mm256_permutevar8x32_ps(A, taps[0].PL_A);
+        __m256 B_perm_0L = _mm256_permutevar8x32_ps(B, taps[0].PL_B);
+        __m256 data_0L = _mm256_blendv_ps(A_perm_0L, B_perm_0L, taps[0].ML_B); // Result: dst[x+0]..dst[x+7]
+
+        __m256 A_perm_0H = _mm256_permutevar8x32_ps(A, taps[0].PH_A);
+        __m256 B_perm_0H = _mm256_permutevar8x32_ps(B, taps[0].PH_B);
+        __m256 data_0H = _mm256_blendv_ps(A_perm_0H, B_perm_0H, taps[0].MH_B); // Result: dst[x+8]..dst[x+15]
+
+        // Repeat for data_1, data_2, data_3...
+        // Permute and Blend for Tap 1 (data_1)
+        __m256 A_perm_1L = _mm256_permutevar8x32_ps(A, taps[1].PL_A);
+        __m256 B_perm_1L = _mm256_permutevar8x32_ps(B, taps[1].PL_B);
+        __m256 data_1L = _mm256_blendv_ps(A_perm_1L, B_perm_1L, taps[1].ML_B); // Result: dst[x+0]..dst[x+7]
+
+        __m256 A_perm_1H = _mm256_permutevar8x32_ps(A, taps[1].PH_A);
+        __m256 B_perm_1H = _mm256_permutevar8x32_ps(B, taps[1].PH_B);
+        __m256 data_1H = _mm256_blendv_ps(A_perm_1H, B_perm_1H, taps[1].MH_B); // Result: dst[x+8]..dst[x+15]
+        // Permute and Blend for Tap 2 (data_2)
+        __m256 A_perm_2L = _mm256_permutevar8x32_ps(A, taps[2].PL_A);
+        __m256 B_perm_2L = _mm256_permutevar8x32_ps(B, taps[2].PL_B);
+        __m256 data_2L = _mm256_blendv_ps(A_perm_2L, B_perm_2L, taps[2].ML_B); // Result: dst[x+0]..dst[x+7]
+
+        __m256 A_perm_2H = _mm256_permutevar8x32_ps(A, taps[2].PH_A);
+        __m256 B_perm_2H = _mm256_permutevar8x32_ps(B, taps[2].PH_B);
+        __m256 data_2H = _mm256_blendv_ps(A_perm_2H, B_perm_2H, taps[2].MH_B); // Result: dst[x+8]..dst[x+15]
+        // Permute and Blend for Tap 3 (data_3)
+        __m256 A_perm_3L = _mm256_permutevar8x32_ps(A, taps[3].PL_A);
+        __m256 B_perm_3L = _mm256_permutevar8x32_ps(B, taps[3].PL_B);
+        __m256 data_3L = _mm256_blendv_ps(A_perm_3L, B_perm_3L, taps[3].ML_B); // Result: dst[x+0]..dst[x+7]
+
+        __m256 A_perm_3H = _mm256_permutevar8x32_ps(A, taps[3].PH_A);
+        __m256 B_perm_3H = _mm256_permutevar8x32_ps(B, taps[3].PH_B);
+        __m256 data_3H = _mm256_blendv_ps(A_perm_3H, B_perm_3H, taps[3].MH_B); // Result: dst[x+8]..dst[x+15]
+
+        // perm_0 .. perm_3 lo and hi contain the indexes to permute data_src into the correct order
+        // for each of the 16 output pixels so they index into 0..15 (guaranteed) range of the source data loaded above
+        // Since we have only 8-wide permute, we have to do two separate permutes and then blend the results together.
+
+        // Assuming these eight data vectors have been calculated via Permute+Blend:
+        // __m256 data_0L, data_0H;
+        // __m256 data_1L, data_1H;
+        // __m256 data_2L, data_2H;
+        // __m256 data_3L, data_3H;
+
+        // ---------------------------------------------------------------------------
+        // 3. Calculation
+        // ---------------------------------------------------------------------------
+
+        // --- Low Half (Pixels 0-7) ---
+        // Uses: data_0L..3L and coef_0..3
+
+        __m256 result0L = _mm256_mul_ps(data_0L, coef_0);       // Tap 0
+        __m256 result1L = _mm256_mul_ps(data_2L, coef_2);       // Tap 2
+
+        result0L = _mm256_fmadd_ps(data_1L, coef_1, result0L);  // Tap 1
+        result1L = _mm256_fmadd_ps(data_3L, coef_3, result1L);  // Tap 3
+
+        __m256 final_result_L = _mm256_add_ps(result0L, result1L);
+
+
+        // --- High Half (Pixels 8-15) ---
+        // Uses: data_0H..3H and coef_4..7
+        // Note: coef_4 corresponds to Tap 0 for this group, coef_5 to Tap 1, etc.
+
+        __m256 result0H = _mm256_mul_ps(data_0H, coef_4);       // Tap 0 (High)
+        __m256 result1H = _mm256_mul_ps(data_2H, coef_6);       // Tap 2 (High)
+
+        result0H = _mm256_fmadd_ps(data_1H, coef_5, result0H);  // Tap 1 (High)
+        result1H = _mm256_fmadd_ps(data_3H, coef_7, result1H);  // Tap 3 (High)
+
+        __m256 final_result_H = _mm256_add_ps(result0H, result1H);
+
+        // ---------------------------------------------------------------------------
+        // 4. Store
+        // ---------------------------------------------------------------------------
+
+        _mm256_store_ps(dst_ptr, final_result_L);     // dst[0..7]
+        _mm256_store_ps(dst_ptr + 8, final_result_H); // dst[8..15]
+
+        dst_ptr += dst_pitch;
+        src_ptr += src_pitch;
+      }
+      current_coeff += filter_size * 16;
+      }; // end of lambda
+
+    // Process the 'safe zone' where direct full unaligned loads are acceptable.
+    for (; x < width_safe_mod; x += PIXELS_AT_A_TIME)
+    {
+      do_h_float_core(std::false_type{}); // partial_load == false, use direct _mm_loadu_ps
+    }
+
+    // Process the potentially 'unsafe zone' near the image edge, using safe loading.
+    for (; x < width; x += PIXELS_AT_A_TIME)
+    {
+      do_h_float_core(std::true_type{}); // partial_load == true, use the safer '_mm256_load_partial_safe'
+    }
+  }
 
 }
+
 
 
 template<int filtersizemod4>
@@ -1730,7 +2252,7 @@ void resize_h_planar_float_avx2_gather_permutex_vstripe_ks4(BYTE* dst8, const BY
   bool bDoGather = resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(program);
   if (bDoGather)
   {
-    resize_h_planar_float_avx2_gather_vstripe_ks4<filtersizemod4>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel);
+    resize_h_planar_float_avx2_transpose_vstripe_ks4<filtersizemod4>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel);
   } // if bDoGather
   else
   {
@@ -1742,13 +2264,555 @@ void resize_h_planar_float_avx2_gather_permutex_vstripe_ks4(BYTE* dst8, const BY
 }
 
 // Instantiate them
-template void resize_h_planar_float_avx2_gather_vstripe_ks4<0>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
-template void resize_h_planar_float_avx2_gather_vstripe_ks4<1>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
-template void resize_h_planar_float_avx2_gather_vstripe_ks4<2>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
-template void resize_h_planar_float_avx2_gather_vstripe_ks4<3>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+template void resize_h_planar_float_avx2_transpose_vstripe_ks4<0>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+template void resize_h_planar_float_avx2_transpose_vstripe_ks4<1>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+template void resize_h_planar_float_avx2_transpose_vstripe_ks4<2>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+template void resize_h_planar_float_avx2_transpose_vstripe_ks4<3>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 
 // Instantiate them
 template void resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<0>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 template void resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<1>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 template void resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<2>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 template void resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<3>(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+
+//--------------------------------------------------------------------------
+
+// AVX2 Horizontal float
+
+// Three helpers, each for processing 4 target pixels from 16, 8 and 4 source pixel/coeff pairs.
+
+// Helper, implemented for AVX2 (simulating zext)
+// zero-extend 128-bit float vector to 256-bit float vector
+AVS_FORCEINLINE static __m256 _mm256_zextps128_ps256_avx2(__m128 a)
+{
+  __m256 zero_v = _mm256_setzero_ps();
+  return _mm256_insertf128_ps(zero_v, a, 0);
+}
+
+// 4 target pixels, each from 16 source pixel/coeff pair
+// Called only when accessing 16 source pixels and coefficients at a time is safe
+// AVX2 OPTIMIZATION: Process 2x8 blocks to simulate the 16-block stride
+AVS_FORCEINLINE static void process_pix4_coeff16_h_float_core_avx2(
+  const float* src,
+  int begin1, int begin2, int begin3, int begin4,
+  const float* current_coeff,
+  int filter_size,
+  __m256& result1, __m256& result2, __m256& result3, __m256& result4)
+{
+  // --- Block A: First 8 floats ---
+  __m256 data_1_a = _mm256_loadu_ps(src + begin1);
+  __m256 coeff_1_a = _mm256_loadu_ps(current_coeff);
+  result1 = _mm256_fmadd_ps(data_1_a, coeff_1_a, result1);
+  __m256 data_1_b = _mm256_loadu_ps(src + begin1 + 8);
+  __m256 coeff_1_b = _mm256_loadu_ps(current_coeff + 8);
+  result1 = _mm256_fmadd_ps(data_1_b, coeff_1_b, result1);
+
+  __m256 data_2_a = _mm256_loadu_ps(src + begin2);
+  __m256 coeff_2_a = _mm256_loadu_ps(current_coeff + 1 * filter_size);
+  result2 = _mm256_fmadd_ps(data_2_a, coeff_2_a, result2);
+  __m256 data_2_b = _mm256_loadu_ps(src + begin2 + 8);
+  __m256 coeff_2_b = _mm256_loadu_ps(current_coeff + 1 * filter_size + 8);
+  result2 = _mm256_fmadd_ps(data_2_b, coeff_2_b, result2);
+
+  __m256 data_3_a = _mm256_loadu_ps(src + begin3);
+  __m256 coeff_3_a = _mm256_loadu_ps(current_coeff + 2 * filter_size);
+  result3 = _mm256_fmadd_ps(data_3_a, coeff_3_a, result3);
+  __m256 data_3_b = _mm256_loadu_ps(src + begin3 + 8);
+  __m256 coeff_3_b = _mm256_loadu_ps(current_coeff + 2 * filter_size + 8);
+  result3 = _mm256_fmadd_ps(data_3_b, coeff_3_b, result3);
+
+  __m256 data_4_a = _mm256_loadu_ps(src + begin4);
+  __m256 coeff_4_a = _mm256_loadu_ps(current_coeff + 3 * filter_size);
+  result4 = _mm256_fmadd_ps(data_4_a, coeff_4_a, result4);
+  __m256 data_4_b = _mm256_loadu_ps(src + begin4 + 8);
+  __m256 coeff_4_b = _mm256_loadu_ps(current_coeff + 3 * filter_size + 8);
+  result4 = _mm256_fmadd_ps(data_4_b, coeff_4_b, result4);
+
+}
+
+// 4 target pixels, each from 8 source pixel/coeff pair
+// Called only when accessing 8 source pixels and coefficients at a time is safe
+AVS_FORCEINLINE static void process_pix4_coeff8_h_float_core_avx2(
+  const float* src,
+  int begin1, int begin2, int begin3, int begin4,
+  const float* current_coeff,
+  int filter_size,
+  __m256& result1, __m256& result2, __m256& result3, __m256& result4)
+{
+  // Load 8 source floats for each of the four beginning source offsets
+  // Load 8 coefficients for each of the four output pixels
+  __m256 data_1 = _mm256_loadu_ps(src + begin1);
+  __m256 coeff_1 = _mm256_load_ps(current_coeff);                     // 8 coeffs for pixel 1
+  result1 = _mm256_fmadd_ps(data_1, coeff_1, result1);
+
+  __m256 data_2 = _mm256_loadu_ps(src + begin2);
+  __m256 coeff_2 = _mm256_load_ps(current_coeff + 1 * filter_size); // 8 coeffs for pixel 2
+  result2 = _mm256_fmadd_ps(data_2, coeff_2, result2);
+
+  __m256 data_3 = _mm256_loadu_ps(src + begin3);
+  __m256 coeff_3 = _mm256_load_ps(current_coeff + 2 * filter_size); // 8 coeffs for pixel 3
+  result3 = _mm256_fmadd_ps(data_3, coeff_3, result3);
+
+  __m256 data_4 = _mm256_loadu_ps(src + begin4);
+  __m256 coeff_4 = _mm256_load_ps(current_coeff + 3 * filter_size); // 8 coeffs for pixel 4
+  result4 = _mm256_fmadd_ps(data_4, coeff_4, result4);
+}
+
+// 4 target pixels, each from 4 source pixel/coeff pair.
+// Called only for first iteration when results are not initialized.
+// Otherwise same as process_pix4_coeff8_h_float_core.
+// Optimized: Uses 256-bit MUL directly on zero-extended loads.
+AVS_FORCEINLINE static void process_pix4_coeff4_h_float_core_first_avx2(
+  const float* src,
+  int begin1, int begin2, int begin3, int begin4,
+  const float* current_coeff,
+  int filter_size,
+  __m256& result1, __m256& result2, __m256& result3, __m256& result4)
+{
+  // Note: _mm_loadu_ps/_mm_load_ps automatically zero the upper 128 bits of the YMM register.
+  // We cast them to __m256 to allow using _mm256_mul_ps, which results in correct zero-extended output.
+
+  // Pixel 1
+  __m256 data_1 = _mm256_castps128_ps256(_mm_loadu_ps(src + begin1));
+  __m256 coeff_1 = _mm256_castps128_ps256(_mm_load_ps(current_coeff));
+  result1 = _mm256_mul_ps(data_1, coeff_1);
+
+  // Pixel 2
+  __m256 data_2 = _mm256_castps128_ps256(_mm_loadu_ps(src + begin2));
+  __m256 coeff_2 = _mm256_castps128_ps256(_mm_load_ps(current_coeff + 1 * filter_size));
+  result2 = _mm256_mul_ps(data_2, coeff_2);
+
+  // Pixel 3
+  __m256 data_3 = _mm256_castps128_ps256(_mm_loadu_ps(src + begin3));
+  __m256 coeff_3 = _mm256_castps128_ps256(_mm_load_ps(current_coeff + 2 * filter_size));
+  result3 = _mm256_mul_ps(data_3, coeff_3);
+
+  // Pixel 4
+  __m256 data_4 = _mm256_castps128_ps256(_mm_loadu_ps(src + begin4));
+  __m256 coeff_4 = _mm256_castps128_ps256(_mm_load_ps(current_coeff + 3 * filter_size));
+  result4 = _mm256_mul_ps(data_4, coeff_4);
+}
+
+#define HAS_COEFF16_STEP
+
+// filtersize_hint: special: 0..4 for 4,8,16,24,32. Generic: -1
+// filter_size is an aligned value and always multiple of 8 (prerequisite)
+template<bool safe_aligned_mode, int filtersize_hint>
+AVS_FORCEINLINE static void process_four_pixels_h_float_pix4of16_ks_4_8_16_avx2(
+  const float* src_ptr,
+  int begin1, int begin2, int begin3, int begin4,
+  float* current_coeff,
+  int filter_size,
+  __m256& result1, __m256& result2, __m256& result3, __m256& result4,
+  int kernel_size)
+{
+
+  // very special case: filter size <= 4
+  if constexpr (safe_aligned_mode) {
+    if constexpr(filtersize_hint == 0) {
+      // Process 4 target pixels and 4 source pixels/coefficients at a time
+      // XMM-based loop internally, but returns __m256 with upper 128 cleared
+      // Do not assume initialized zeros in result1..4, they will be set here.
+      process_pix4_coeff4_h_float_core_first_avx2(
+        src_ptr + 0, begin1, begin2, begin3, begin4,
+        current_coeff + 0,
+        filter_size,
+        result1, result2, result3, result4);
+      return;
+    }
+  }
+
+  // not: when filtersize_hint == -1, it is not covered with filtersize_hint maximum 4 case, which means
+  // that real filter size is over 32.
+  // Thus we surely can have 2x16 coeff processing here.
+
+  int i = 0;
+#ifdef HAS_COEFF16_STEP
+  if constexpr(filtersize_hint == -1) {
+    // Handle 2x16 coeffs first, since we know that real filter size is over 32 here, because of filtersize_hint == -1
+    const int ksmod16_sure = 32;
+    // this will be unrolled probably
+    for (; i < ksmod16_sure; i += 16) {
+      // Direct AVX2 adaptation: The core function now updates resultX (YMM) directly
+      process_pix4_coeff16_h_float_core_avx2(
+        src_ptr + i, begin1, begin2, begin3, begin4,
+        current_coeff + i,
+        filter_size,
+        result1, result2, result3, result4);
+    }
+    // processed 32 coeffs from the kernel, do the rest
+    const int ksmod16 = safe_aligned_mode ? (filter_size / 16 * 16) : (kernel_size / 16 * 16);
+    // Process 4 target pixels and 16 source pixels/coefficients at a time
+    for (; i < ksmod16; i += 16) {
+      // Direct AVX2 adaptation: The core function now updates resultX (YMM) directly
+      process_pix4_coeff16_h_float_core_avx2(
+        src_ptr + i, begin1, begin2, begin3, begin4,
+        current_coeff + i,
+        filter_size,
+        result1, result2, result3, result4);
+    }
+  }
+  else {
+    // do by 16 coeffs till possible
+    if (filtersize_hint >= 2) {
+      const int ksmod16 = safe_aligned_mode ? (filter_size / 16 * 16) : (kernel_size / 16 * 16);
+      // Process 4 target pixels and 16 source pixels/coefficients at a time
+      for (; i < ksmod16; i += 16) {
+        // Direct AVX2 adaptation: The core function now updates resultX (YMM) directly
+        process_pix4_coeff16_h_float_core_avx2(
+          src_ptr + i, begin1, begin2, begin3, begin4,
+          current_coeff + i,
+          filter_size,
+          result1, result2, result3, result4);
+      }
+    }
+  }
+
+  // filter sizes 16 or 32 can return here
+  if constexpr (safe_aligned_mode && (filtersize_hint == 2 || filtersize_hint == 4)) {
+    return;
+  }
+
+  if constexpr (!safe_aligned_mode) {
+    if (i == kernel_size) return; // kernel_size is not known compile time
+  }
+#else
+  // no coeff16 step
+  if constexpr (filtersize_hint == -1) {
+    // Handle 4x8 coeffs first, since we know that real filter size is over 32 here, because of filtersize_hint == -1
+    const int ksmod8_sure = 32;
+    // this will be unrolled probably
+    for (; i < ksmod8_sure; i += 8) {
+      process_pix4_coeff8_h_float_core_avx2(
+        src_ptr + i, begin1, begin2, begin3, begin4,
+        current_coeff + i,
+        filter_size,
+        result1, result2, result3, result4);
+    }
+  }
+#endif
+
+  // When to do the coeff8 step if we had the coeff16 step enabled:
+  // not safe-aligned mode: always. E.g. kernel_size == 28 -> 16 done, now 10 rest, do 8 next
+  // filtersize_hint == -1: not-compile-time known filtersize (kernel_size / 16 * 16 done, rest follows)
+  // filtersize_hint == 1 or 3: 0*16 or 1*16 done, now do 1*8
+#ifdef HAS_COEFF16_STEP
+  if (!safe_aligned_mode || filtersize_hint == -1 || filtersize_hint == 1 || filtersize_hint == 3) {
+#else
+  if (true) {
+#endif
+    // 32 bytes contain 8 floats. We will use 256-bit registers (YMM).
+    const int ksmod8 = safe_aligned_mode ? (filter_size / 8 * 8) : (kernel_size / 8 * 8);
+
+    // Process 4 target pixels and 8 source pixels/coefficients at a time (YMM-based loop)
+    for (; i < ksmod8; i += 8) {
+      process_pix4_coeff8_h_float_core_avx2(
+        src_ptr + i, begin1, begin2, begin3, begin4,
+        current_coeff + i,
+        filter_size,
+        result1, result2, result3, result4);
+    }
+  }
+
+  if constexpr (!safe_aligned_mode) {
+    // Right edge case.
+    // Coeffs are zero padded, reading them is no problem.
+    // But if we read past the end of source then we can get possible NaN contamination.
+    // Handle the remainder: 1 to 7 source/coefficient elements.
+    // real_kernel_size is used here, it's guaranteed that reading real_kernel_size elements
+    // from any pixel_offset[] is safe and ends within the source buffer.
+    // Optional 4-2-1 processing loop.
+
+    if (i == kernel_size) return;
+
+    // --- Define Base Pointers for Source and Coefficients ---
+    const float* src_ptr1 = src_ptr + begin1;
+    const float* src_ptr2 = src_ptr + begin2;
+    const float* src_ptr3 = src_ptr + begin3;
+    const float* src_ptr4 = src_ptr + begin4;
+
+    float* current_coeff2 = current_coeff + 1 * filter_size;
+    float* current_coeff3 = current_coeff + 2 * filter_size;
+    float* current_coeff4 = current_coeff + 3 * filter_size;
+
+    const int ksmod4 = kernel_size / 4 * 4;
+
+    // -------------------------------------------------------------------
+    // Mod 4 Block (4 elements for four pixels using __m128)
+    // -------------------------------------------------------------------
+    if (i < ksmod4) {
+
+      // 128-bit loads (movups/movaps) automatically zero the upper 128 bits of the YMM register.
+      // We cast to __m256 and FMA directly. 
+      // Lower 128 bits: Accumulated normally.
+      // Upper 128 bits: 0 * 0 + Result_High -> Result_High preserved.
+
+      // Pixel 1
+      __m256 data_1 = _mm256_castps128_ps256(_mm_loadu_ps(src_ptr1 + i));
+      __m256 coeff_1 = _mm256_castps128_ps256(_mm_load_ps(current_coeff + i));
+      result1 = _mm256_fmadd_ps(data_1, coeff_1, result1);
+
+      // Pixel 2
+      __m256 data_2 = _mm256_castps128_ps256(_mm_loadu_ps(src_ptr2 + i));
+      __m256 coeff_2 = _mm256_castps128_ps256(_mm_load_ps(current_coeff2 + i));
+      result2 = _mm256_fmadd_ps(data_2, coeff_2, result2);
+
+      // Pixel 3
+      __m256 data_3 = _mm256_castps128_ps256(_mm_loadu_ps(src_ptr3 + i));
+      __m256 coeff_3 = _mm256_castps128_ps256(_mm_load_ps(current_coeff3 + i));
+      result3 = _mm256_fmadd_ps(data_3, coeff_3, result3);
+
+      // Pixel 4
+      __m256 data_4 = _mm256_castps128_ps256(_mm_loadu_ps(src_ptr4 + i));
+      __m256 coeff_4 = _mm256_castps128_ps256(_mm_load_ps(current_coeff4 + i));
+      result4 = _mm256_fmadd_ps(data_4, coeff_4, result4);
+
+      i += 4;
+      if (i == kernel_size) return;
+    }
+
+    const int ksmod2 = kernel_size / 2 * 2;
+
+    // -------------------------------------------------------------------
+    // New Mod 2 Block (2 elements for four pixels using __m128)
+    // Mod 2 Block (Optimized: _mm_load_sd zeros upper bits 128-255 too!)
+    // -------------------------------------------------------------------
+    if (i < ksmod2) {
+      // _mm_load_sd (vmovsd) loads 64 bits and zeroes everything else in the register (up to 256 bits).
+      // Vector looks like: [0, 0, 0, 0, 0, 0, val1, val0]
+      // We can use the exact same FMA trick.
+
+      auto load_2_floats_as_ymm = [](const float* p) {
+        return _mm256_castps128_ps256(_mm_castpd_ps(_mm_load_sd(reinterpret_cast<const double*>(p))));
+        };
+
+      result1 = _mm256_fmadd_ps(load_2_floats_as_ymm(src_ptr1 + i), load_2_floats_as_ymm(current_coeff + i), result1);
+      result2 = _mm256_fmadd_ps(load_2_floats_as_ymm(src_ptr2 + i), load_2_floats_as_ymm(current_coeff2 + i), result2);
+      result3 = _mm256_fmadd_ps(load_2_floats_as_ymm(src_ptr3 + i), load_2_floats_as_ymm(current_coeff3 + i), result3);
+      result4 = _mm256_fmadd_ps(load_2_floats_as_ymm(src_ptr4 + i), load_2_floats_as_ymm(current_coeff4 + i), result4);
+
+      i += 2;
+      if (i == kernel_size) return;
+    }
+
+    // -------------------------------------------------------------------
+    // Fallback Scalar Operation (1 element remaining)
+    // -------------------------------------------------------------------
+    if (i < kernel_size) {
+
+      // Optimized scalar loop for the single remaining element
+      float final_scalar1 = src_ptr1[i] * current_coeff[i];
+      float final_scalar2 = src_ptr2[i] * current_coeff2[i];
+      float final_scalar3 = src_ptr3[i] * current_coeff3[i];
+      float final_scalar4 = src_ptr4[i] * current_coeff4[i];
+
+      // Using the helper for the last one to be safe/consistent with scalar ops
+      result1 = _mm256_add_ps(result1, _mm256_zextps128_ps256_avx2(_mm_set_ss(final_scalar1)));
+      result2 = _mm256_add_ps(result2, _mm256_zextps128_ps256_avx2(_mm_set_ss(final_scalar2)));
+      result3 = _mm256_add_ps(result3, _mm256_zextps128_ps256_avx2(_mm_set_ss(final_scalar3)));
+      result4 = _mm256_add_ps(result4, _mm256_zextps128_ps256_avx2(_mm_set_ss(final_scalar4)));
+      // i is now equal to kernel_size (i++)
+    }
+  }
+}
+
+
+template<bool is_safe, int filtersize_hint>
+AVS_FORCEINLINE static void process_sixteen_pixels_h_float_pix16_sub4_ks_4_8_16_avx2(
+  const float* src, int x, float* current_coeff_base,
+  int filter_size, // 8, 16, 24, 32 are quasi-constexpr here, others not compile-time known but still aligned to 8
+  float* dst,
+  ResamplingProgram* program)
+{
+  assert(program->filter_size_alignment == 8);
+
+  float* current_coeff = current_coeff_base + x * filter_size;
+  const int unaligned_kernel_size = program->filter_size_real;
+  const __m256 zero256 = _mm256_setzero_ps();
+
+  // --- Block 1: Pixels 0, 1, 2, 3 ---
+  __m256 result0 = zero256;
+  __m256 result1 = zero256;
+  __m256 result2 = zero256;
+  __m256 result3 = zero256;
+
+  int begin0 = program->pixel_offset[x + 0];
+  int begin1 = program->pixel_offset[x + 1];
+  int begin2 = program->pixel_offset[x + 2];
+  int begin3 = program->pixel_offset[x + 3];
+
+  process_four_pixels_h_float_pix4of16_ks_4_8_16_avx2<is_safe, filtersize_hint>(
+    src, begin0, begin1, begin2, begin3, current_coeff, filter_size,
+    result0, result1, result2, result3, unaligned_kernel_size);
+  current_coeff += 4 * filter_size;
+
+  // --- Block 2: Pixels 4, 5, 6, 7 ---
+  __m256 result4 = zero256;
+  __m256 result5 = zero256;
+  __m256 result6 = zero256;
+  __m256 result7 = zero256;
+
+  int begin4 = program->pixel_offset[x + 4];
+  int begin5 = program->pixel_offset[x + 5];
+  int begin6 = program->pixel_offset[x + 6];
+  int begin7 = program->pixel_offset[x + 7];
+
+  process_four_pixels_h_float_pix4of16_ks_4_8_16_avx2<is_safe, filtersize_hint>(
+    src, begin4, begin5, begin6, begin7, current_coeff, filter_size,
+    result4, result5, result6, result7, unaligned_kernel_size);
+  current_coeff += 4 * filter_size;
+
+  // ---------------------------------------------------------------------------
+  // REDUCTION FOR PIXELS 0-7 (Result256_low)
+  // ---------------------------------------------------------------------------
+
+  // Round 1: Reduce pairs (8 vectors -> 4 vectors)
+  __m256 sum01 = _mm256_hadd_ps(result0, result1);
+  __m256 sum23 = _mm256_hadd_ps(result2, result3);
+  __m256 sum45 = _mm256_hadd_ps(result4, result5);
+  __m256 sum67 = _mm256_hadd_ps(result6, result7);
+
+  // Round 2: Reduce quads (4 vectors -> 2 vectors)
+  __m256 sum0123 = _mm256_hadd_ps(sum01, sum23);
+  __m256 sum4567 = _mm256_hadd_ps(sum45, sum67);
+
+  // Round 3: Final Merge (Add Lower 128-bit to Upper 128-bit)
+  __m128 lo_0123 = _mm256_castps256_ps128(sum0123);
+  __m128 lo_4567 = _mm256_castps256_ps128(sum4567);
+  __m256 result_lo = _mm256_insertf128_ps(_mm256_castps128_ps256(lo_0123), lo_4567, 1);
+
+  __m128 hi_0123 = _mm256_extractf128_ps(sum0123, 1);
+  __m128 hi_4567 = _mm256_extractf128_ps(sum4567, 1);
+  __m256 result_hi = _mm256_insertf128_ps(_mm256_castps128_ps256(hi_0123), hi_4567, 1);
+
+  // Assemble the Low 256-bit result (Pixels 0-7)
+  __m256 result256_low = _mm256_add_ps(result_lo, result_hi);
+  _mm256_stream_ps(reinterpret_cast<float*>(dst + x), result256_low);
+
+
+  // --- Block 3: Pixels 8, 9, 10, 11 ---
+  __m256 result8 = zero256;
+  __m256 result9 = zero256;
+  __m256 result10 = zero256;
+  __m256 result11 = zero256;
+
+  int begin8 = program->pixel_offset[x + 8];
+  int begin9 = program->pixel_offset[x + 9];
+  int begin10 = program->pixel_offset[x + 10];
+  int begin11 = program->pixel_offset[x + 11];
+
+  process_four_pixels_h_float_pix4of16_ks_4_8_16_avx2<is_safe, filtersize_hint>(
+    src, begin8, begin9, begin10, begin11, current_coeff, filter_size,
+    result8, result9, result10, result11, unaligned_kernel_size);
+  current_coeff += 4 * filter_size;
+
+  // --- Block 4: Pixels 12, 13, 14, 15 ---
+  __m256 result12 = zero256;
+  __m256 result13 = zero256;
+  __m256 result14 = zero256;
+  __m256 result15 = zero256;
+
+  int begin12 = program->pixel_offset[x + 12];
+  int begin13 = program->pixel_offset[x + 13];
+  int begin14 = program->pixel_offset[x + 14];
+  int begin15 = program->pixel_offset[x + 15];
+
+  process_four_pixels_h_float_pix4of16_ks_4_8_16_avx2<is_safe, filtersize_hint>(
+    src, begin12, begin13, begin14, begin15, current_coeff, filter_size,
+    result12, result13, result14, result15, unaligned_kernel_size);
+
+
+  // ---------------------------------------------------------------------------
+  // REDUCTION FOR PIXELS 8-15 (Result256_high)
+  // ---------------------------------------------------------------------------
+
+  // Round 1: Reduce pairs (8 vectors -> 4 vectors)
+  __m256 sum89 = _mm256_hadd_ps(result8, result9);
+  __m256 sum1011 = _mm256_hadd_ps(result10, result11);
+  __m256 sum1213 = _mm256_hadd_ps(result12, result13);
+  __m256 sum1415 = _mm256_hadd_ps(result14, result15);
+
+  // Round 2: Reduce quads (4 vectors -> 2 vectors)
+  __m256 sum8_11 = _mm256_hadd_ps(sum89, sum1011);
+  __m256 sum12_15 = _mm256_hadd_ps(sum1213, sum1415);
+
+  // Round 3: Final Merge (Add Lower 128-bit to Upper 128-bit)
+  __m128 lo_8_11 = _mm256_castps256_ps128(sum8_11);
+  __m128 lo_12_15 = _mm256_castps256_ps128(sum12_15);
+  __m256 result_lo_high = _mm256_insertf128_ps(_mm256_castps128_ps256(lo_8_11), lo_12_15, 1);
+
+  __m128 hi_8_11 = _mm256_extractf128_ps(sum8_11, 1);
+  __m128 hi_12_15 = _mm256_extractf128_ps(sum12_15, 1);
+  __m256 result_hi_high = _mm256_insertf128_ps(_mm256_castps128_ps256(hi_8_11), hi_12_15, 1);
+
+  // Assemble the High 256-bit result (Pixels 8-15)
+  __m256 result256_high = _mm256_add_ps(result_lo_high, result_hi_high);
+
+  // ---------------------------------------------------------------------------
+  // Stream the two 256-bit results
+  // ---------------------------------------------------------------------------
+  _mm256_stream_ps(reinterpret_cast<float*>(dst + x + 8), result256_high);
+}
+
+// filtersizealigned8: special: 0, 1..4, Generic : -1
+template<int filtersize_hint>
+static void internal_resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel) {
+  AVS_UNUSED(bits_per_pixel);
+  // filter_size is aligned to 8 (prerequisite), contrary that we have a special case for filter size <=4
+
+  // We note that when template is used, filter_size is quasi-constexpr if filtersize_hint != -1.
+  // When filtersize_hint == -1, then program->filter_size is aligned to 8 anyway, but not known at compile time.
+  const int filter_size =
+    filtersize_hint == 0 ? 8 : // though we'll optimize for 4 internally, coeff buffer is still allocated for 8
+    (filtersize_hint >= 1) ? filtersize_hint * 8 : program->filter_size; // this latter is always aligned to 8 as well
+
+  const float* src = (float*)src8;
+  float* dst = (float*)dst8;
+  dst_pitch = dst_pitch / sizeof(float);
+  src_pitch = src_pitch / sizeof(float);
+
+  constexpr int PIXELS_AT_A_TIME = 16;
+  // Align safe zone to 16 pixels
+  const int w_safe_mod16 = (program->safelimit_16_pixels.overread_possible ? program->safelimit_16_pixels.source_overread_beyond_targetx : width) / PIXELS_AT_A_TIME * PIXELS_AT_A_TIME;
+
+  for (int y = 0; y < height; y++) {
+    float* current_coeff_base = program->pixel_coefficient_float;
+
+    // Process safe aligned pixels
+    for (int x = 0; x < w_safe_mod16; x += PIXELS_AT_A_TIME) {
+      process_sixteen_pixels_h_float_pix16_sub4_ks_4_8_16_avx2<true, filtersize_hint>(src, x, current_coeff_base, filter_size, dst, program);
+    }
+
+    // Process up to the actual kernel size (unsafe zone)
+    for (int x = w_safe_mod16; x < width; x += PIXELS_AT_A_TIME) {
+      process_sixteen_pixels_h_float_pix16_sub4_ks_4_8_16_avx2<false, filtersize_hint>(src, x, current_coeff_base, filter_size, dst, program);
+    }
+
+    dst += dst_pitch;
+    src += src_pitch;
+  }
+}
+
+// Winner implementation: resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16;
+void resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel) {
+  const int filter_size = program->filter_size;
+  // Expected alignment
+  assert(program->filter_size_alignment == 8);
+
+  // Dispatcher template now supports filter_size aligned to 8 (8, 16, 24, 32) and a special case for <=4
+  // Larger filter sizes will use the generic method (-1) which still benefit from 16-8-4 coeff processing blocks.
+  if (filter_size == 1 * 8)
+    if (program->filter_size_real <= 4)
+      internal_resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16<0>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel); // Internally optimized for 4
+    else
+      internal_resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16<1>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel); // Internally optimized for 8
+  else if (filter_size == 2 * 8) // Internally optimized for 16
+    internal_resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16<2>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel);
+  else if (filter_size == 3 * 8) // Internally optimized for 16+8
+    internal_resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16<3>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel);
+  else if (filter_size == 4 * 8) // Internally optimized for 2*16
+    internal_resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16<4>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel);
+  else // -1: basic method, use program->filter_size, internally optimized for calculating coeffs in N*16 + 8 + 4 + 2 + 1 blocks
+    internal_resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16<-1>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel);
+}
+
