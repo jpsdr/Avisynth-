@@ -44,6 +44,7 @@ template<bool lessthan16bit>
 void resizer_h_avx2_generic_uint16_t(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 
 void resizer_h_avx2_generic_float(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+void resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 
 void resize_v_avx2_planar_uint8_t(BYTE* dst, const BYTE* src, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int target_height, int bits_per_pixel);
 
@@ -57,12 +58,18 @@ void resize_v_avx2_planar_float_w_sr(BYTE* dst0, const BYTE* src0, int dst_pitch
 template<int filtersizemod4>
 void resize_h_planar_float_avx_transpose_vstripe_ks4(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 
-bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(int width, ResamplingProgram* program);
+bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(ResamplingProgram* program);
+
+bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_pix16_check(ResamplingProgram* program);
 
 template<int filtersizemod4>
-void resize_h_planar_float_avx2_gather_vstripe_ks4(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+void resize_h_planar_float_avx2_transpose_vstripe_ks4(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
 
 void resize_h_planar_float_avx2_permutex_vstripe_ks4(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+
+void resize_h_planar_float_avx2_permutex_vstripe_ks4_pix16(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel);
+
+int resampler_h_float_detect_optimal_scanline(int src_width, int tgt_width, size_t l2_cache_size_bytes);
 
 // combined gather + permutex version
 template<int filtersizemod4>
