@@ -1293,6 +1293,7 @@ FilteredResizeH::FilteredResizeH(PClip _child, double subrange_left, double subr
   : GenericVideoFilter(_child),
   resampling_program_luma(nullptr), resampling_program_chroma(nullptr), 
   resampler_h_luma(nullptr), resampler_h_chroma(nullptr),
+  resampler_h_luma_mt(nullptr), resampler_h_chroma_mt(nullptr),
   resampler_luma(nullptr), resampler_chroma(nullptr),
   num_threads(0)
 
@@ -1457,10 +1458,10 @@ FilteredResizeH::FilteredResizeH(PClip _child, double subrange_left, double subr
     }
     else {
       // planar format (or Y)
-      resampler_h_luma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_luma, env);
+      resampler_h_luma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_luma, /*out*/resampler_h_luma_mt, env);
 
       if (!grey && !isRGBPfamily) {
-        resampler_h_chroma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_chroma, env);
+        resampler_h_chroma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_chroma, /*out*/resampler_h_chroma_mt, env);
       }
     }
   // Change target video info size
@@ -1541,27 +1542,30 @@ PVideoFrame __stdcall FilteredResizeH::GetFrame(int n, IScriptEnvironment* env)
     env->Free(temp_2);
   }
   else {
+    // depending on MT or not, select proper resizer if alternative is available
+    ResamplerH current_resampler_h_luma = (num_threads > 1 && resampler_h_luma_mt != nullptr) ? resampler_h_luma_mt : resampler_h_luma;
+    ResamplerH current_resampler_h_chroma = (num_threads > 1 && resampler_h_chroma_mt != nullptr) ? resampler_h_chroma_mt : resampler_h_chroma;
 
     // Y Plane
-    resampler_h_luma(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
+    current_resampler_h_luma(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
 
     if (isRGBPfamily) {
-      resampler_h_luma(dst->GetWritePtr(PLANAR_B), src->GetReadPtr(PLANAR_B), dst->GetPitch(PLANAR_B), src->GetPitch(PLANAR_B), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
-      resampler_h_luma(dst->GetWritePtr(PLANAR_R), src->GetReadPtr(PLANAR_R), dst->GetPitch(PLANAR_R), src->GetPitch(PLANAR_R), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
+      current_resampler_h_luma(dst->GetWritePtr(PLANAR_B), src->GetReadPtr(PLANAR_B), dst->GetPitch(PLANAR_B), src->GetPitch(PLANAR_B), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
+      current_resampler_h_luma(dst->GetWritePtr(PLANAR_R), src->GetReadPtr(PLANAR_R), dst->GetPitch(PLANAR_R), src->GetPitch(PLANAR_R), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
     }
     else if (!grey) {
       const int dst_chroma_width = dst_width >> vi.GetPlaneWidthSubsampling(PLANAR_U);
       const int dst_chroma_height = dst_height >> vi.GetPlaneHeightSubsampling(PLANAR_U);
 
       // U Plane
-      resampler_h_chroma(dst->GetWritePtr(PLANAR_U), src->GetReadPtr(PLANAR_U), dst->GetPitch(PLANAR_U), src->GetPitch(PLANAR_U), resampling_program_chroma, dst_chroma_width, dst_chroma_height, bits_per_pixel);
+      current_resampler_h_chroma(dst->GetWritePtr(PLANAR_U), src->GetReadPtr(PLANAR_U), dst->GetPitch(PLANAR_U), src->GetPitch(PLANAR_U), resampling_program_chroma, dst_chroma_width, dst_chroma_height, bits_per_pixel);
 
       // V Plane
-      resampler_h_chroma(dst->GetWritePtr(PLANAR_V), src->GetReadPtr(PLANAR_V), dst->GetPitch(PLANAR_V), src->GetPitch(PLANAR_V), resampling_program_chroma, dst_chroma_width, dst_chroma_height, bits_per_pixel);
+      current_resampler_h_chroma(dst->GetWritePtr(PLANAR_V), src->GetReadPtr(PLANAR_V), dst->GetPitch(PLANAR_V), src->GetPitch(PLANAR_V), resampling_program_chroma, dst_chroma_width, dst_chroma_height, bits_per_pixel);
     }
     if (vi.IsYUVA() || vi.IsPlanarRGBA())
     {
-      resampler_h_luma(dst->GetWritePtr(PLANAR_A), src->GetReadPtr(PLANAR_A), dst->GetPitch(PLANAR_A), src->GetPitch(PLANAR_A), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
+      current_resampler_h_luma(dst->GetWritePtr(PLANAR_A), src->GetReadPtr(PLANAR_A), dst->GetPitch(PLANAR_A), src->GetPitch(PLANAR_A), resampling_program_luma, dst_width, dst_height, bits_per_pixel);
     }
 
   }
@@ -1569,13 +1573,9 @@ PVideoFrame __stdcall FilteredResizeH::GetFrame(int n, IScriptEnvironment* env)
   return dst;
 }
 
-// FIXME: enable this when we have two dispatch paths for MT and non-MT
-// (ks4 specialized functions currently are slower in MT than in non-MT)
-
-// #define SAFE_KS4_MT
-
-ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pixel, ResamplingProgram* program, IScriptEnvironment* env)
+ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pixel, ResamplingProgram* program, ResamplerH &out_resampler_h_alternative_for_mt, IScriptEnvironment* env)
 {
+  out_resampler_h_alternative_for_mt = nullptr;
   int simd_coeff_count_padding = 8;
 
   // Both 8-bit and 16-bit SSSE3 and AVX2 horizontal resizers benefit from processing 16 pixels per cycle.
@@ -1629,25 +1629,27 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
     if (((CPU & CPUF_AVX512_FAST) == CPUF_AVX512_FAST)) {
       // feature flag, grouping many avx512 features
 
-#ifdef SAFE_KS4_MT
-      // Specialized ks<=4 functions disabled until we can handle two MT and non-MT disspatch properly
-      // these perform very poorly in Prefetch
+      // these perform very poorly in Prefetch, so we provide alternative generic version for MT
+
       if (program->filter_size_real <= 4) {
         // up to 4 coeffs it can be highly optimized with transposes, gather/permutex choice
+        out_resampler_h_alternative_for_mt = resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16; // jolly joker
         if (resize_h_planar_float_avx512_gather_permutex_vstripe_ks4_check(program)) {
-          switch (program->filter_size_real) {
-          case 1: return resize_h_planar_float_avx512_transpose_vstripe_ks4<1>; break;
-          case 2: return resize_h_planar_float_avx512_transpose_vstripe_ks4<2>; break;
-          case 3: return resize_h_planar_float_avx512_transpose_vstripe_ks4<3>; break;
-          case 4: return resize_h_planar_float_avx512_transpose_vstripe_ks4<0>; break;
-          }
+          return resize_h_planar_float_avx512_transpose_vstripe_ks4;
         }
-        // FIXME: make it safe + correct, like the avx2 counterpart
-        // return resize_h_planar_float_avx512_permutex_vstripe_ks4;
-        // until then:
-        return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16;
+        return resize_h_planar_float_avx512_permutex_vstripe_ks4;
+          }
+
+      if (program->filter_size_real <= 8) {
+        // up to 8 coeffs it can be highly optimized with transposes, gather/permutex choice
+        out_resampler_h_alternative_for_mt = resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16; // jolly joker
+        if (resize_h_planar_float_avx512_gather_permutex_vstripe_ks8_check(program)) {
+          return resize_h_planar_float_avx512_transpose_vstripe_ks8; // no template
+        }
+        return resize_h_planar_float_avx512_permutex_vstripe_ks8;
       }
-#endif
+
+
       return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16;
       // other candidates for testing:
       // return resizer_h_avx512_generic_float_pix8_sub8_ks16;
@@ -1662,8 +1664,9 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
     }
 #endif
     if (CPU & CPUF_AVX2) {
-#ifdef SAFE_KS4_MT
       // up to 4 coeffs it can be highly optimized with transposes, gather/permutex choice
+      // These perform very poorly in Prefetch, so we provide alternative generic version for MT
+      out_resampler_h_alternative_for_mt = resize_h_planar_float_avx2_permutex_vstripe_ks4; // jolly joker
       if (program->filter_size_real <= 4) {
         if (resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(program)) {
       switch (program->filter_size_real) {
@@ -1675,13 +1678,14 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
         }
         return resize_h_planar_float_avx2_permutex_vstripe_ks4; //
       }
-#endif
       return resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16; // new generic, like avx512 version
       // return resizer_h_avx2_generic_float; old generic would be named pix8_sub2_ks8
     }
     if (CPU & CPUF_SSSE3) {
-#ifdef SAFE_KS4_MT
       // up to 4 coeffs it can be highly optimized with transposes
+      // These perform very poorly in Prefetch, so we provide alternative generic version for MT
+      if (program->filter_size_real <= 4)
+        out_resampler_h_alternative_for_mt = resizer_h_ssse3_generic_float; // jolly joker
       switch (program->filter_size_real) {
       case 1: return resize_h_planar_float_sse_transpose_vstripe_ks4<1>; break;
       case 2: return resize_h_planar_float_sse_transpose_vstripe_ks4<2>; break;
@@ -1689,9 +1693,6 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
       case 4: return resize_h_planar_float_sse_transpose_vstripe_ks4<0>; break;
       default: return resizer_h_ssse3_generic_float;
       }
-#else
-      return resizer_h_ssse3_generic_float;
-#endif
     }
 #endif
     return resize_h_c_planar<float, 0>;
@@ -1893,8 +1894,12 @@ ResamplerV FilteredResizeV::GetResampler(int CPU, int pixelsize, int bits_per_pi
 #ifdef INTEL_INTRINSICS
 #ifdef INTEL_INTRINSICS_AVX512
       if ((CPU & CPUF_AVX512_FAST) == CPUF_AVX512_FAST) {
-        return resize_v_avx512_planar_float; // quicker than avx2 version
-        // return resize_v_avx512_planar_float_w_sr; // ! Unlike avx2 version, this one is not faster. 198 fps vx 205 fps
+        // return resize_v_avx512_planar_float; // Old, base version, quicker than avx2 version
+        // This one is about equal to avx2 version, but only with clang,
+        // it seems that clang is too good and, probably unrolls the old function version
+        // out-of-box so much better than MSVC, that it competes with the _w_sr version.
+        // With MSVC its no-brainer to use avx512
+        return resize_v_avx512_planar_float_w_sr;
       }
 #endif
       if (CPU & CPUF_AVX2) {
