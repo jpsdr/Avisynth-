@@ -23,6 +23,13 @@
 #include <cstdint>
 #include <cstddef>
 
+// needed for linux and bsd l2cache size query
+#if defined(AVS_LINUX) || defined(AVS_BSD)
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#endif
+
 // Neon/Dotprod request in WinAPI ...
 #if defined(ARM64) && defined(AVS_WINDOWS)
 #include <Windows.h>
@@ -134,7 +141,7 @@ static int get_avx10_minor_version() {
 #endif // defined(X86_32) || defined(X86_64)
 
 // ------------------------------------------------------------------
-// Core ARMv8 Feature Detection Function
+// Core aarch64 (ARMv8/v9) Feature Detection Function
 // ------------------------------------------------------------------
 #if defined(ARM64)
 static int64_t ARMCheckForExtensions()
@@ -153,57 +160,96 @@ static int64_t ARMCheckForExtensions()
   unsigned long hwcap = getauxval(AT_HWCAP);
   unsigned long hwcap2 = getauxval(AT_HWCAP2);
 
-  // Tier 2: CPUF_ARM_DOTPROD (Dot Product)
-  // When DOTPROD exists, we have at least Armv8.2-a
-  // Safe gcc/clang flags: -march=armv8.2-a+dotprod
+  // When DOTPROD exists, we have at least Armv8.1-a
+  // optional in v8.1-a, mandatory in v8.4-a
+  // Safe gcc/clang flags: -march=armv8.1-a+dotprod
   if ((hwcap & HWCAP_ASIMDDP)) {
     result |= CPUF_ARM_DOTPROD;
   }
 
-  // Tier 3: CPUF_ARM_SVE2
   // SVE2 (Scalable Vector Extension version 2) optional in v8.5-a, mandatory in v9.0-a
   // Safe flags: -march=armv8.5-a+sve2
   if (hwcap2 & HWCAP2_SVE2) {
     result |= CPUF_ARM_SVE2;
   }
-  else if (hwcap & HWCAP_SVE) {
+
+
+  // CPUF_ARM_SVE2_1 (incremental SVE2 part 1)
+  // optional in v9.1-a, mandatory in v9.2-a
+  #ifdef HWCAP2_SVE2P1
+  #ifdef CPUF_ARM_SVE2_1
+  if (hwcap2 & HWCAP2_SVE2P1) {
+    result |= CPUF_ARM_SVE2_1;
   }
+  #endif
+  #endif
+
+  // CPUF_ARM_I8MM (AdvSIMD Int8 matrix multiply, Armv8.2-I8MM)
+  // optional in v8.2-a, mandatory in v8.6-a
+  // Safe flags: -march=armv8.2-a+i8mm
+  if (hwcap2 & HWCAP2_I8MM) {
+    result |= CPUF_ARM_I8MM;
+  }
+
 
 #elif defined(AVS_MACOS)
 
   // macOS (Apple Silicon) detection via sysctlbyname.
+  // https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_instruction_set_characteristics
   int value = 0;
   size_t len = sizeof(value);
 
-  // Tier 2: CPUF_ARM_DOTPROD (Dot Product)
   // Check for the DOTPROD feature, which is guaranteed on modern Apple Silicon.
+  // All Apple Silicon devices (M1, M2, M3, etc.) are based on ARMv8.6-a or later.
   // The sysctl function returns 0 on success and populates 'value'.
-  if (sysctlbyname("hw.optional.dotprod", &value, &len, NULL, 0) == 0 && value) {
+  if (sysctlbyname("hw.optional.arm.FEAT_DotProd", &value, &len, NULL, 0) == 0 && value) {
     result |= CPUF_ARM_DOTPROD;
   }
+  if (sysctlbyname("hw.optional.arm.FEAT_I8MM", &value, &len, NULL, 0) == 0 && value) {
+    result |= CPUF_ARM_I8MM;
+  }
 
-  // Tier 3: CPUF_ARM_SVE2 (SVE/SVE2 is not currently (2025) implemented by Apple)
+  // SVE2 is mandatory for general ARMv9.0-a compliance, Apple has chosen not to
+  // implement SVE or SVE2 in its M-series CPUs to date (2025).
   // No check required here as the hardware does not support it.
 
 #elif defined(AVS_WINDOWS)
 
   // Windows ARM64 detection using IsProcessorFeaturePresent
-  // Note: Windows ARM does not currently (late 2025) expose SVE/SVE2 features via WinAPI flags.
+  // Windows ARM SVE/SVE2 features via WinAPI flags are available since SDK 26100 (Windows 11 24H2).
 
-  // Tier 2: CPUF_ARM_DOTPROD (Dot Product)
+  // CPUF_ARM_DOTPROD (Dot Product)
 #if defined(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE)
   if (IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE)) {
     result |= CPUF_ARM_DOTPROD;
   }
-#elif defined(PF_ARM_V8_DOTPROD_INSTRUCTIONS_AVAILABLE)
+#endif
+
+#if defined(PF_ARM_V8_DOTPROD_INSTRUCTIONS_AVAILABLE)
   if (IsProcessorFeaturePresent(PF_ARM_V8_DOTPROD_INSTRUCTIONS_AVAILABLE)) {
     result |= CPUF_ARM_DOTPROD;
   }
 #endif
-#else
-  // Fallback for other ARM systems (e.g., Windows ARM64)
-  // If no specific OS mechanism is available, we only rely on the mandatory NEON flag.
+
+#if defined(PF_ARM_SVE2_INSTRUCTIONS_AVAILABLE)
+  if (IsProcessorFeaturePresent(PF_ARM_SVE2_INSTRUCTIONS_AVAILABLE)) {
+    result |= CPUF_ARM_SVE2;
+  }
 #endif
+
+#if defined(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE)
+  if (IsProcessorFeaturePresent(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE)) {
+    result |= CPUF_ARM_I8MM;
+  }
+#endif
+
+#if defined(PF_ARM_SVE2_1_INSTRUCTIONS_AVAILABLE)
+  if (IsProcessorFeaturePresent(PF_ARM_SVE2_1_INSTRUCTIONS_AVAILABLE)) {
+    result |= CPUF_ARM_SVE2_1;
+  }
+#endif
+
+#endif // Platform-specific ARM64 feature detection
 
   return result;
 }
@@ -413,6 +459,31 @@ static int64_t CPUCheckForExtensions()
   return result;
 }
 
+#if defined(ARM64) && (defined(AVS_LINUX) || defined(AVS_BSD))
+static size_t parse_sysfs_size_string(const char* size_str) {
+  if (size_str == nullptr) {
+    return 0;
+  }
+
+  char* endptr;
+  long value = strtol(size_str, &endptr, 10);
+  if (value <= 0) {
+    return 0;
+  }
+
+  if (*endptr == 'K' || *endptr == 'k') {
+    return (size_t)value * 1024;
+  }
+  else if (*endptr == 'M' || *endptr == 'm') {
+    return (size_t)value * 1024 * 1024;
+  }
+  else if (*endptr == 'G' || *endptr == 'g') {
+    return (size_t)value * 1024 * 1024 * 1024;
+  }
+  return (size_t)value;
+}
+#endif // defined(ARM64) && (defined(AVS_LINUX) || defined(AVS_BSD))
+
 // ------------------------------------------------------------------
 // Core L2 Cache Detection Function
 // ------------------------------------------------------------------
@@ -469,6 +540,55 @@ static size_t DetectL2CacheSize()
   return 0;
 #elif defined(ARM64)
   // Cache detection on ARM is highly vendor/OS-specific.
+// --- Linux/BSD Implementation (e.g., Raspberry Pi 5) ---
+#if defined(AVS_LINUX) || defined(AVS_BSD)
+  // Detection via /sys filesystem (standard on Linux/BSD for cache info).
+  // The path targets the L2 cache size for cpu0 (per core L2 on RPi5/Cortex-A76).
+  // e.g. cat /sys/devices/system/cpu/cpu0/cache/index2/size returns 512K on RPi5
+  static constexpr const char* ARM_L2_CACHE_SYSFS_PATH = "/sys/devices/system/cpu/cpu0/cache/index2/size";
+  FILE* file = fopen(ARM_L2_CACHE_SYSFS_PATH, "r");
+  if (file) {
+    char size_str[32] = { 0 };
+    if (fgets(size_str, sizeof(size_str) - 1, file) != NULL) {
+      // Remove trailing newline character
+      size_t str_len = strlen(size_str);
+      if (str_len > 0 && size_str[str_len - 1] == '\n') {
+        size_str[str_len - 1] = '\0';
+      }
+
+      // Parse the string (e.g., "512K") and return in bytes.
+      size_t l2_cache_bytes = parse_sysfs_size_string(size_str);
+      fclose(file);
+      return l2_cache_bytes;
+    }
+    fclose(file);
+  }
+#elif defined(AVS_MACOS)
+  // macOS/Apple Silicon detection via sysctlbyname.
+  // https://developer.apple.com/documentation/kernel/1387446-sysctlbyname/determining_system_capabilities
+  // The generic 'hw.l2cachesize' is for the least performant core (E-cores).
+  // For performance optimization, we target the L2 cache of the high-performance (P) cores.
+  // These are typically designated as perflevel0.
+  // Note: sysctl returns the cache size in bytes.
+
+  int l2_cache_bytes = 0;
+  size_t len = sizeof(l2_cache_bytes);
+
+  // Check for the L2 cache size of the high-performance cores (P-cores), 
+  // which is the largest and most relevant for optimization.
+  if (sysctlbyname("hw.perflevel0.l2cachesize", &l2_cache_bytes, &len, NULL, 0) == 0 && l2_cache_bytes > 0) {
+    // Return size in bytes.
+    return static_cast<size_t>(l2_cache_bytes);
+  }
+
+  // Fallback to the generic L2 key (typically the E-core cache size).
+  if (sysctlbyname("hw.l2cachesize", &l2_cache_bytes, &len, NULL, 0) == 0 && l2_cache_bytes > 0) {
+    // Return size in bytes.
+    return static_cast<size_t>(l2_cache_bytes);
+  }
+#endif
+
+
   // Returning 0 is a safe default for a portable cross-platform implementation.
   return 0;
 #else
