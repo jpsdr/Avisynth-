@@ -1406,107 +1406,6 @@ BilinearResize(int(width*0.97), height) # gather, H kernel size 3
  * Out of bounds target pixels coefficients are padded with zeros up to program->filter_size_alignment.
 */
 
-// returns true if only transpose method is allowed, false if permutex method can be used
-bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(ResamplingProgram* program)
-{
-  // 'target_size_alignment' ensures we can safely access pixel_offset[] entries using offsets like
-  // pixel_offset[x + 0] to pixel_offset[x + 7] per 8-pixel block processing
-  assert(program->target_size_alignment >= 8);
-
-  // Ensure that coefficient loading is safe for 4 float loads
-  assert(program->filter_size_alignment >= 4);
-
-  for (int x = 0; x < program->target_size; x += 8)
-  {
-    int start_off = program->pixel_offset[x + 0];
-    // program->pixel_offset[x + 7] is still valid, since program->target_size_alignment >= 8
-    // and pixel_offset[] values for x >= target_size are the same as for x=target_size-1.
-    // This is ensured during the resampling program setup in resize_prepare_coeffs()
-    int end_off = program->pixel_offset[x + 7] + 3;
-    if ((end_off - start_off) >= 8) {
-      return true; // only transpose is allowed
-    }
-  }
-  return false; // permute is OK.
-}
-
-// returns true if only transpose method is allowed, false if permutex method can be used
-bool resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_pix16_check(ResamplingProgram* program)
-{
-  // 'target_size_alignment' ensures we can safely access pixel_offset[] entries using offsets like
-  // pixel_offset[x + 0] to pixel_offset[x + 15] per 16-pixel block processing
-  assert(program->target_size_alignment >= 16);
-
-  // Ensure that coefficient loading is safe for 4 float loads
-  assert(program->filter_size_alignment >= 4);
-
-  for (int x = 0; x < program->target_size; x += 16)
-  {
-    int start_off = program->pixel_offset[x + 0];
-    // program->pixel_offset[x + 15] is still valid, since program->target_size_alignment >= 16
-    // and pixel_offset[] values for x >= target_size are the same as for x=target_size-1.
-    // This is ensured during the resampling program setup in resize_prepare_coeffs()
-    int end_off = program->pixel_offset[x + 15] + 3;
-    if ((end_off - start_off) >= 16) {
-      return true; // only transpose is allowed
-    }
-  }
-  return false; // permute is OK.
-}
-
-/*
- * OPTIMAL SCANLINE CALCULATION NOTES (L2 CACHE BLOCKING)
- *
- * This function calculates the optimal vertical strip size (max_scanline)
- * to be processed in a cache-blocked horizontal resizing operation.
- *
- * CONTEXT: Single-threaded, high-throughput workload with private L2 cache.
- * The high FPS target justifies a more aggressive cache reservation factor.
- *
- * 1. COEFFICIENT TABLE EXCLUSION (Horizontal 2x resize of fullhd content):
- * The coefficient table (~245 KB) is excluded from the calculation. It is
- * treated as a streamed resource due to its size relative to L2 (512 KB).
- * The hardware prefetcher is expected to handle its sequential access pattern
- * efficiently without residing fully in the reserved L2 working set.
- *
- * 2. CACHE RESERVATION HEURISTIC:
- * A factor of 0.75 (3/4) is reserved for the working set. This is an aggressive
- * approach for a single-threaded task with a private L2 cache, minimizing
- * cache thrashing risk from OS context switches while maximizing block size.
- *
- * 3. CONCRETE SCENARIO (512 KB L2, 1920->3840 upscale):
- * Reserved L2 space: 512 KB * 0.75 = 384 KB (393,216 bytes).
- * One scanline strip (src + tgt) is 23,040 bytes.
- * The resulting max_scanline is 17 (393,216 / 23,040 ~ 17.06).
- */
-static constexpr double CACHE_RESERVE_FACTOR = 0.75;
-
-int resampler_h_float_detect_optimal_scanline(int src_width, int tgt_width, size_t l2_cache_size_bytes) {
-  // sizeof(float) is 4 bytes
-  constexpr size_t PIXEL_SIZE = sizeof(float);
-
-  // Calculate the bytes needed for one (Source + Destination) scanline strip
-  size_t scanline_bytes = (static_cast<size_t>(src_width) + static_cast<size_t>(tgt_width)) * PIXEL_SIZE;
-
-  // Calculate the reserved bytes based on the aggressive factor
-  // Use floating point math for precision, then cast to size_t
-  size_t reserved_l2_bytes = static_cast<size_t>(
-    static_cast<double>(l2_cache_size_bytes) * CACHE_RESERVE_FACTOR
-    );
-
-  // Calculate max_scanline (integer division for floor)
-  int max_scanline = static_cast<int>(reserved_l2_bytes / scanline_bytes);
-
-  // Clamp to practical bounds (4 to 64 is typical range for strip size)
-  if (max_scanline < 4) {
-    max_scanline = 4;
-  }
-  if (max_scanline > 64) {
-    max_scanline = 64;
-  }
-  return max_scanline;
-}
-
 // resize_h_planar_float_avx2_xxx_vstripe_ks4 method #1: gather-based
 template<int filtersizemod4>
 void resize_h_planar_float_avx2_transpose_vstripe_ks4(BYTE* dst8, const BYTE* src8, int dst_pitch, int src_pitch, ResamplingProgram* program, int width, int height, int bits_per_pixel)
@@ -1543,10 +1442,8 @@ void resize_h_planar_float_avx2_transpose_vstripe_ks4(BYTE* dst8, const BYTE* sr
   // Split to H-stripes to make better source data locality in L2 cache (if L2 present per core ?)
   constexpr int STRIPE_ALIGN = 8;  // this must be multiple of PIXELS_AT_A_TIME 
 
-  const size_t cache_size_L2 = program->cache_size_L2;
-  int max_scanlines = resampler_h_float_detect_optimal_scanline(program->source_size, program->target_size, cache_size_L2)
-    / STRIPE_ALIGN * STRIPE_ALIGN;
   //max_scanlines = program->target_size; // test
+  int max_scanlines = program->max_scanlines / STRIPE_ALIGN * STRIPE_ALIGN;
   if (max_scanlines < STRIPE_ALIGN) max_scanlines = STRIPE_ALIGN;
 
   for (auto y_from = 0; y_from < height; y_from += max_scanlines) {
@@ -1723,9 +1620,7 @@ void resize_h_planar_float_avx2_permutex_vstripe_ks4(BYTE* dst8, const BYTE* src
   // if less than 4, padded with zeros till filter_size_alignment.
   assert(program->filter_size_alignment >= 4);
 
-  // e.g. i7-11700 typical L2 if 512K per core.
-  const size_t cache_size_L2 = program->cache_size_L2;
-  int max_scanlines = resampler_h_float_detect_optimal_scanline(program->source_size, program->target_size, cache_size_L2);
+  const int max_scanlines =  program->max_scanlines;
 
   for (int y_from = 0; y_from < height; y_from += max_scanlines) {
     int y_to = std::min(y_from + max_scanlines, height);
@@ -2047,9 +1942,7 @@ void resize_h_planar_float_avx2_permutex_vstripe_ks4_pix16(BYTE* dst8, const BYT
   // if less than 4, padded with zeros till filter_size_alignment.
   assert(program->filter_size_alignment >= 4);
 
-  // e.g. i7-11700 typical L2 if 512K per core.
-  const size_t cache_size_L2 = program->cache_size_L2;
-  int max_scanlines = resampler_h_float_detect_optimal_scanline(program->source_size, program->target_size, cache_size_L2);
+  const int max_scanlines = program->max_scanlines;
 
   // Example setup before the main loop (assuming memory allocation for 4 instances)
   PermuteVectors_AVX2 taps[4];
@@ -2246,7 +2139,7 @@ void resize_h_planar_float_avx2_gather_permutex_vstripe_ks4(BYTE* dst8, const BY
 {
 
   // FIXME: this analysis could be done once in the dispatcher instead of per call, since the program is constant
-  bool bDoGather = resize_h_planar_float_avx2_gather_permutex_vstripe_ks4_check(program);
+  bool bDoGather = program->resize_h_planar_gather_permutex_vstripe_check(8/*iSamplesInThGroup*/, 8 /*permutex_index_diff_limit*/, 4 /*kernel_size*/);
   if (bDoGather)
   {
     resize_h_planar_float_avx2_transpose_vstripe_ks4<filtersizemod4>(dst8, src8, dst_pitch, src_pitch, program, width, height, bits_per_pixel);
