@@ -1617,7 +1617,7 @@ PVideoFrame __stdcall FilteredResizeH::GetFrame(int n, IScriptEnvironment* env)
 ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pixel, ResamplingProgram* program, ResamplerH &out_resampler_h_alternative_for_mt, IScriptEnvironment* env)
 {
   out_resampler_h_alternative_for_mt = nullptr;
-  int simd_coeff_count_padding = 8;
+  int simd_coeff_count_padding = 8; // even for _ks16_float this is enough, it works differently inside
 
   // Both 8-bit and 16-bit SSSE3 and AVX2 horizontal resizers benefit from processing 16 pixels per cycle.
   // Floats also use 32 bytes, but since 32/sizeof(float) = 8, processing 16 pixels is unnecessary.
@@ -1635,11 +1635,34 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
 #ifdef INTEL_INTRINSICS_AVX512
     if (((CPU & CPUF_AVX512_FAST) == CPUF_AVX512_FAST)) {
       // feature flag, grouping many avx512 features
-      if (program->filter_size_real <= 4) {
+      // in case of optimized avx512_permutex_vstripe resizer found, set alternative resizer for MT use
         out_resampler_h_alternative_for_mt = resizer_h_avx2_generic_uint8_t; // AVX2 should present if AVX512 present
+      if (program->filter_size_real <= 4) {
         if (!program->resize_h_planar_gather_permutex_vstripe_check(64/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, 4/*kernel_size*/))
           return resize_h_planar_uint8_avx512_permutex_vstripe_ks4;
       }
+      if (program->filter_size_real <= 8) {
+        /*
+          resize_h_planar_uint8_avx512_permutex_vstripe_2s32_ks8
+          - support more downsampling ratios, like
+            Bicubic/BilinearResize(width/2) and even SinPowResize(width/2) for downsampling of UHD 4k to FHD is working.
+          - Expected to support scaling ratios from about a bit below 0.5 to infinity (with filter support <=2).
+
+          resize_h_planar_uint8_avx512_permutex_vstripe_ks8
+          - faster with scale ratios from about 1.0 to infinity (with filter support <=4).
+
+          These two functions selected in order from faster to slower.
+        */
+        if (!program->resize_h_planar_gather_permutex_vstripe_check(64/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, 8/*kernel_size*/)) // first try faster ks8
+          return resize_h_planar_uint8_avx512_permutex_vstripe_ks8;
+        if (!program->resize_h_planar_gather_permutex_vstripe_check(32/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, 8/*kernel_size*/)) // slower ks8 but more downsample ratio for /2
+          return resize_h_planar_uint8_avx512_permutex_vstripe_2s32_ks8;
+    }
+      if (program->filter_size_real <= 16) {
+        if (!program->resize_h_planar_gather_permutex_vstripe_check(32/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, 16/*kernel_size*/))
+          return resize_h_planar_uint8_avx512_permutex_vstripe_ks16;
+      }
+      out_resampler_h_alternative_for_mt = nullptr; // not needed
     }
 #endif
     if (CPU & CPUF_AVX2) {
@@ -1714,14 +1737,46 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
         // first check 16 pixels per cycle version, probably resize_h_planar_float_avx512_permutex_vstripe_2s8_ks8 is faster,
         // if not possible, then 8 pixels per cycle
         if (program->resize_h_planar_gather_permutex_vstripe_check(16/*iSamplesInTheGroup*/, 32/*permutex_index_diff_limit*/, 8/*kernel_size*/)) {
+          // 16 pixels per cycle version of permutex was not possible, try 2x8 version
+          if (!program->resize_h_planar_gather_permutex_vstripe_check(8/*iSamplesInTheGroup*/, 32/*permutex_index_diff_limit*/, 8/*kernel_size*/)) {
+            return resize_h_planar_float_avx512_permutex_vstripe_2s8_ks8; // 2x8 output version: better than transpose and generic
+          }
           return resize_h_planar_float_avx512_transpose_vstripe_ks8;
+          // Speed ranking fps, just to have a clue, higher is better.
+          // resize_h_planar_float_avx512_permutex_vstripe_2s8_ks8:        3482
+          // resize_h_planar_float_avx512_transpose_vstripe_ks8:           3186
+          // generic resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16:  2772
         }
+        // Speed ranking fps, just to have a clue, higher is better.
+        // resize_h_planar_float_avx512_permutex_vstripe_2s8_ks8:  2040 2390 1221
+        // resize_h_planar_float_avx512_permutex_vstripe_ks8:      2847 3236 1775
         return resize_h_planar_float_avx512_permutex_vstripe_ks8;
       }
 
+      if (program->filter_size_real <= 16) {
+        // up to 16 coeffs it can be highly optimized with transposes, gather/permutex choice
+        out_resampler_h_alternative_for_mt = resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16; // jolly joker
+        if (program->resize_h_planar_gather_permutex_vstripe_check(16/*iSamplesInTheGroup*/, 32/*permutex_index_diff_limit*/, 16/*kernel_size*/)) {
+          if (!program->resize_h_planar_gather_permutex_vstripe_check(8/*iSamplesInTheGroup*/, 32/*permutex_index_diff_limit*/, 16/*kernel_size*/)) {
+            // LanczosResize(int(width * 0.9 + 0.5), height, taps = 4) # case K: H kernel size 9
+            // LanczosResize(int(width * 0.5 + 0.5), height, taps = 3) # case N: H kernel size 12
 
+            // Speed ranking fps, just to have a clue, higher is better.
+            // 1902 2809 resize_h_planar_float_avx512_permutex_vstripe_ks16 (invalid here, but for reference)
+            // 1356 2137 resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16 
+            // 1278 1997 resize_h_planar_float_avx512_permutex_vstripe_2s8_ks16 test 2x8 output version
+
+            // return resize_h_planar_float_avx512_permutex_vstripe_2s8_ks16; // This one is slower than the generic version
+            // Anyway we keep this branch, maybe in future 2s8_ks16 can be optimized better, till then, use generic.
       return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16;
-      // other candidates for testing:
+          }
+          return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16; // todo: _ks16 transpose-based version to be designed and checked 
+        }
+        return resize_h_planar_float_avx512_permutex_vstripe_ks16;
+      }
+      
+      return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16;
+      // other candidates were tested:
       // return resizer_h_avx512_generic_float_pix8_sub8_ks16;
       // return resizer_h_avx512_generic_float_pix16_sub16_ks8;
       // return resizer_h_avx512_generic_float_pix32_sub8_ks8;
@@ -1925,6 +1980,10 @@ ResamplerV FilteredResizeV::GetResampler(int CPU, int pixelsize, int bits_per_pi
     if (pixelsize == 1)
     {
 #ifdef INTEL_INTRINSICS
+#ifdef INTEL_INTRINSICS_AVX512
+      if (CPU & CPUF_AVX512_FAST)
+        return resize_v_avx512_planar_uint8_t_w_sr;
+#endif
       if (CPU & CPUF_AVX2)
         return resize_v_avx2_planar_uint8_t;
       if (CPU & CPUF_SSE2)
@@ -1940,6 +1999,14 @@ ResamplerV FilteredResizeV::GetResampler(int CPU, int pixelsize, int bits_per_pi
     else if (pixelsize == 2)
     {
 #ifdef INTEL_INTRINSICS
+#ifdef INTEL_INTRINSICS_AVX512
+      if (CPU & CPUF_AVX512_FAST) {
+        if (bits_per_pixel < 16)
+          return resize_v_avx512_planar_uint16_t_w_sr<true>;
+        else
+          return resize_v_avx512_planar_uint16_t_w_sr<false>;
+      }
+#endif
       if (CPU & CPUF_AVX2) {
         if (bits_per_pixel < 16)
           return resize_v_avx2_planar_uint16_t<true>;
