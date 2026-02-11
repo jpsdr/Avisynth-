@@ -32,40 +32,20 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
-#ifndef __Greyscale_H__
-#define __Greyscale_H__
+#ifndef __blend_common_neon_h
+#define __blend_common_neon_h
 
-#include <avisynth.h>
-#include "../convert/convert_planar.h"
+#include <avs/types.h>
 
-class Greyscale : public GenericVideoFilter
-/**
-  * Class to convert video to greyscale
- **/
-{
-public:
-  Greyscale(PClip _child, const char* matrix, IScriptEnvironment* env);
-  PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
+template<bool has_mask, typename pixel_t>
+void overlay_blend_neon_uint(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  const int p1_pitch, const int p2_pitch, const int mask_pitch,
+  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
+template<bool has_mask>
+void overlay_blend_neon_float(BYTE* p1, const BYTE* p2, const BYTE* mask,
+  const int p1_pitch, const int p2_pitch, const int mask_pitch,
+  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
+void overlay_darken_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const BYTE* p2U, const BYTE* p2V, int p1_pitch, int p2_pitch, int width, int height);
+void overlay_lighten_neon(BYTE* p1Y, BYTE* p1U, BYTE* p1V, const BYTE* p2Y, const BYTE* p2U, const BYTE* p2V, int p1_pitch, int p2_pitch, int width, int height);
 
-  static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env);
-
-  int __stdcall SetCacheHints(int cachehints, int frame_range) override {
-    AVS_UNUSED(frame_range);
-    return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
-  }
-
-private:
-  ConversionMatrix greyMatrix;
-  int theMatrix;
-  int theColorRange;
-  int theOutColorRange;
-  int pixelsize;
-  int bits_per_pixel;
-  bool coeff_int16_overflow;
-
-};
-
-
-
-
-#endif  // __Greyscale_H__
+#endif // __blend_common_neon_h

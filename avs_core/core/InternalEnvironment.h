@@ -77,7 +77,19 @@ public:
 	}
 };
 
-// Interface fransformation hack
+#ifdef ALTERNATIVE_VFB_TIMESTAMP
+class VideoFrameBuffer;
+
+// Forward declarations - don't expose full classes
+class ScriptEnvironment;
+
+namespace VFBHelper {
+  // Wrapper function to call the nested static method
+  void UpdateVFBFreeTimestamp(VideoFrameBuffer* vfb);
+}
+#endif
+
+// Interface transformation hack
 class InternalEnvironment; // forward
 InternalEnvironment* GetAndRevealCamouflagedEnv(IScriptEnvironment* env);
 
@@ -317,6 +329,9 @@ public:
   virtual void __stdcall SetCacheMode(CacheMode mode) = 0;
   virtual CacheMode __stdcall GetCacheMode() = 0;
 	virtual bool& __stdcall GetSupressCaching() = 0;
+
+  // useful to detect chainedCtor
+  virtual size_t __stdcall GetInvokeStackSize() = 0;
 
   virtual void __stdcall SetDeviceOpt(DeviceOpt mode, int val) = 0;
 
