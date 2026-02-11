@@ -218,11 +218,7 @@ static PVideoFrame CreateBlankFrame(const VideoInfo& vi, int color, int mode, co
         default: // case 4:
           float val_f;
           if (plane == PLANAR_U || plane == PLANAR_V) {
-#ifdef FLOAT_CHROMA_IS_HALF_CENTERED
-            float shift = 0.5f;
-#else
             float shift = 0.0f;
-#endif
             val_f = float(val_i - 128) / 255.0f + shift; // 32 bit float chroma 128=0.5
           }
           else {
@@ -591,8 +587,8 @@ AVSValue __cdecl Create_MessageClip(AVSValue args, void*, IScriptEnvironment* en
 ********************************************************************/
 
 
-template<typename pixel_t, int bits_per_pixel>
-static void draw_colorbars_444(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8, int pitchY, int pitchUV, int w, int h)
+template<typename pixel_t>
+static void draw_colorbars_444(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8, int pitchY, int pitchUV, int w, int h, int bits_per_pixel)
 {
   pixel_t *pY = reinterpret_cast<pixel_t *>(pY8);
   pixel_t *pU = reinterpret_cast<pixel_t *>(pU8);
@@ -600,13 +596,8 @@ static void draw_colorbars_444(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8, int pit
   pitchY /= sizeof(pixel_t);
   pitchUV /= sizeof(pixel_t);
 
-#ifdef FLOAT_CHROMA_IS_HALF_CENTERED
-  int chroma_offset_i = 128;
-  float chroma_offset_f = 0.5f;
-#else
   int chroma_offset_i = 128;
   float chroma_offset_f = 0.0f;
-#endif
 
   const int shift = sizeof(pixel_t) == 4 ? 0 : (bits_per_pixel - 8);
   typedef typename std::conditional < sizeof(pixel_t) == 4, float, int>::type factor_t; // float support
@@ -715,13 +706,8 @@ static void draw_colorbars_420_422_411(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8,
   typedef typename std::conditional < sizeof(pixel_t) == 4, float, int>::type factor_t; // float support
   factor_t factor = (pixel_t)(sizeof(pixel_t) == 4 ? 1 / 255.0f : 1);
 
-#ifdef FLOAT_CHROMA_IS_HALF_CENTERED
-  int chroma_offset_i = 128;
-  float chroma_offset_f = 0.5f;
-#else
   int chroma_offset_i = 128;
   float chroma_offset_f = 0.0f;
-#endif
 
 
 //                                                        LtGrey  Yellow    Cyan   Green Magenta     Red    Blue
@@ -854,8 +840,17 @@ static void draw_colorbars_420_422_411(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8,
   }
 }
 
-template<typename pixel_t, int bits_per_pixel>
-static void draw_colorbarsHD_444(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8, int pitchY, int pitchUV, int w, int h)
+void GetYUVRec709fromRGB(double R, double G, double B, double& dY, double& dU, double& dV)
+{
+  // See 3.2 from https://www.itu.int/dms_pubrec/itu-r/rec/bt/R-REC-BT.709-6-201506-I!!PDF-E.pdf
+  dY = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+
+  dU = (B - dY) / 1.8556;
+  dV = (R - dY) / 1.5748;
+}
+
+template<typename pixel_t>
+static void draw_colorbarsHD_444(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8, int pitchY, int pitchUV, int w, int h, int bits_per_pixel)
 {
   pixel_t *pY = reinterpret_cast<pixel_t *>(pY8);
   pixel_t *pU = reinterpret_cast<pixel_t *>(pU8);
@@ -864,17 +859,21 @@ static void draw_colorbarsHD_444(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8, int p
   pitchUV /= sizeof(pixel_t);
 
   const int shift = sizeof(pixel_t) == 4 ? 0 : (bits_per_pixel - 8);
-  typedef typename std::conditional < sizeof(pixel_t) == 4, float, int>::type factor_t; // float support
-  factor_t factor = (pixel_t)(sizeof(pixel_t) == 4 ? 1 / 255.0f : 1);
 
-#ifdef FLOAT_CHROMA_IS_HALF_CENTERED
-  int chroma_offset_i = 128;
-  float chroma_offset_f = 0.5f;
-#else
-  int chroma_offset_i = 128;
-  float chroma_offset_f = 0.0f;
-#endif
+  // Also for float target we make "limited" range
+  bits_conv_constants luma, chroma;
+  // RGB is source, YUV is destination
+  // For RGB source / Y destination (both luma-like):
+  const bool full_scale_s = true; // full scale reference
+  const bool full_scale_d = false; // narrow range reference
+  get_bits_conv_constants(luma, false, full_scale_s, full_scale_d, 32, 32);
+  // For UV destination (chroma behavior):
+  // Note: we only need dst_span for UV, so we use full_scale_d for both params
+  get_bits_conv_constants(chroma, true, full_scale_s, full_scale_d, 32, 32);
 
+  double float_offset = luma.dst_offset;
+  double float_scale = luma.mul_factor; // 219.0 / 255.0;
+  double float_uv_scale = chroma.mul_factor;
 
 //		Nearest 16:9 pixel exact sizes
 //		56*X x 12*Y
@@ -888,7 +887,7 @@ static void draw_colorbarsHD_444(uint8_t *pY8, uint8_t *pU8, uint8_t *pV8, int p
 /*
   ARIB STD-B28  Version 1.0-E1
 
-  *1: 75W/100W/I+: Choice from 75% white, 100% white and +I signal
+  *1: 75W/100W/I+: Choice from 75% white, 100% white and +I signal. Avisynth: I+.
   *2: can be changed to any value other than the standard values in accordance with the operation purpose by the user
 
               |<-------------------------------------------------------- a -------------------------------------------------->|
@@ -919,13 +918,13 @@ Pattern 4     |     15%     |        0%       |          100%         |   0%  |-
 
   2021: SMPTE RP 219-1:2014
   *1: can be changed to any value other than the standard values in accordance with the operation purpose by the user
-  *2: 75W/100W/+I/-I: Choice from 75% white, 100% white and +I or -I signal
-  *3: 0% Black or +Q (Left from Y ramp)
+  *2: 75W/100W/+I/-I: Choice from 75% white, 100% white and +I or -I signal. Avisynth: 100% White.
+  *3: Choice from 0% Black or +Q (Left from Y ramp) Avisynth: 0% Black.
   *4: can be changed to any value other than the standard values in accordance with the operation purpose by the user
-  *5: Choice from 0% Black, Sub-black valley
+  *5: Choice from 0% Black, Sub-black valley. Avisynth: 0% Black.
       The sub-black valley signal shall begin at the 0% black level, shall decrease in a linear ramp to the minimum permitted level at the mid-point,
       and shall increase in a linear ramp to the 0% black level at the end of the black bar.
-  *6: Choice from 100% White, Super-white Peak
+  *6: Choice from 100% White, Super-white Peak. Avisynth: 100% White.
       The super-white peak signal shall begin at the 100% white level, shall increase in a linear ramp to the maximum permitted level at the midpoint, 
       and shall decrease in a linear ramp to the 100% white level at the end of the white bar. 
 
@@ -965,180 +964,197 @@ Pattern 4     |     15%     |0% Blk or SubBlck|100%White/SuperWhtePeak|   0%  |-
   const int p23 = (h + 6) / 12;  // 1/12th of height
   const int p1 = h - p23 * 2 - p4; // remaining 7/12th of height
 
+  /*
   //               75%  Rec709 -- Grey40 Grey75 Yellow  Cyan   Green Magenta  Red   Blue
   static const BYTE pattern1Y[] = { 104,   180,   168,   145,   133,    63,    51,    28 };
   static const BYTE pattern1U[] = { 128,   128,    44,   147,    63,   193,   109,   212 };
   static const BYTE pattern1V[] = { 128,   128,   136,    44,    52,   204,   212,   120 };
-  for (; y < p1; ++y) { // Pattern 1
-    int x = 0;
-    for (; x < d; ++x) {
-      pY[x] = factor*(pattern1Y[0] << shift); // 40% Grey
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern1U[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern1V[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern1U[0] << shift);
-        pV[x] = factor * (pattern1V[0] << shift);
-      }
+  // 3.7.6: replaced the 8 bit table (inaccurate base for higher bitdepths) with accurate 
+  // RGB values with double precision RGB to YUV conversion.
+  */
+
+  // Define in double precision RGB and convert to rec.709 YUV later for target bitdepth
+
+  static const double pattern1R[] = { 0.4, 0.75, 0.75, 0.00, 0.00, 0.75, 0.75, 0.00 };
+  static const double pattern1G[] = { 0.4, 0.75, 0.75, 0.75, 0.75, 0.00, 0.00, 0.00 };
+  static const double pattern1B[] = { 0.4, 0.75, 0.00, 0.75, 0.00, 0.75, 0.00, 0.75 };
+
+  // Helper to process and write a pixel based on RGB input
+  auto ProcessPixel = [&](double r, double g, double b, int targetX) {
+    double dY, dU, dV;
+    GetYUVRec709fromRGB(r, g, b, dY, dU, dV);
+
+    if constexpr (sizeof(pixel_t) == 4) {
+      pY[targetX] = (pixel_t)(dY * float_scale + float_offset);
+      pU[targetX] = (pixel_t)(dU * float_uv_scale);
+      pV[targetX] = (pixel_t)(dV * float_uv_scale);
     }
+    else {
+      // High-precision calculation for 10/12/16-bit
+      pY[targetX] = (pixel_t)(((dY * 219.0 + 16.0) * (1 << shift)) + 0.5);
+      pU[targetX] = (pixel_t)(((dU * 224.0 + 128.0) * (1 << shift)) + 0.5);
+      pV[targetX] = (pixel_t)(((dV * 224.0 + 128.0) * (1 << shift)) + 0.5);
+    }
+    };
+
+  // ColorbarsHD produces "limited", and since Avisynth handles "limited" 32 bit float, so we adjust it as well.
+
+  // Pattern 1
+
+  for (; y < p1; ++y) {
+    int x = 0;
+    // 40% grey
+    for (; x < d; ++x) {
+      ProcessPixel(pattern1R[0], pattern1G[0], pattern1B[0], x);
+    }
+    // 75% White, Yellow, Cyan, Green, Magenta, Red, Blue
     for (int i = 1; i < 8; i++) {
       for (int j = 0; j < c; ++j, ++x) {
-        pY[x] = factor*(pattern1Y[i] << shift); // 75% Colour bars
-        if constexpr(sizeof(pixel_t) == 4) {
-          pU[x] = factor * (pattern1U[i] - chroma_offset_i) + (factor_t)chroma_offset_f;
-          pV[x] = factor * (pattern1V[i] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        }
-        else {
-          pU[x] = factor * (pattern1U[i] << shift);
-          pV[x] = factor * (pattern1V[i] << shift);
-        }
+        ProcessPixel(pattern1R[i], pattern1G[i], pattern1B[i], x);
       }
     }
     for (; x < w; ++x) {
-      pY[x] = factor*(pattern1Y[0] << shift); // 40% Grey
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern1U[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern1V[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern1U[0] << shift);
-        pV[x] = factor * (pattern1V[0] << shift);
-      }
+      ProcessPixel(pattern1R[0], pattern1G[0], pattern1B[0], x);
     }
     pY += pitchY; pU += pitchUV; pV += pitchUV;
   }
+
+  /*
+  SMPTE RP 219 / EG 1: +I Signal Reference (Rec. 709 / HD)
+  * The +I (In-phase) signal is defined by its analog IRE levels:
+    R = 41.2545 IRE, G = 16.6946 IRE, B = 0 IRE.
+  * Normalized Linear RGB (IRE/100): R: 0.412545, G: 0.166946, B: 0.000000
+  -----------------------------------------------------------
+  Bit-Depth | Y (Luma)      | U (Cb)        | V (Cr)        |
+  -----------------------------------------------------------
+  8-bit     | 61   (3D)     | 103  (67)     | 157  (9D)     |
+  10-bit    | 245  (0F5)    | 412  (19C)    | 629  (275)    |
+  16-bit    | 15707 (3D5B)  | 26368 (6700)  | 40249 (9D39)  |
+  -----------------------------------------------------------
+  See also https://www.arib.or.jp/english/html/overview/doc/6-STD-B28v1_0-E1.pdf
+  and
+  Wikipedia (https://en.wikipedia.org/wiki/SMPTE_color_bars) (2026)
+
+  Pre 3.7.6 old table, containing precalculated 8 bit values
   //              100% Rec709       Cyan  Blue Yellow  Red    +I Grey75  White
   static const BYTE pattern23Y[] = { 188,   32,  219,   63,   61,  180,  235 };
   static const BYTE pattern23U[] = { 154,  240,   16,  102,  103,  128,  128 };
   static const BYTE pattern23V[] = {  16,  118,  138,  240,  157,  128,  128 };
-  for (; y < p1 + p23; ++y) { // Pattern 2
+
+  */
+  // Pattern 2
+
+  // 0: Cyan100, 1: Blue100, 2: Yellow100, 3: Red100, 4: +I, 5: Grey75, 6: White100
+  static const double pattern23R[] = { 0.0, 0.0, 1.0, 1.0, 0.412545, 0.75, 1.0 };
+  static const double pattern23G[] = { 1.0, 0.0, 1.0, 0.0, 0.166946, 0.75, 1.0 };
+  static const double pattern23B[] = { 1.0, 1.0, 0.0, 0.0, 0.0,      0.75, 1.0 };
+
+  // For pattern 2 and 3
+  auto ProcessBar = [&](int index, int endX, int& currentX) {
+    double dY, dU, dV;
+    GetYUVRec709fromRGB(pattern23R[index], pattern23G[index], pattern23B[index], dY, dU, dV);
+
+    for (; currentX < endX && currentX < w; ++currentX) {
+      if constexpr (sizeof(pixel_t) == 4) {
+        pY[currentX] = (pixel_t)(dY * float_scale + float_offset);
+        pU[currentX] = (pixel_t)(dU * float_uv_scale);
+        pV[currentX] = (pixel_t)(dV * float_uv_scale);
+      }
+      else {
+        pY[currentX] = (pixel_t)(((dY * 219.0 + 16.0) * (1 << shift)) + 0.5);
+        pU[currentX] = (pixel_t)(((dU * 224.0 + 128.0) * (1 << shift)) + 0.5);
+        pV[currentX] = (pixel_t)(((dV * 224.0 + 128.0) * (1 << shift)) + 0.5);
+      }
+    }
+    };
+
+  for (; y < p1 + p23; ++y) {
     int x = 0;
-    for (; x < d; ++x) {
-      pY[x] = factor*(pattern23Y[0] << shift); // 100% Cyan
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern23U[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern23V[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern23U[0] << shift);
-        pV[x] = factor * (pattern23V[0] << shift);
-      }
-    }
-    for (; x < c + d; ++x) {
-      pY[x] = factor*(pattern23Y[4] << shift); // +I or Grey75 or White ???
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern23U[4] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern23V[4] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern23U[4] << shift);
-        pV[x] = factor * (pattern23V[4] << shift);
-      }
-    }
-    for (; x < c * 7 + d; ++x) {
-      pY[x] = factor*(pattern23Y[5] << shift); // 75% White
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern23U[5] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern23V[5] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern23U[5] << shift);
-        pV[x] = factor * (pattern23V[5] << shift);
-      }
-    }
-    for (; x < w; ++x) {
-      pY[x] = factor*(pattern23Y[1] << shift); // 100% Blue
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern23U[1] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern23V[1] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern23U[1] << shift);
-        pV[x] = factor * (pattern23V[1] << shift);
-      }
-    }
+
+    // 1. Left Padding (100% Cyan) - Index 0
+    ProcessBar(0, d, x);
+    // 2. The +I Bar - Index 4 (+I or Grey75 or White)
+    ProcessBar(4, c + d, x);
+    // 3. 75% White (Grey75) - Index 5
+    ProcessBar(5, c * 7 + d, x);
+    // 4. Remaining width (100% Blue) - Index 1
+    ProcessBar(1, w, x);
+
     pY += pitchY; pU += pitchUV; pV += pitchUV;
   }
-  for (; y < p1 + p23 * 2; ++y) { // Pattern 3
+
+  // Pattern 3
+
+  for (; y < p1 + p23 * 2; ++y) {
     int x = 0;
-    for (; x < d; ++x) {
-      pY[x] = factor*(pattern23Y[2] << shift); // 100% Yellow
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern23U[2] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern23V[2] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern23U[2] << shift);
-        pV[x] = factor * (pattern23V[2] << shift);
-      }
+
+    ProcessBar(2, d, x); // 100% Yellow
+
+    // Y ramp section: 0% Black, Ramp, 100% White
+    // FIXED in 3.7.6: Y-ramp to conform SMPTE RP 219-1:2014, put 0% Black before and 100% White after
+    // Divide the c * 7 area: 
+    // - 1x - 0% Black
+    // - 5x - Ramp
+    // - 1x - 100% White
+
+    int rampStartX = x + c;         // End of Black step
+    int rampEndX = x + (c * 6);     // Start of White step
+    int sectionEndX = x + (c * 7);  // End of this whole middle section
+
+    // A. 0% black
+    for (; x < rampStartX; ++x) {
+      ProcessPixel(0.0, 0.0, 0.0, x);
     }
-    // FIXME: Y-ramp to conform SMPTE RP 219-1:2014, put 0% Black before and 100% White after
-    for (int j = 0; j < c * 7; ++j, ++x) { // Y-Ramp
-      pY[x] = pixel_t(factor*(16 << shift) + (factor * (220 << shift) * j) / (c * 7));
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (128 - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (128 - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (128 << shift);
-        pV[x] = factor * (128 << shift);
-      }
+
+    // B. Y-ramp (0.0 to 1.0)
+    int rampWidth = rampEndX - rampStartX;
+    for (int j = 0; x < rampEndX; ++x, ++j) {
+      double v = (double)j / (rampWidth - 1);
+      ProcessPixel(v, v, v, x); // For a grayscale ramp, R=G=B
     }
-    for (; x < w; ++x) {
-      pY[x] = factor*(pattern23Y[3] << shift); // 100% Red
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern23U[3] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern23V[3] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern23U[3] << shift);
-        pV[x] = factor * (pattern23V[3] << shift);
-      }
+
+    // C. 100% White
+    for (; x < sectionEndX; ++x) {
+      ProcessPixel(1.0, 1.0, 1.0, x);
     }
+    // end of Ramp section
+
+    ProcessBar(3, w, x); // 100% Red
     pY += pitchY; pU += pitchUV; pV += pitchUV;
-  } //                           Grey15 Black White Black   -2% Black   +2% Black   +4% Black
-  static const BYTE pattern4Y[] = {  49,   16,  235,   16,   12,   16,   20,   16,   25,   16 };
-  static const BYTE pattern4U[] = { 128,  128,  128,  128,  128,  128,  128,  128,  128,  128 };
-  static const BYTE pattern4V[] = { 128,  128,  128,  128,  128,  128,  128,  128,  128,  128 };
-  static const BYTE pattern4W[] = {   0,    9,   21,   26,   28,   30,   32,   34,   36,   42 }; // in 6th's
-  for (; y < h; ++y) { // Pattern 4
+  }
+
+  // Pattern 4
+
+  // Normalized RGB for Pattern 4: 15% Grey, Black, White, Black, -2%, Black, +2%, Black, +4%, Black
+  /* old table, precalculated 8 bit values
+  //                             Grey15 Black White Black   -2% Black   +2% Black   +4% Black
+  static const BYTE pattern4Y[] = { 49,   16,  235,   16,   12,   16,   20,   16,   25,   16 };
+  U and V are 128
+  */
+
+  static const double pattern4RGB[] = { 0.15, 0.0, 1.0, 0.0, -0.02, 0.0, 0.02, 0.0, 0.04, 0.0 };
+  static const BYTE pattern4W[]     = { 0,    9,   21,  26,  28,    30,  32,   34,  36,   42 }; // in 6th's
+  for (; y < h; ++y) {
     int x = 0;
+
+    // 1. Left Padding (15% Grey)
     for (; x < d; ++x) {
-      pY[x] = factor*(pattern4Y[0] << shift); // 15% Grey
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern4U[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern4V[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern4U[0] << shift);
-        pV[x] = factor * (pattern4V[0] << shift);
-      }
+      ProcessPixel(pattern4RGB[0], pattern4RGB[0], pattern4RGB[0], x);
     }
+
+    // 2. PLUGE and Bars (Indices 1 through 9)
     for (int i = 1; i <= 9; i++) {
-      for (; x < d + (pattern4W[i] * c + 3) / 6; ++x) {
-        pY[x] = factor*(pattern4Y[i] << shift);
-        if constexpr(sizeof(pixel_t) == 4) {
-          pU[x] = factor * (pattern4U[1] - chroma_offset_i) + (factor_t)chroma_offset_f;
-          pV[x] = factor * (pattern4V[1] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        }
-        else {
-          pU[x] = factor * (pattern4U[i] << shift);
-          pV[x] = factor * (pattern4V[i] << shift);
-        }
+      int endX = d + (pattern4W[i] * c + 3) / 6;
+      for (; x < endX && x < w; ++x) {
+        ProcessPixel(pattern4RGB[i], pattern4RGB[i], pattern4RGB[i], x);
       }
     }
+
+    // 3. Right Padding (15% Grey)
     for (; x < w; ++x) {
-      pY[x] = factor*(pattern4Y[0] << shift); // 15% Grey
-      if constexpr(sizeof(pixel_t) == 4) {
-        pU[x] = factor * (pattern4U[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-        pV[x] = factor * (pattern4V[0] - chroma_offset_i) + (factor_t)chroma_offset_f;
-      }
-      else {
-        pU[x] = factor * (pattern4U[0] << shift);
-        pV[x] = factor * (pattern4V[0] << shift);
-      }
+      ProcessPixel(pattern4RGB[0], pattern4RGB[0], pattern4RGB[0], x);
     }
+
     pY += pitchY; pU += pitchUV; pV += pitchUV;
   }
 }
@@ -1599,7 +1615,7 @@ public:
     update_Matrix_and_ColorRange(props, theMatrix, theColorRange, env);
 
   // HD colorbars arib_std_b28
-  // Rec709 yuv values calculated by jmac698, Jan 2010, for Midzuki
+  // Rec709 yuv values
   if (type) { // ColorbarsHD
     BYTE* pY = (BYTE*)frame->GetWritePtr(PLANAR_Y);
     BYTE* pU = (BYTE*)frame->GetWritePtr(PLANAR_U);
@@ -1608,12 +1624,12 @@ public:
     const int pitchUV = frame->GetPitch(PLANAR_U);
 
     switch (bits_per_pixel) {
-    case 8: draw_colorbarsHD_444<uint8_t, 8>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 10: draw_colorbarsHD_444<uint16_t, 10>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 12: draw_colorbarsHD_444<uint16_t, 12>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 14: draw_colorbarsHD_444<uint16_t, 14>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 16: draw_colorbarsHD_444<uint16_t, 16>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 32: draw_colorbarsHD_444<float, 8 /* n/a */>(pY, pU, pV, pitchY, pitchUV, w, h); break;
+    case 8: draw_colorbarsHD_444<uint8_t>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel); break;
+    case 10: 
+    case 12: 
+    case 14: 
+    case 16: draw_colorbarsHD_444<uint16_t>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel); break;
+    case 32: draw_colorbarsHD_444<float>(pY, pU, pV, pitchY, pitchUV, w, h,bits_per_pixel); break;
     }
 
   }
@@ -1626,12 +1642,12 @@ public:
     const int pitchUV = frame->GetPitch(PLANAR_U);
 
     switch (bits_per_pixel) {
-    case 8: draw_colorbars_444<uint8_t, 8>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 10: draw_colorbars_444<uint16_t, 10>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 12: draw_colorbars_444<uint16_t, 12>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 14: draw_colorbars_444<uint16_t, 14>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 16: draw_colorbars_444<uint16_t, 16>(pY, pU, pV, pitchY, pitchUV, w, h); break;
-    case 32: draw_colorbars_444<float, 8 /* n/a */>(pY, pU, pV, pitchY, pitchUV, w, h); break;
+    case 8: draw_colorbars_444<uint8_t>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel); break;
+    case 10:
+    case 12:
+    case 14:
+    case 16: draw_colorbars_444<uint16_t>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel); break;
+    case 32: draw_colorbars_444<float>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel); break;
     }
   }
   else if (vi.IsRGB() && vi.IsPlanar()) {

@@ -32,40 +32,29 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
-#ifndef __Greyscale_H__
-#define __Greyscale_H__
+#ifndef __Layer_AVX2_H__
+#define __Layer_AVX2_H__
 
 #include <avisynth.h>
-#include "../convert/convert_planar.h"
+#include <stdint.h>
 
-class Greyscale : public GenericVideoFilter
-/**
-  * Class to convert video to greyscale
- **/
-{
-public:
-  Greyscale(PClip _child, const char* matrix, IScriptEnvironment* env);
-  PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
+void mask_avx2(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, size_t width, size_t height);
+void colorkeymask_avx2(BYTE* pf, int pitch, int color, int height, int width, int tolB, int tolG, int tolR);
+void invert_frame_avx2(BYTE* frame, int pitch, int width, int height, int mask);
+void invert_frame_uint16_avx2(BYTE* frame, int pitch, int width, int height, uint64_t mask64);
 
-  static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env);
+void layer_yuy2_or_rgb32_fast_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
+template<typename pixel_t>
+void layer_genericplane_fast_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 
-  int __stdcall SetCacheHints(int cachehints, int frame_range) override {
-    AVS_UNUSED(frame_range);
-    return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
-  }
+template<bool use_chroma>
+void layer_rgb32_mul_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
+template<bool use_chroma>
+void layer_rgb32_add_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
+void layer_rgb32_fast_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
+template<bool use_chroma>
+void layer_rgb32_subtract_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
+template<int mode>
+void layer_rgb32_lighten_darken_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
 
-private:
-  ConversionMatrix greyMatrix;
-  int theMatrix;
-  int theColorRange;
-  int theOutColorRange;
-  int pixelsize;
-  int bits_per_pixel;
-  bool coeff_int16_overflow;
-
-};
-
-
-
-
-#endif  // __Greyscale_H__
+#endif  // __Layer_SSE_H__

@@ -208,7 +208,7 @@ PVideoFrame __stdcall AvsCache::GetFrame(int n, IScriptEnvironment* env_)
       try
       {
 #ifdef _DEBUG
-        snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame LRU_LOOKUP_NOT_FOUND: [%s] n=%6d child=%p\n", name.c_str(), n, (void*)_pimpl->child); // P.F.
+        snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame LRU_LOOKUP_NOT_FOUND Start: [%s] n=%6d child=%p\n", name.c_str(), n, (void*)_pimpl->child); // P.F.
         _RPT0(0, buf.get());
 #endif
         //cache_handle.first->value = _pimpl->child->GetFrame(n, env);
@@ -238,10 +238,10 @@ PVideoFrame __stdcall AvsCache::GetFrame(int n, IScriptEnvironment* env_)
       std::chrono::duration<double> elapsed_seconds = t_end - t_start;
       std::string name = FuncName;
       if (NULL == cache_handle.first->value) {
-          snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame LRU_LOOKUP_NOT_FOUND: HEY! got nulled! [%s] n=%6d child=%p frame=%p framebefore=%p SeekTimeWithGetFrame:%f\n", name.c_str(), n, (void *)_pimpl->child, (void *)cache_handle.first->value, (void *)result, elapsed_seconds.count()); // P.F.
+          snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame LRU_LOOKUP_NOT_FOUND   End: HEY! got nulled! [%s] n=%6d child=%p frame=%p framebefore=%p SeekTimeWithGetFrame:%f\n", name.c_str(), n, (void *)_pimpl->child, (void *)cache_handle.first->value, (void *)result, elapsed_seconds.count()); // P.F.
           _RPT0(0, buf.get());
       } else {
-          snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame LRU_LOOKUP_NOT_FOUND: [%s] n=%6d child=%p frame=%p framebefore=%p videoCacheSize=%zu SeekTimeWithGetFrame:%f\n", name.c_str(), n, (void *)_pimpl->child, (void *)cache_handle.first->value, (void *)result, _pimpl->VideoCache->size(), elapsed_seconds.count()); // P.F.
+          snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame LRU_LOOKUP_NOT_FOUND   End: [%s] n=%6d child=%p frame=%p framebefore=%p videoCacheSize=%zu SeekTimeWithGetFrame:%f\n", name.c_str(), n, (void *)_pimpl->child, (void *)cache_handle.first->value, (void *)result, _pimpl->VideoCache->size(), elapsed_seconds.count()); // P.F.
           _RPT0(0, buf.get());
       }
 #endif
@@ -621,7 +621,7 @@ CacheGuard::CacheGuard(const PClip& child, const char *name, IScriptEnvironment*
 CacheGuard::~CacheGuard()
 { }
 
-PClip CacheGuard::GetCache(IScriptEnvironment* env_)
+PClip CacheGuard::GetCache(IScriptEnvironment* env_, bool use_child_if_notfound, PClip child)
 {
   std::unique_lock<std::mutex> global_lock(mutex);
 
@@ -634,6 +634,10 @@ PClip CacheGuard::GetCache(IScriptEnvironment* env_)
       return entry.second;
     }
   }
+
+  // not found for current device, creation may not be good (e.g. GetFrame(0) from an Invoke)
+  if (use_child_if_notfound)
+    return child;
 
   // not found for current device, create it
   AvsCache* cache = new AvsCache(child, device, /*ref*/mutex, static_cast<InternalEnvironment*>(globalEnv));
@@ -678,7 +682,11 @@ PVideoFrame __stdcall CacheGuard::GetFrame(int n, IScriptEnvironment* env_)
   if (!name.empty())
     _RPT2(0, "CacheGuard::GetFrame call further GetFrame: %s %d\n", name.c_str(), n);
   */
-  return GetCache(env)->GetFrame(n, env);
+
+  // do not create cache from inside Invoke (e.g. when calling GetFrame(0) from constructor during instantation)
+  const bool chainedCtor = IEnv->GetInvokeStackSize() > 0;
+ 
+  return GetCache(env, chainedCtor, child)->GetFrame(n, env);
 }
 
 void __stdcall CacheGuard::GetAudio(void* buf, int64_t start, int64_t count, IScriptEnvironment* env_)
@@ -687,7 +695,10 @@ void __stdcall CacheGuard::GetAudio(void* buf, int64_t start, int64_t count, ISc
   IScriptEnvironment* env = static_cast<IScriptEnvironment*>(IEnv);
 
   ScopedCounter getframe_counter(IEnv->GetFrameRecursiveCount());
-  return GetCache(env)->GetAudio(buf, start, count, env);
+
+  // do not create cache from inside Invoke (e.g. when calling GetFrame(0) from constructor during instantation)
+  const bool chainedCtor = IEnv->GetInvokeStackSize() > 0;
+  return GetCache(env, chainedCtor, child)->GetAudio(buf, start, count, env);
 }
 
 const VideoInfo& __stdcall CacheGuard::GetVideoInfo()
@@ -702,7 +713,35 @@ bool __stdcall CacheGuard::GetParity(int n)
 
 int __stdcall CacheGuard::SetCacheHints(int cachehints, int frame_range)
 {
-  _RPT3(0, "CacheGuard::SetCacheHints called. cache=%p hint=%d frame_range=%d\n", (void *)this, cachehints, frame_range); // P.F.
+
+#ifdef _DEBUG
+  std::string hintname;
+  switch (cachehints) {
+  case CACHE_DONT_CACHE_ME: hintname = "CACHE_DONT_CACHE_ME"; break;
+  case CACHE_SET_MIN_CAPACITY: hintname = "CACHE_SET_MIN_CAPACITY"; break;
+  case CACHE_SET_MAX_CAPACITY: hintname = "CACHE_SET_MAX_CAPACITY"; break;
+  case CACHE_GET_MIN_CAPACITY: hintname = "CACHE_GET_MIN_CAPACITY"; break;
+  case CACHE_GET_MAX_CAPACITY: hintname = "CACHE_GET_MAX_CAPACITY"; break;
+  case CACHE_GET_SIZE: hintname = "CACHE_GET_SIZE"; break;
+  case CACHE_GET_REQUESTED_CAP: hintname = "CACHE_GET_REQUESTED_CAP"; break;
+  case CACHE_GET_CAPACITY: hintname = "CACHE_GET_CAPACITY"; break;
+  case CACHE_GET_MTMODE: hintname = "CACHE_GET_MTMODE"; break;
+  case CACHE_IS_CACHE_REQ: hintname = "CACHE_IS_CACHE_REQ"; break;
+  case CACHE_IS_CACHE_ANS: hintname = "CACHE_IS_CACHE_ANS"; break;
+  case CACHE_IS_MTGUARD_REQ: hintname = "CACHE_IS_MTGUARD_REQ"; break;
+  case CACHE_IS_MTGUARD_ANS: hintname = "CACHE_IS_MTGUARD_ANS"; break;
+  case CACHE_INFORM_NUM_THREADS: hintname = "CACHE_INFORM_NUM_THREADS"; break;
+  case CACHE_GET_DEV_TYPE: hintname = "CACHE_GET_DEV_TYPE"; break;
+  case CACHE_GET_CHILD_DEV_TYPE: hintname = "CACHE_GET_CHILD_DEV_TYPE"; break;
+  }
+  if (cachehints != CACHE_GET_DEV_TYPE && cachehints != CACHE_GET_CHILD_DEV_TYPE) {
+    // dont't care for the above
+    if (hintname == "")
+      _RPT3(0, "CacheGuard::SetCacheHints called. cache=%p hint=%d frame_range=%d\n", (void*)this, cachehints, frame_range); // P.F.
+    else
+      _RPT3(0, "CacheGuard::SetCacheHints called. cache=%p hint=%d (%s) frame_range=%d\n", (void*)this, cachehints, hintname.c_str(), frame_range); // P.F.
+  }
+#endif
   switch (cachehints)
   {
     /*********************************************
