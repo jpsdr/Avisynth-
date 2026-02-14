@@ -123,7 +123,7 @@ class ResetMask : public GenericVideoFilter
   **/
 {
 public:
-  ResetMask(PClip _child, float _mask_f, IScriptEnvironment* env);
+  ResetMask(PClip _child, AVSValue _mask_f, AVSValue opacity_f, IScriptEnvironment* env);
   PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 
   int __stdcall SetCacheHints(int cachehints, int frame_range) override {
@@ -229,8 +229,10 @@ enum
   DARKEN = 1
 };
 
+// Simply Rec.601
+
 // 15 bit scaled constants used for calculating luma mask from RGB
-// original constants (3736,19235,9798) cause int32 overfloat at 16 bits as sum()=32769
+// original constants (3736,19235,9798) cause int32 overflow at 16 bits as sum()=32769
 // modified constants (3736,19234,9798) O.K. at 16 bits as sum()=32768
 // 32769 * 65535 + 16384 = 8000BFFF int32 overflow
 // 32768 * 65535 + 16384 = 7FFFC000 OK
