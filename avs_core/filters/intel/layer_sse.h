@@ -40,19 +40,12 @@
 
 void mask_sse2(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, size_t width, size_t height);
 void colorkeymask_sse2(BYTE* pf, int pitch, int color, int height, int width, int tolB, int tolG, int tolR);
-void invert_frame_sse2(BYTE* frame, int pitch, int width, int height, int mask);
-void invert_frame_uint16_sse2(BYTE* frame, int pitch, int width, int height, uint64_t mask64);
+void invert_frame_inplace_sse2(BYTE* frame, int pitch, int width, int height, int mask);
+void invert_frame_uint16_inplace_sse2(BYTE* frame, int pitch, int width, int height, uint64_t mask64);
 template<bool use_chroma>
-void layer_yuy2_mul_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template<bool use_chroma>
-void layer_yuy2_add_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 void layer_yuy2_or_rgb32_fast_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<typename pixel_t>
 void layer_genericplane_fast_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template<bool use_chroma>
-void layer_yuy2_subtract_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template<int mode>
-void layer_yuy2_lighten_darken_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
 template<bool use_chroma>
 void layer_rgb32_mul_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<bool use_chroma>
@@ -66,23 +59,10 @@ void layer_rgb32_lighten_darken_sse2(BYTE* dstp, const BYTE* ovrp, int dst_pitch
 #ifdef X86_32 
 void mask_mmx(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, size_t width, size_t height);
 void colorkeymask_mmx(BYTE* srcp, int pitch, int color, int height, int width, int tolB, int tolG, int tolR);
-void invert_frame_mmx(BYTE* frame, int pitch, int width, int height, int mask);
-void invert_plane_mmx(BYTE* frame, int pitch, int width, int height);
-template<bool use_chroma>
-void layer_yuy2_mul_mmx(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template<bool use_chroma>
-void layer_yuy2_add_mmx(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template<bool use_chroma>
-void layer_yuy2_subtract_mmx(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-
-void layer_yuy2_fast_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-template<int mode>
-void layer_yuy2_lighten_darken_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
 template<bool use_chroma>
 void layer_rgb32_mul_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<bool use_chroma>
 void layer_rgb32_add_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
-void layer_rgb32_fast_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<bool use_chroma>
 void layer_rgb32_subtract_isse(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<int mode>
