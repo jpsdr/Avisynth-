@@ -32,59 +32,13 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
-#ifndef __Convert_YUY2_H__
-#define __Convert_YUY2_H__
+#ifndef __Convert_RGB_AVX512_H__
+#define __Convert_RGB_AVX512_H__
 
 #include <avisynth.h>
 
-#include "convert_matrix.h"
+template<typename pixel_t, bool targetHasAlpha>
+void convert_rgba_to_rgbp_avx512vbmi(const BYTE* srcp, BYTE* (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height);
 
-class ConvertToYUY2 : public GenericVideoFilter
-/**
-  * Class for conversions to YUY2
- **/
-{
-public:
-  ConvertToYUY2(PClip _child, bool _dupl, bool _interlaced, const char *matrix_name, IScriptEnvironment* env);
-  PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
 
-  int __stdcall SetCacheHints(int cachehints, int frame_range) override {
-    AVS_UNUSED(frame_range);
-    return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
-  }
-
-  static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env);
-
-private:
-  const bool interlaced;
-
-protected:
-  const int src_cs;  // Source colorspace
-  int theMatrix;
-  int theColorRange;
-  int theOutColorRange;
-  ConversionMatrix matrix;
-
-};
-
-class ConvertBackToYUY2 : public ConvertToYUY2
-/**
-  * Class for conversions to YUY2 (With Chroma copy)
- **/
-{
-public:
-  ConvertBackToYUY2(PClip _child, const char *matrix, IScriptEnvironment* env);
-  PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment* env) override;
-
-  int __stdcall SetCacheHints(int cachehints, int frame_range) override {
-    AVS_UNUSED(frame_range);
-    return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
-  }
-
-  static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env);
-};
-
-void convert_yuy2_to_yv12_interlaced_c(const BYTE* src, int src_width, int src_pitch, BYTE* dstY, BYTE* dstU, BYTE* dstV, int dst_pitchY, int dst_pitchUV, int height);
-void convert_yuy2_to_yv12_progressive_c(const BYTE* src, int src_width, int src_pitch, BYTE* dstY, BYTE* dstU, BYTE* dstV, int dst_pitchY, int dst_pitchUV, int height);
-
-#endif // __Convert_YUY2_H__
+#endif // __Convert_RGB_AVX512_H__

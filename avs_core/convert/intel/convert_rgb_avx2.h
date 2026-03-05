@@ -38,6 +38,9 @@
 #include <avs/types.h>
 
 template<typename pixel_t, bool targetHasAlpha>
-void convert_rgb_to_rgbp_avx2(const BYTE *srcp, BYTE * (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height, int bits_per_pixel);
+void convert_rgb_to_rgbp_avx2(const BYTE *srcp, BYTE * (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height);
+
+template<typename pixel_t, bool targetHasAlpha>
+void convert_rgba_to_rgbp_avx2(const BYTE* srcp, BYTE* (&dstp)[4], int src_pitch, int(&dst_pitch)[4], int width, int height);
 
 #endif  // __Convert_RGB_AVX2_H__

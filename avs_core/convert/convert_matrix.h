@@ -43,10 +43,6 @@ struct ConversionMatrix {
   int u_r, u_g, u_b;
   int v_r, v_g, v_b;
 
-  // used in YUY2 RGB->YUY2 asm
-  int ku, ku_luma;
-  int kv, kv_luma;
-
   float y_r_f, y_g_f, y_b_f;
   float u_r_f, u_g_f, u_b_f;
   float v_r_f, v_g_f, v_b_f;
@@ -56,12 +52,18 @@ struct ConversionMatrix {
   int offset_rgb;
   float offset_rgb_f;
 
+  // and the w/o the y/rgb suffix, supporting yuv-yuv or rgb-rgb fused matrix calculations.
+  int offset_in;
+  float offset_in_f;
+  int offset_out;
+  float offset_out_f;
+
   // Helper values for exact 32-bit target for hybric calculations, where
   // conversion to 32-bits is done after the integer-integer conversion.
   // E.g. yuv X-bit -> rgb X-bit -> rgb 32-bit
   float target_span_f;
   float target_span_f_32;
-  float offset_rgb_f_32;
+  float offset_out_f_32;
 };
 
 bool GetKrKb(int matrix, double& Kr, double& Kb);
