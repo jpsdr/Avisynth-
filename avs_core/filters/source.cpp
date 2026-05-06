@@ -1815,7 +1815,7 @@ static void draw_colorbarsUHD_444_rgb(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8,
 #ifdef XP_TLS
     if (is_float_output)
 #else
-    if constexpr (is_float_output)
+    if (is_float_output)
 #endif
     {
       return (pixel_t)((code10 - luma_c.src_offset_i) * luma_c.mul_factor + luma_c.dst_offset);
@@ -1846,7 +1846,7 @@ static void draw_colorbarsUHD_444_rgb(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8,
 #ifdef XP_TLS
     if (is_float_output)
 #else
-    if constexpr (is_float_output)
+    if (is_float_output)
 #endif
     {
       return scale_y(code10); // float always uses 10-bit ref via scale_y
@@ -1972,7 +1972,7 @@ static void draw_colorbarsUHD_444_rgb(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8,
 #ifdef XP_TLS
     if (is_float_output) {
 #else
-    if constexpr (is_float_output) {
+    if (is_float_output) {
 #endif
       sy = (pixel_t)(dY * luma_c_from_float.mul_factor + luma_c_from_float.dst_offset);
       scb = (pixel_t)(dU * chroma_c_from_float.mul_factor);
