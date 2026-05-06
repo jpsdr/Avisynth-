@@ -46,72 +46,141 @@
 /******************************
  ********* Mode: Blend ********
  ******************************/
+// ---------------------------------------------------------------------------
+// Overlay blend masked getter — returns masked_merge_avx2_impl instantiation.
+// is_chroma=false -> always MASK444 (luma).
+// is_chroma=true  -> placement-aware maskMode (chroma).
+// ---------------------------------------------------------------------------
 
-// 32 bit float mask calculation inside
-template<bool has_mask, typename pixel_t>
-void overlay_blend_c_uint(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel)
+masked_merge_fn_t* get_overlay_blend_masked_fn_c(bool is_chroma, MaskMode maskMode)
 {
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
-  auto factor = has_mask ? opacity_f / max_pixel_value : opacity_f;
+#define DISPATCH_OVERLAY_BLEND_C(MaskType) \
+  return is_chroma ? masked_merge_c_impl<MaskType> \
+                   : masked_merge_c_impl<MASK444>;
 
+  switch (maskMode) {
+  case MASK444:          DISPATCH_OVERLAY_BLEND_C(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_C(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_C(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_C(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_C(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_C(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_C(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_C(MASK411)
+  }
+#undef DISPATCH_OVERLAY_BLEND_C
+  return masked_merge_c_impl<MASK444>; // unreachable
+}
+
+// and for float:
+masked_merge_float_fn_t* get_overlay_blend_masked_float_fn_c(bool is_chroma, MaskMode maskMode)
+{
+#define DISPATCH_OVERLAY_BLEND_FLOAT_C(MaskType) \
+  return is_chroma ? masked_merge_float_c_impl<MaskType> \
+                   : masked_merge_float_c_impl<MASK444>;
+
+  switch (maskMode) {
+  case MASK444:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK444)
+  case MASK420:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK420)
+  case MASK420_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK420_MPEG2)
+  case MASK420_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK420_TOPLEFT)
+  case MASK422:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK422)
+  case MASK422_MPEG2:    DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK422_MPEG2)
+  case MASK422_TOPLEFT:  DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK422_TOPLEFT)
+  case MASK411:          DISPATCH_OVERLAY_BLEND_FLOAT_C(MASK411)
+  }
+#undef DISPATCH_OVERLAY_BLEND_FLOAT_C
+  return masked_merge_float_c_impl<MASK444>; // unreachable
+}
+
+/*
+// Scalar division — used in reference C, constexpr-friendly
+template<int bits_per_pixel>
+inline int magic_div(uint32_t tmp) {
+  constexpr MagicDiv magic = get_magic_div(bits_per_pixel);
+  if constexpr (bits_per_pixel == 8)
+    // mimics: mulhi_epu16(x, 0x8081) >> 7
+    return (int)(((uint32_t)tmp * magic.div) >> (16 + magic.shift));
+  else
+    // mimics: mul_epu32(x, div) >> (32 + shift)
+    return (int)(((uint64_t)tmp * magic.div) >> (32 + magic.shift));
+}
+*/
+
+/*****************************************************
+ ********* Family 1: weighted_merge (no mask) ********
+ *****************************************************/
+
+// weight + invweight == 32768; kernel: (p1*inv + p2*w + 16384) >> 15
+// Intentionally matches the SIMD >> 15 path (old C used >> 16 with weights summing to 32767).
+template<typename pixel_t>
+static void weighted_merge_impl_c(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  int weight, int invweight)
+{
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
-      const float new_factor = has_mask ? static_cast<float>(reinterpret_cast<const pixel_t*>(mask)[x]) * factor : factor;
-      const pixel_t pix1 = reinterpret_cast<pixel_t*>(p1)[x];
-      const pixel_t pix2 = reinterpret_cast<const pixel_t*>(p2)[x];
-      pixel_t result = pix1 + (int)((pix2 - pix1) * new_factor + 0.5f);
-      reinterpret_cast<pixel_t*>(p1)[x] = result;
+      reinterpret_cast<pixel_t*>(p1)[x] = (pixel_t)(
+        (reinterpret_cast<const pixel_t*>(p1)[x] * invweight +
+         reinterpret_cast<const pixel_t*>(p2)[x] * weight + 16384) >> 15);
     }
-
     p1 += p1_pitch;
     p2 += p2_pitch;
-    if(has_mask)
-      mask += mask_pitch;
   }
 }
 
-// instantiate
-// w/o mask
-template void overlay_blend_c_uint<false, uint8_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_c_uint<false, uint16_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-// w/ mask
-template void overlay_blend_c_uint<true, uint8_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_c_uint<true, uint16_t>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int opacity, const float opacity_f, const int bits_per_pixel);
+// merge, handle the two extrems at plane level if it wasn't at clip level
+void weighted_merge_return_a_or_b(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  int weight, int invweight,
+  int bits_per_pixel)
+{
+  // called either with weight==0, invweight==32768 or the opposite
+  if (weight == 0) return; // keep p1 as-is
 
+  const int pixelsize = bits_per_pixel == 8 ? 1 : bits_per_pixel <= 16 ? 2 : 4;
+  const int rowsize = width * pixelsize;
 
-template<bool has_mask>
-void overlay_blend_c_float(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch,
-  const int width, const int height, const int /*opacity*/, const float opacity_f, const int bits_per_pixel) {
-
-  for (int y = 0; y < height; y++) {
-    for (int x = 0; x < width; x++) {
-      auto new_mask = has_mask ? reinterpret_cast<const float*>(mask)[x] * opacity_f : opacity_f;
-      auto p1x = reinterpret_cast<float*>(p1)[x];
-      auto p2x = reinterpret_cast<const float*>(p2)[x];
-      auto result = p1x + (p2x - p1x) * new_mask; // p1x*(1-new_mask) + p2x*mask
-      reinterpret_cast<float*>(p1)[x] = result;
+  if (invweight == 0) {
+    // like bitblt
+    for (int y = 0; y < height; y++) {
+      memcpy(p1, p2, rowsize);
+      p1 += p1_pitch;
+      p2 += p2_pitch;
     }
-
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-    if constexpr (has_mask)
-      mask += mask_pitch;
   }
 }
 
-// instantiate
-template void overlay_blend_c_float<false>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int /*opacity*/, const float opacity_f, const int bits_per_pixel);
-template void overlay_blend_c_float<true>(BYTE* p1, const BYTE* p2, const BYTE* mask,
-  const int p1_pitch, const int p2_pitch, const int mask_pitch, const int width, const int height, const int /*opacity*/, const float opacity_f, const int bits_per_pixel);
+void weighted_merge_c(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  int weight, int invweight,
+  int bits_per_pixel)
+{
+  if (bits_per_pixel == 8)
+    weighted_merge_impl_c<uint8_t>(p1, p2, p1_pitch, p2_pitch, width, height, weight, invweight);
+  else
+    weighted_merge_impl_c<uint16_t>(p1, p2, p1_pitch, p2_pitch, width, height, weight, invweight);
+}
 
+void weighted_merge_float_c(BYTE* p1, const BYTE* p2,
+  int p1_pitch, int p2_pitch,
+  int width, int height,
+  float weight_f)
+{
+  const float invweight_f = 1.0f - weight_f;
+  for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+      reinterpret_cast<float*>(p1)[x] =
+        reinterpret_cast<const float*>(p1)[x] * invweight_f +
+        reinterpret_cast<const float*>(p2)[x] * weight_f;
+    }
+    p1 += p1_pitch;
+    p2 += p2_pitch;
+  }
+}
 
 /***************************************
  ********* Mode: Lighten/Darken ********

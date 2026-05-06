@@ -58,4 +58,11 @@ void yuy2_uvtoy8_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch
 template <bool has_clipY>
 void yuy2_ytouv_sse2(const BYTE* srcp_y, const BYTE* srcp_u, const BYTE* srcp_v, BYTE* dstp, int pitch_y, int pitch_u, int pitch_v, int dst_pitch, int dst_rowsize, int height);
 
+// Packed RGB32/RGB64 single-channel extraction
+template<int channel_index>
+void extract_packed_rgb32_channel_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
+
+template<int channel_index>
+void extract_packed_rgb64_channel_sse2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
+
 #endif  // __Planeswap_SSE_H__

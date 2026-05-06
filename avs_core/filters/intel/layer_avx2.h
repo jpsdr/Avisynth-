@@ -43,8 +43,16 @@ void mask_avx2(BYTE* srcp, const BYTE* alphap, int src_pitch, int alpha_pitch, s
 void colorkeymask_avx2(BYTE* pf, int pitch, int color, int height, int width, int tolB, int tolG, int tolR);
 void invert_frame_inplace_avx2(BYTE* frame, int pitch, int width, int height, int mask);
 void invert_frame_uint16_inplace_avx2(BYTE* frame, int pitch, int width, int height, uint64_t mask64);
-template<typename pixel_t, bool lessthan16bits, bool chroma>
-void invert_plane_c_avx2(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+template<bool chroma>
+void invert_plane_avx2_u8(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+
+// 10/12/14/16-bit luma/chroma plane inversion (AVX2).
+template<bool chroma>
+void invert_plane_avx2_u16(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
+
+// 32-bit float luma/chroma plane inversion (AVX2).
+template<bool chroma>
+void invert_plane_avx2_f32(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel);
 
 void layer_yuy2_or_rgb32_fast_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level);
 template<typename pixel_t>
@@ -61,29 +69,31 @@ template<int mode>
 void layer_rgb32_lighten_darken_avx2(BYTE* dstp, const BYTE* ovrp, int dst_pitch, int overlay_pitch, int width, int height, int level, int thresh);
 
 void get_layer_yuv_mul_functions_avx2(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+  bool is_chroma, bool hasAlpha,
   int placement, VideoInfo& vi, int bits_per_pixel,
   layer_yuv_mul_c_t** layer_fn,
   layer_yuv_mul_f_c_t** layer_f_fn);
 
-template<bool is_subtract>
-void get_layer_yuv_add_subtract_functions_avx2(
-  bool is_chroma, bool use_chroma, bool hasAlpha,
+void get_layer_yuv_masked_add_functions_avx2(
+  bool is_chroma,
   int placement, VideoInfo& vi, int bits_per_pixel,
-  layer_yuv_add_subtract_c_t** layer_fn,
-  layer_yuv_add_subtract_f_c_t** layer_f_fn);
+  /*out*/masked_merge_fn_t** layer_fn,
+  /*out*/masked_merge_float_fn_t** layer_f_fn);
 
-void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn);
+void get_layer_planarrgb_lighten_darken_functions_avx2(bool isLighten, bool hasAlpha, bool blendAlpha, int bits_per_pixel, /*out*/layer_planarrgb_lighten_darken_c_t** layer_fn, /*out*/layer_planarrgb_lighten_darken_f_c_t** layer_f_fn);
 
-template<bool is_subtract>
-void get_layer_planarrgb_add_subtract_functions_avx2(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
-  /*out*/layer_planarrgb_add_subtract_c_t** layer_fn,
-  /*out*/layer_planarrgb_add_subtract_f_c_t** layer_f_fn);
+void get_layer_planarrgb_add_functions_avx2(
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
+  /*out*/layer_planarrgb_add_c_t** layer_fn,
+  /*out*/layer_planarrgb_add_f_c_t** layer_f_fn);
 
 void get_layer_planarrgb_mul_functions_avx2(
-  bool chroma, bool hasAlpha, int bits_per_pixel,
+  bool chroma, bool hasAlpha, bool blendAlpha, int bits_per_pixel,
   layer_planarrgb_mul_c_t** layer_fn,
   layer_planarrgb_mul_f_c_t** layer_f_fn);
+
+void get_layer_packedrgb_blend_functions_avx2(
+  bool has_separate_mask, int bits_per_pixel,
+  layer_packedrgb_blend_c_t** fn);
 
 #endif  // __Layer_SSE_H__

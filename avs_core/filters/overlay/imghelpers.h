@@ -41,6 +41,7 @@
 #include <avs/minmax.h>
 #include <avs/alignment.h>
 #include "444convert.h"
+#include "blend_common.h"
 
 class ImageOverlayInternal {
 private:
@@ -53,6 +54,8 @@ private:
 
   int fake_w;
   int fake_h;
+  int fake_x_accum; // cumulative luma x offset from all SubFrame calls
+  int fake_y_accum; // cumulative luma y offset from all SubFrame calls
   const int _w;
   const int _h;
   const int _bits_per_pixel;
@@ -82,11 +85,6 @@ public:
     frame(_frame),
     _w(_inw), _h(_inh), _bits_per_pixel(_workingVI.BitsPerComponent()), grey(_grey), maskChroma(nullptr) {
 
-    int pixelsize;
-    if (_bits_per_pixel == 8) pixelsize = 1;
-    else if (_bits_per_pixel <= 16) pixelsize = 2;
-    else pixelsize = 4;
-
     planeCount = _workingVI.NumComponents();
 
     planes = (_workingVI.IsYUV() || _workingVI.IsYUVA()) ? planes_y : planes_r;
@@ -102,19 +100,10 @@ public:
       pitches[p] = frame->GetPitch(plane);
     }
 
-    // allocate extra chroma and set chroma pitches for greymask mode
+    // Set chroma pitches for greymask mode.
+    // All paths now use the luma pitch for chroma planes — no separate chroma buffer.
     if (grey) {
-      if (_workingVI.Is420() || _workingVI.Is422()) {
-        // allocate for subSampled chroma when original mask is grey (Y only)
-        int tmppitch = AlignNumber((_w >> xSubSamplingShifts[1])*pixelsize, FRAME_ALIGN);
-        maskChroma = static_cast<BYTE*>(Env->Allocate(
-          tmppitch * (_h >> ySubSamplingShifts[1]), 64, AVS_POOLED_ALLOC)
-          );
-        pitches[1] = pitches[2] = tmppitch;
-      }
-      else {
-        pitches[1] = pitches[2] = pitches[0];
-      }
+      pitches[1] = pitches[2] = pitches[0];
     }
 
     // temporarily. so far only blend is ported to arrays
@@ -125,18 +114,79 @@ public:
     for (int p = 0; p < planeCount; p++)
       origPlanes[p] = (BYTE*)frame->GetReadPtr(planes[p]);
     if (grey) {
-      if (_workingVI.Is420()) {
-        // resize Y-only mask to 4:2:0 chroma
-        ConvertYToYV12Chroma(maskChroma, origPlanes[0], pitches[1], pitches[0], pixelsize, _w >> xSubSamplingShifts[1], _h >> ySubSamplingShifts[1], Env);
-        origPlanes[1] = origPlanes[2] = maskChroma;
-      }
-      else if (_workingVI.Is422()) {
-        // resize Y-only mask to 4:2:2 chroma
-        ConvertYToYV16Chroma(maskChroma, origPlanes[0], pitches[1], pitches[0], pixelsize, _w >> xSubSamplingShifts[1], _h >> ySubSamplingShifts[1], Env);
-        origPlanes[1] = origPlanes[2] = maskChroma;
+      if (_workingVI.Is420() || _workingVI.Is422()) {
+        // Chroma planes alias the luma plane.  BlendImageMask (Overlay Blend/Luma/Chroma —
+        // the only modes that reach this branch with use444=false for subsampled YUV)
+        // computes placement-correct spatial averages per row into a per-row scratch buffer.
+        // xSubSamplingShifts[1/2] remain at their actual values (1) so callers can derive
+        // chroma dimensions and advance the luma-resolution mask row pointer correctly.
+        origPlanes[1] = origPlanes[2] = origPlanes[0];
+
+        // -------------------------------------------------------------------
+        // Historical: former per-frame chroma-mask pre-resampling (removed).
+        // ConvertYToYV12Chroma / ConvertYToYV16Chroma were called here once per
+        // frame to produce a pre-downsampled chroma-resolution mask plane stored
+        // in the maskChroma allocation.  Removed due to several limitations:
+        //
+        //   1. MPEG1 (centre) chroma placement only.  The converters averaged
+        //      horizontally centred pairs of luma pixels, which corresponds to
+        //      MPEG1/JPEG placement.  MPEG2 (left-aligned / co-sited) placement
+        //      — the default for H.262, H.264, and most broadcast content — was
+        //      never supported; callers used the result regardless.
+        //
+        //   2. SIMD path was not bit-exact with the C path.  The SSE2 variant
+        //      used the  avg_epu8( avg_epu8(a,b), avg_epu8(a^1,b^1) )  trick
+        //      to approximate unbiased rounding, while the C fallback used plain
+        //      (a+b+1)>>1.  Results could differ by ±1 LSB.
+        //
+        //   3. No YV411 (4:1:1) support.  No ConvertYToYV411Chroma function
+        //      existed, so a greymask + YV411 blend in subsampled mode would
+        //      have silently produced wrong output (chroma planes pointing at
+        //      luma data without any horizontal averaging applied).
+        //
+        //   4. Only Overlay Blend, Luma, and Chroma with subsampled (420/422)
+        //      YUV input and use444=false ever reached this code.  All other
+        //      modes are blocked from use444=false with YUV input:
+        //        - Multiply, Darken, Lighten, SoftLight, HardLight, Difference,
+        //          Exclusion: overlay.cpp throws "cannot specify use444=false
+        //          for this overlay mode" at construction time.
+        //        - Add, Subtract: use444=false is auto-set only for RGB input
+        //          (lines 203-208 of overlay.cpp); for YUV these modes stay on
+        //          the use444=true path and their ImageOverlayInternal is always
+        //          created with a 4:4:4 working format.
+        //      maskChroma (the BYTE* member) and its ~ImageOverlayInternal check
+        //      are preserved below so the historical code compiles.
+        // -------------------------------------------------------------------
+#if 0
+        // 4:2:0 former path
+        {
+          int pixelsize;
+          if (_bits_per_pixel == 8) pixelsize = 1;
+          else if (_bits_per_pixel <= 16) pixelsize = 2;
+          else pixelsize = 4;
+
+          int tmppitch = AlignNumber((_w >> xSubSamplingShifts[1]) * pixelsize, FRAME_ALIGN);
+          maskChroma = static_cast<BYTE*>(Env->Allocate(
+            tmppitch * (_h >> ySubSamplingShifts[1]), 64, AVS_POOLED_ALLOC));
+          pitches[1] = pitches[2] = tmppitch;
+          ConvertYToYV12Chroma(maskChroma, origPlanes[0], pitches[1], pitches[0], pixelsize,
+            _w >> xSubSamplingShifts[1], _h >> ySubSamplingShifts[1], Env);
+          origPlanes[1] = origPlanes[2] = maskChroma;
+        }
+        // 4:2:2 former path
+        {
+          int tmppitch = AlignNumber((_w >> xSubSamplingShifts[1]) * pixelsize, FRAME_ALIGN);
+          maskChroma = static_cast<BYTE*>(Env->Allocate(
+            tmppitch * (_h >> ySubSamplingShifts[1]), 64, AVS_POOLED_ALLOC));
+          pitches[1] = pitches[2] = tmppitch;
+          ConvertYToYV16Chroma(maskChroma, origPlanes[0], pitches[1], pitches[0], pixelsize,
+            _w >> xSubSamplingShifts[1], _h >> ySubSamplingShifts[1], Env);
+          origPlanes[1] = origPlanes[2] = maskChroma;
+        }
+#endif
       }
       else {
-        // UV = Y plane pointer
+        // 444 / RGB / YV411 (no dedicated converter): UV = Y plane pointer.
         origPlanes[1] = origPlanes[2] = origPlanes[0];
         xSubSamplingShifts[1] = xSubSamplingShifts[2] = 0;
         ySubSamplingShifts[1] = ySubSamplingShifts[2] = 0;
@@ -250,7 +300,15 @@ public:
 
     fake_w = new_w;
     fake_h = new_h;
+    fake_x_accum += x;
+    fake_y_accum += y;
   }
+
+  // Accumulated luma x/y offset from all SubFrame calls since last ResetFake.
+  // Used by blend functions to compute the correct chroma column/row count via
+  // ceiling division when the starting position is not chroma-grid-aligned.
+  int xAccum() const { return return_original ? 0 : fake_x_accum; }
+  int yAccum() const { return return_original ? 0 : fake_y_accum; }
 
   bool IsSizeZero() {
     if (w()<=0) return true;
@@ -269,6 +327,8 @@ public:
       fakePlanes[i] = origPlanes[i];
     fake_w = _w;
     fake_h = _h;
+    fake_x_accum = 0;
+    fake_y_accum = 0;
   }
 
   ~ImageOverlayInternal() {

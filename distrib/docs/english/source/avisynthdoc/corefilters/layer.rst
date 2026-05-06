@@ -31,14 +31,27 @@ Note that some modes can be similar to :doc:`Overlay <overlay>`, but the two fil
     the alpha channel is used as a mask. Non-alpha plane YUV/planar RGB color spaces act as having 
     a fully transparent alpha channel. Color format must match base_clip.
 
-    Note: if destination is YUVA/RGBA, the overlay clip also has to be Alpha-aware type.
-    Alpha channel is not updated for YUVA targets, but RGBA targets do get the Alpha 
-    updated (like the old RGB32 mode did - compatibility)
+    Note: if destination is YUVA or planar RGBA, the overlay clip must also be an alpha-aware type.
+
+    **Alpha plane update behaviour** (destination alpha after the operation):
+
+    For modes other than 'Add' or 'Subtract' all packed RGB formats (RGB24/32/48/64) are 
+    internally converted to planar before processing and post-converted back; the rules 
+    below apply to the planar representation.
+
+    - **Both clips alpha-aware** (e.g. YUVA+YUVA, PlanarRGBA+PlanarRGBA, RGB32+RGB32):
+      destination alpha **is** updated by every operation using the same formula applied to
+      the colour channels.  The overlay alpha serves as both the per-pixel blend weight and
+      the target value for the alpha channel blend.
+    - **Only overlay has alpha** (e.g. PlanarRGB base + PlanarRGBA overlay):
+      overlay alpha is used as a per-pixel blend weight for the colour channels only;
+      destination alpha is **not written**.
+    - **Only base has alpha, or neither has alpha**: destination alpha is **not written**.
 
 .. describe:: op
 
-    the performed merge operation, which can be: "add", "subtract", "lighten", 
-    "darken", "fast", "mul"
+    the performed merge operation, which can be: "add", "subtract", "lighten",
+    "darken", "fast", "mul", "mulovr"
 
     +----------+-------------------------------------------------+-------------------------------------------------------------------------------------------------------------+
     | Operation| Example                                         | Description                                                                                                 |
@@ -90,6 +103,31 @@ Note that some modes can be similar to :doc:`Overlay <overlay>`, but the two fil
     |          |                                                 | | - alpha=0d    → only ``base_clip`` visible.                                                               |
     |          |                                                 | | - alpha=255d → approx. the same luminance as ``base_clip`` but with the colors of ``overlay_clip``.       |
     |          |                                                 | | See GIMP: Multiply                                                                                        |
+    +----------+-------------------------------------------------+-------------------------------------------------------------------------------------------------------------+
+    | mulovr   |                                                 | | **YUV(A) formats only.** Overlay-style multiply: the overlay's **luma (Y) channel only** darkens the      |
+    |          |                                                 |   base clip. Overlay chroma (U, V) is ignored.                                                              |
+    |          |                                                 |                                                                                                             |
+    |          |                                                 | | A dark overlay Y pulls base luma toward black and simultaneously desaturates base chroma toward neutral   |
+    |          |                                                 |   (128d for 8-bit integer, 0.0 for float). A fully bright overlay Y (max) leaves the base unchanged.        |
+    |          |                                                 |                                                                                                             |
+    |          |                                                 | | The result matches ``Overlay(mode="multiply")`` within ±1 LSB for all bit depths and all 4:2:0 / 4:2:2    |
+    |          |                                                 |   chroma placements.                                                                                        |
+    |          |                                                 |                                                                                                             |
+    |          |                                                 | | **Difference from "mul":** "mul" multiplies each output plane independently by the corresponding overlay  |
+    |          |                                                 |   plane (Y×Y, U×U, V×V), and works for RGB too. "mulovr" uses only the overlay Y to drive all planes,       |
+    |          |                                                 |   keeping chroma proportionally neutral — it desaturates where the overlay is dark, which matches the       |
+    |          |                                                 |   photographic multiply model. For greyscale (Y-only) clips both modes produce identical results.           |
+    |          |                                                 |                                                                                                             |
+    |          |                                                 | | **Not available for RGB.** An error is raised if the clip is not YUV or YUVA.                             |
+    |          |                                                 |                                                                                                             |
+    |          |                                                 | | Formula (integer, per chroma sample):                                                                     |
+    |          |                                                 | |   ``alpha_eff = mask * opacity / max``                                                                    |
+    |          |                                                 | |   ``darken_factor = alpha_eff * (max − ovr_Y) / max``                                                     |
+    |          |                                                 | |   ``result_Y  = base_Y  * (max − darken_factor) / max``                                                   |
+    |          |                                                 | |   ``result_UV = (base_UV * (max − darken_factor) + neutral * darken_factor) / max``                       |
+    |          |                                                 |                                                                                                             |
+    |          |                                                 | | opacity/alpha: same semantics as other modes (alpha-aware overlay clip, ``opacity`` parameter).           |
+    |          |                                                 | | ``placement`` is respected for correct chroma-mask downsampling in 4:2:0 and 4:2:2 formats.               |
     +----------+-------------------------------------------------+-------------------------------------------------------------------------------------------------------------+
     | fast     |                                                 | Like "add", but without masking. ``use_chroma`` must be true; ``opacity``, ``level`` and ``threshold``      |
     |          |                                                 | are not used. The result is simply the average of ``base_clip`` and ``overlay_clip``.                       |
@@ -219,13 +257,19 @@ Note that some modes can be similar to :doc:`Overlay <overlay>`, but the two fil
 
 .. describe:: placement
 
-    chroma placement for 420 and 422 YUV formats.
+    Chroma placement for 4:2:0 and 4:2:2 YUV formats.
+    
+    default=``"mpeg2"`` 
 
-    Possible values: "mpeg2" (default), "mpeg1".
+    Possible values: ``"mpeg2"`` (default), ``"mpeg1"``, ``"top_left"``.
 
-    Used in "mul", "darken" and "lighten", "add" and "subtract" modes with planar YUV 
-    4:2:0 or 4:2:2 color spaces (not available for YUY2) in order to properly apply 
-    luma/overlay mask on U and V chroma channels. 
+    Used in "mul", "mulovr", "darken", "lighten", "add" and "subtract" modes with planar YUV
+    4:2:0 or 4:2:2 color spaces (not available for YUY2) to correctly filter the
+    luma-resolution alpha mask down to chroma resolution for the U and V planes.
+
+    * ``"mpeg2"`` — left-cosited H, centred V (MPEG-2 / H.264 default; triangle filter).
+    * ``"mpeg1"`` — centred H+V (MPEG-1 / JPEG; box filter).
+    * ``"top_left"`` — left-cosited H+V (HEVC / AV1 / UHD default; point sample, fastest).
 
 Other notes
 -----------
@@ -264,6 +308,12 @@ Changelog
 +-----------------+---------------------------------------------------------------+
 | Version         | Changes                                                       |
 +=================+===============================================================+
+| 3.7.6           | | Layer: Add "mulovr" mode (Overlay-style multiply, YUV(A)    |
+|                 |   only)                                                       |
+|                 | | Layer: Add 'top_left' option for "placement"                |
+|                 | | Layer: full refactor, use unified blend functions,          |
+|                 |   opacity (and not level)-based integer division arithmetic   |
++-----------------+---------------------------------------------------------------+
 | 3.5.0           | Layer: support RGB24 and RGB48                                |
 +-----------------+---------------------------------------------------------------+
 | 3.4.0           | | Layer: support almost all formats, not only RGB32 and YUY2  |
@@ -277,6 +327,6 @@ Changelog
 +-----------------+---------------------------------------------------------------+
 
 
-$Date: 2025/01/15 13:15:00 $
+$Date: 2026/04/30 09:23:00 $
 
 .. _in this thread: http://forum.doom9.org/showthread.php?s=&threadid=28438
