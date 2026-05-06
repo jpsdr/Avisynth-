@@ -1014,7 +1014,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
           if (final_is_float) {
 #else
-          if constexpr (final_is_float) {
+          if (final_is_float) {
 #endif
             // float inside path, + 32 bit float output
             const int pix_idx = x / sizeof(pixel_t);
@@ -1218,7 +1218,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
             if (!final_is_float)
 #else
-            if constexpr (!final_is_float)
+            if (!final_is_float)
 #endif
               sum = _mm256_srai_epi32(sum, target_shift); // INT_ARITH_SHIFT - modified with bit-conversion diff, bit fixed point shift
             return sum;
@@ -1232,7 +1232,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
           if (final_is_float) {
 #else
-          if constexpr (final_is_float) {
+          if (final_is_float) {
 #endif
             // when float output is needed, convert after scaling, mimic a post-ConvertBits
             const int pix_idx = x / sizeof(pixel_t);
