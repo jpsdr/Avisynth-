@@ -37,10 +37,16 @@
 // Avisynth filter: Layer
 // by "poptones" (poptones@myrealbox.com)
 
+#include <avisynth.h>
 #include "layer.h"
+#include "merge.h"
 #ifdef INTEL_INTRINSICS
 #include "intel/layer_sse.h"
 #include "intel/layer_avx2.h"
+#include "intel/layer_sse41.h"
+#endif
+#ifdef NEON_INTRINSICS
+#include "overlay/aarch64/layer_neon.h"
 #endif
 #ifdef AVS_WINDOWS
 #include <avs/win.h>
@@ -48,7 +54,6 @@
 #include <avs/posix.h>
 #endif
 
-#include <avs/minmax.h>
 #include <avs/alignment.h>
 #include "../core/internal.h"
 #include "../convert/convert_planar.h"
@@ -64,6 +69,9 @@ static int getPlacement(const AVSValue& _placement, IScriptEnvironment* env) {
 
     if (!lstrcmpi(placement, "mpeg1"))
       return PLACEMENT_MPEG1;
+
+    if (!lstrcmpi(placement, "top_left"))
+      return PLACEMENT_TOPLEFT;
 
     env->ThrowError("Layer: Unknown chroma placement");
   }
@@ -186,7 +194,7 @@ static void mask_planar_rgb_float_c(BYTE* dstp8, const BYTE* srcp_r8, const BYTE
 PVideoFrame __stdcall Mask::GetFrame(int n, IScriptEnvironment* env)
 {
   PVideoFrame src1 = child1->GetFrame(n, env);
-  PVideoFrame src2 = child2->GetFrame(min(n, mask_frames - 1), env);
+  PVideoFrame src2 = child2->GetFrame(std::min(n, mask_frames - 1), env);
 
   env->MakeWritable(&src1);
 
@@ -228,13 +236,6 @@ PVideoFrame __stdcall Mask::GetFrame(int n, IScriptEnvironment* env)
       mask_sse2(src1p, src2p, src1_pitch, src2_pitch, vi.width, vi.height);
     }
     else
-#ifdef X86_32
-      if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_MMX))
-      {
-        mask_mmx(src1p, src2p, src1_pitch, src2_pitch, vi.width, vi.height);
-      }
-      else
-#endif
 #endif
       {
         if (pixelsize == 1) { // RGB32
@@ -384,13 +385,6 @@ PVideoFrame __stdcall ColorKeyMask::GetFrame(int n, IScriptEnvironment* env)
       colorkeymask_sse2(pf, pitch, color, vi.height, rowsize, tolB, tolG, tolR);
     }
     else
-#ifdef X86_32
-      if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_MMX))
-      {
-        colorkeymask_mmx(pf, pitch, color, vi.height, rowsize, tolB, tolG, tolR);
-      }
-      else
-#endif
 #endif
       {
         if (pixelsize == 1) {
@@ -478,8 +472,8 @@ ResetMask::ResetMask(PClip _child, AVSValue _mask_f, AVSValue _opacity_f, IScrip
   // opacity = 0.0 means TRANSPARENT (invisible, mask value 0 : black)
   // when opacity is set, it overrides mask
 
-  mask = clamp(mask, 0, max_pixel_value);
-  mask_f = clamp(mask_f, 0.0f, 1.0f);
+  mask = std::min(std::max(mask, 0), max_pixel_value);
+  mask_f = std::min(std::max(mask_f, 0.0f), 1.0f);
 }
 
 
@@ -761,11 +755,14 @@ static void invert_frame_inplace(BYTE* frame, int pitch, int rowsize, int height
 using invert_plane_fn_t = void(*)(uint8_t*, const uint8_t*, int, int, int, int, int);
 
 // width is in pixels, not bytes.
-// Invoking only C functions, since optimizers do a decent work, code is not slower than manual SIMD for this easy filter.
+// AVX2: explicit SIMD kernels (invert_plane_avx2_u8/u16/f32).
+// SSE2: explicit SIMD kernels (invert_plane_sse2_u8/u16/f32).
+// Fallback: C templates (invert_plane_c).
 static void invert_plane(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int dst_pitch, int width, int height, int bits_per_pixel, bool chroma, IScriptEnvironment* env) {
   const int pixelsize = bits_per_pixel == 8 ? 1 : bits_per_pixel <= 16 ? 2 : 4; // 8 bit = 1 byte, 10-16 bit = 2 bytes, float = 4 bytes
 #ifdef INTEL_INTRINSICS
   const bool avx2 = env->GetCPUFlags() & CPUF_AVX2;
+  const bool sse2 = env->GetCPUFlags() & CPUF_SSE2;
 #endif
 
   invert_plane_fn_t fn = nullptr;
@@ -774,33 +771,32 @@ static void invert_plane(uint8_t* dstp, const uint8_t* srcp, int src_pitch, int 
   case 1:
 #ifdef INTEL_INTRINSICS
     if (avx2)
-      fn = chroma ? invert_plane_c_avx2<uint8_t, true /*lt16b* n/a */, true> : invert_plane_c_avx2<uint8_t, true /*lt16b* n/a */, false>;
+      fn = chroma ? invert_plane_avx2_u8<true> : invert_plane_avx2_u8<false>;
+    else if (sse2)
+      fn = chroma ? invert_plane_sse2_u8<true> : invert_plane_sse2_u8<false>;
     else
 #endif
       fn = chroma ? invert_plane_c<uint8_t, true /*lt16b* n/a */, true> : invert_plane_c<uint8_t, true /*lt16b* n/a */, false>;
     break;
   case 2:
-    if (bits_per_pixel < 16) {
 #ifdef INTEL_INTRINSICS
-      if (avx2)
-        fn = chroma ? invert_plane_c_avx2<uint16_t, true /*lt16b**/, true> : invert_plane_c_avx2<uint16_t, true /*lt16b**/, false>;
-      else
+    if (avx2)
+      fn = chroma ? invert_plane_avx2_u16<true> : invert_plane_avx2_u16<false>;
+    else if (sse2)
+      fn = chroma ? invert_plane_sse2_u16<true> : invert_plane_sse2_u16<false>;
+    else
 #endif
+      if (bits_per_pixel < 16)
         fn = chroma ? invert_plane_c<uint16_t, true /*lt16b**/, true> : invert_plane_c<uint16_t, true /*lt16b**/, false>;
-    }
-    else {
-#ifdef INTEL_INTRINSICS
-      if (avx2)
-        fn = chroma ? invert_plane_c_avx2<uint16_t, false /*lt16b**/, true> : invert_plane_c_avx2<uint16_t, false /*lt16b**/, false>;
       else
-#endif
         fn = chroma ? invert_plane_c<uint16_t, false /*lt16b**/, true> : invert_plane_c<uint16_t, false /*lt16b**/, false>;
-    }
     break;
   case 4:
 #ifdef INTEL_INTRINSICS
     if (avx2)
-      fn = chroma ? invert_plane_c_avx2<float, false /*lt16b* n/a */, true> : invert_plane_c_avx2<float, false /*lt16b* n/a */, false>;
+      fn = chroma ? invert_plane_avx2_f32<true> : invert_plane_avx2_f32<false>;
+    else if (sse2)
+      fn = chroma ? invert_plane_sse2_f32<true> : invert_plane_sse2_f32<false>;
     else
 #endif
       fn = chroma ? invert_plane_c<float, false /*lt16b* n/a */, true> : invert_plane_c<float, false /*lt16b* n/a */, false>;
@@ -1949,21 +1945,41 @@ AVSValue MergeRGB::Create(AVSValue args, void* mode, IScriptEnvironment* env)
  *******   Layer Filter   ******
  *******************************/
 
-// YUY2 in pre- and post-converted to YV16. No YUY2 here.
-Layer::Layer(PClip _child1, PClip _child2, const char _op[], int _lev, int _x, int _y,
+// Packed RGB (RGB24/32/48/64) and YUY2 are pre-converted in Create; this constructor
+// receives only planar formats.  Post-conversion back to the original format is done in Create.
+Layer::Layer(PClip _child1, PClip _child2, PClip _mask_child, const char _op[], int _lev, int _x, int _y,
   int _t, bool _chroma, float _opacity, int _placement, IScriptEnvironment* env)
-  : child1(_child1), child2(_child2), Op(_op), levelB(_lev), ofsX(_x), ofsY(_y),
+  : child1(_child1), child2(_child2), mask_child(_mask_child), Op(_op), levelB(_lev), ofsX(_x), ofsY(_y),
   chroma(_chroma), opacity(_opacity), placement(_placement)
 {
   const VideoInfo& vi1 = child1->GetVideoInfo();
   const VideoInfo& vi2 = child2->GetVideoInfo();
 
-  if (vi1.pixel_type != vi2.pixel_type && !vi1.IsSameColorspace(vi2)) // i420 and YV12 are matched OK
+  // PlanarRGB base + PlanarRGBA overlay is valid: overlay A is the blend weight, base has no alpha.
+  // All other format mismatches (including bit-depth) remain errors.
+  const bool rgb_alpha_mismatch =
+    (vi1.IsPlanarRGB() && vi2.IsPlanarRGBA()) && vi1.BitsPerComponent() == vi2.BitsPerComponent();
+  if (vi1.pixel_type != vi2.pixel_type && !vi1.IsSameColorspace(vi2) && !rgb_alpha_mismatch) // i420 and YV12 are matched OK
     env->ThrowError("Layer: image formats don't match");
 
   vi = vi1;
 
-  hasAlpha = vi.IsRGB32() || vi.IsRGB64() || vi.IsYUVA() || vi.IsPlanarRGBA();
+  // hasAlpha: overlay supplies a per-pixel blend weight via its alpha plane.
+  // Derived from overlay (vi2): it is the overlay's alpha that acts as the mask.
+  // After pre-conversion in Create (when mode is non-"Add"/"Subtract", packed RGB32/64
+  // normally appear here as PlanarRGBA (non-native path).
+  // For the native packed path (Add/Subtract with use_chroma=true),
+  // vi2 stays as RGB32, we still fill hasAlpha for the level->opacity calc;
+  // however the packed RGB32 (kept for speed reasons) blend kernel reads alpha directly.
+  // RGB32 'add' + chroma=true uses magicdiv and opacity in their calc
+  // Or from a separate mask_child clip.
+  hasAlpha = vi2.IsYUVA() || vi2.IsPlanarRGBA() || vi2.IsRGB32() || vi2.IsRGB64();
+
+  // process_alpha_channel: both clips have an alpha plane → blend A exactly like the colour
+  // channels (same op formula).  This reproduces the historical RGB32 behaviour where the
+  // MMX code applied the blend uniformly across all four packed bytes including alpha.
+  // Used for planar rgb part, legacy packed rgb32 is working like this by default.
+  process_alpha_channel = hasAlpha && (vi1.IsYUVA() || vi1.IsPlanarRGBA());
   bits_per_pixel = vi.BitsPerComponent();
 
   const bool levelSpecified = levelB >= 0;
@@ -1987,13 +2003,23 @@ Layer::Layer(PClip _child1, PClip _child2, const char _op[], int _lev, int _x, i
   else if (!strengthSpecified)
     opacity = 1.0f;
 
+  if (opacity < 0.0f) opacity = 0.0f;
+  if (opacity > 1.0f) opacity = 1.0f;
+
+  constexpr bool snap_offsets_to_chroma = false;
+  // Can be turned on for legacy subsampling-friendly behaviour (pre-3.7.6 Layer snapped the offsets)
+  // Chroma width calculation is already made ready to accept odd positions.
+  // "Overlay" does not snap.
+  if (snap_offsets_to_chroma) {
+    if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
+      // make offsets subsampling friendly
+      ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
+      ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
+    }
+  }
+  // For the sake of completeness, packed rgb formats still exist, but for most modes they are converted to planar RGB.
   if (vi.IsRGB32() || vi.IsRGB64() || vi.IsRGB24() || vi.IsRGB48())
     ofsY = vi.height - vi2.height - ofsY; // packed RGB is upside down
-  else if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
-    // make offsets subsampling friendly
-    ofsX = ofsX & ~((1 << vi.GetPlaneWidthSubsampling(PLANAR_U)) - 1);
-    ofsY = ofsY & ~((1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1);
-  }
 
   xdest = (ofsX < 0) ? 0 : ofsX;
   ydest = (ofsY < 0) ? 0 : ofsY;
@@ -2005,8 +2031,12 @@ Layer::Layer(PClip _child1, PClip _child2, const char _op[], int _lev, int _x, i
   ycount = (vi.height < (ofsY + vi2.height)) ? (vi.height - ydest) : (vi2.height - ysrc);
 
   if (!(!lstrcmpi(Op, "Mul") || !lstrcmpi(Op, "Add") || !lstrcmpi(Op, "Fast") ||
-    !lstrcmpi(Op, "Subtract") || !lstrcmpi(Op, "Lighten") || !lstrcmpi(Op, "Darken")))
-    env->ThrowError("Layer supports the following ops: Fast, Lighten, Darken, Add, Subtract, Mul");
+    !lstrcmpi(Op, "Subtract") || !lstrcmpi(Op, "Lighten") || !lstrcmpi(Op, "Darken") ||
+    !lstrcmpi(Op, "mulovr")))
+    env->ThrowError("Layer supports the following ops: Fast, Lighten, Darken, Add, Subtract, Mul, mulovr");
+
+  if (!lstrcmpi(Op, "mulovr") && !vi.IsYUV() && !vi.IsYUVA())
+    env->ThrowError("Layer mulovr: YUV(A) formats only");
 
   if (!chroma)
   {
@@ -2281,13 +2311,29 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
   if (xcount <= 0 || ycount <= 0) return src1;
 
-  PVideoFrame src2 = child2->GetFrame(min(n, overlay_frames - 1), env);
-
+  PVideoFrame src2 = child2->GetFrame(std::min(n, overlay_frames - 1), env);
+  
   env->MakeWritable(&src1);
 
   const int mylevel = hasAlpha ? (int)(opacity * ((1 << bits_per_pixel) + 1) + 0.5f) : (int)(opacity * (1 << bits_per_pixel) + 0.5f);
-  // Alpha mode: opacity of 1.0f gives 257 (@8bit) and 65537 (@16 bits), used in (alpha*level + 1) / range_size,
-  // non-Alpha mode: 1.0f gives 256 (@8bit)
+
+  // For functions using magic-div (/max_val) arithmetic,
+  // opacity_i in [0..max_pixel_value], same convention as masked_merge.
+  const int opacity_i = (int)(opacity * ((1 << bits_per_pixel) - 1) + 0.5f);
+
+  // The inner-loop functions that consume mylevel use a power-of-two shift (>> bpp) for the
+  // blend, not division by max_val.  With a ÷(max_val+1) = ÷256 (@8bit) divisor, a weight
+  // of max_val (255) maps to 255/256 — never to 1.0 — so a mask/alpha pixel of 255 cannot
+  // reach the maximum output value (gives 254 instead of 255).
+  // The inflated level compensates: the two-step product alpha*level can reach the next
+  // power-of-two (256 @8bit, 65536 @16bit), restoring exact values at both extremes.
+  // This fixes both endpoints but leaves intermediate weights slightly asymmetric because
+  // 255 equal mask steps are mapped through a 256-wide divisor.
+  // The masked_merge family avoids this by dividing by max_val directly (see blend_common.h).
+  //   Alpha mode:     opacity 1.0 → 257 (@8bit), 65537 (@16bit): alpha*257>>8 reaches 256 when alpha=255
+  //   Non-alpha mode: opacity 1.0 → 256 (@8bit): direct flat weight, >> 8 at full weight gives src
+
+  const int pixelsize = vi.ComponentSize();
 
   const int height = ycount; // these may be divided by subsampling factor
   const int width = xcount;
@@ -2300,7 +2346,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     const BYTE* src2p = src2->GetReadPtr();
 
     int rgb_step = vi.BytesFromPixels(1); // 4 or 8 bytes/pixelgroup
-    int pixelsize = vi.ComponentSize();
 
     src1p += (src1_pitch * ydest) + (xdest * rgb_step);
     src2p += (src2_pitch * ysrc) + (xsrc * rgb_step);
@@ -2308,6 +2353,10 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     // note: ThresholdParam is not scaled automatically
     int thresh = std::max(0, std::min(ThresholdParam, (1 << bits_per_pixel) - 1)); // limit threshold, old method was: & 0xFF
 
+    // only "Add" and "Subtract" is live code for RGB32/64, others are preconverted to planar RGBA in Create.
+    // Kept for reference.
+
+    // packed rgb "Mul": dead code, kept for reference
     if (!lstrcmpi(Op, "Mul"))
     {
       if (chroma)
@@ -2321,12 +2370,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         {
           layer_rgb32_mul_sse2<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
         }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_mul_isse<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
         else
 #endif
         {
@@ -2347,12 +2390,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         {
           layer_rgb32_mul_sse2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
         }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_mul_isse<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
         else
 #endif
         {
@@ -2365,36 +2402,41 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     }
     if (!lstrcmpi(Op, "Add"))
     {
-      // like Overlay "blend"
-      // rgb : base = base + ((overlay-base)*(alpha*level + 1)/256)/256
-      // yuy2: base = base + ((overlay-base)*(      level    )/256)/256 (no alpha)
       if (chroma)
       {
+        // rgb32 packed rgb "Add" + chroma=true: NOT dead code, kept for speed, too many scripts are using
+
+        // Packed RGBA Add/chroma (and pre-inverted Subtract/chroma):
+        // overlay alpha acts as per-pixel blend weight, or a separate mask
+        // clip supplies the original alpha when the overlay was pre-inverted.
+        // Uses magic-div (÷max_val) arithmetic
+
+        // mask_child is set for pre-inverted Subtract; nullptr for plain Add.
+        // The mask clip (ExtractA of original overlay) has 1 channel with 1 byte/pixel
+        // for RGB32 and 2 bytes/pixel for RGB64; offset by (ysrc, xsrc) as the overlay.
+        const BYTE* maskp8   = nullptr;
+        int         maskpitch = 0;
+        PVideoFrame mask_frame;
+        if (mask_child) {
+          mask_frame = mask_child->GetFrame(std::min(n, overlay_frames - 1), env);
+          maskpitch  = mask_frame->GetPitch();
+          maskp8     = mask_frame->GetReadPtr() + maskpitch * ysrc + xsrc * pixelsize;
+        }
+        const bool has_separate_mask = (mask_child != nullptr);
+
+        layer_packedrgb_blend_c_t* blend_fn;
 #ifdef INTEL_INTRINSICS
-        if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_AVX2))
-        {
-          layer_rgb32_add_avx2<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_SSE2))
-        {
-          layer_rgb32_add_sse2<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_add_isse<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
+        // for 8+ bits these may return the C reference, but compiled with avx2/sse4.1 arch.
+        if ((env->GetCPUFlags() & CPUF_AVX2))
+          get_layer_packedrgb_blend_functions_avx2(has_separate_mask, bits_per_pixel, &blend_fn);
+        else if ((env->GetCPUFlags() & CPUF_SSE4_1))
+          get_layer_packedrgb_blend_functions_sse41(has_separate_mask, bits_per_pixel, &blend_fn);
         else
 #endif
-        {
-          if (pixelsize == 1)
-            layer_rgb32_add_chroma_c<uint8_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-          else
-            layer_rgb32_add_chroma_c<uint16_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
+          get_layer_packedrgb_blend_functions(has_separate_mask, bits_per_pixel, &blend_fn);
+        blend_fn(src1p, src2p, maskp8, src1_pitch, src2_pitch, maskpitch, width, height, opacity_i);
       }
-      else // Add, chroma == false
+      else // Add, chroma == false, Special "Layer" case, not a simple MaskedMerge.
       {
 #ifdef INTEL_INTRINSICS
         if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_AVX2))
@@ -2405,12 +2447,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         {
           layer_rgb32_add_sse2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
         }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_add_isse<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
         else
 #endif
         {
@@ -2421,6 +2457,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         }
       }
     }
+    // packed rgb "Mul": dead code, kept for reference
     if (!lstrcmpi(Op, "Lighten"))
     {
       // Copy overlay_clip over base_clip in areas where overlay_clip is lighter by threshold.
@@ -2434,12 +2471,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       {
         layer_rgb32_lighten_darken_sse2<LIGHTEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
       }
-#ifdef X86_32
-      else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-      {
-        layer_rgb32_lighten_darken_isse<LIGHTEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
-      }
-#endif
       else
 #endif 
       {
@@ -2449,6 +2480,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
           layer_rgb32_lighten_darken_c<LIGHTEN, uint16_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
       }
     }
+    // packed rgb "Mul": dead code, kept for reference
     if (!lstrcmpi(Op, "Darken"))
     {
       // Copy overlay_clip over base_clip in areas where overlay_clip is darker by threshold.
@@ -2462,12 +2494,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       {
         layer_rgb32_lighten_darken_sse2<DARKEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
       }
-#ifdef X86_32
-      else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-      {
-        layer_rgb32_lighten_darken_isse<DARKEN>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel, thresh);
-      }
-#endif
       else
 #endif
       {
@@ -2505,71 +2531,31 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     }
     if (!lstrcmpi(Op, "Subtract"))
     {
-      // base_clip - overlay_clip.
-      // Similar to add, but overlay_clip is inverted before adding.
-      if (chroma)
-      {
+      // use_chroma=true Subtract was redirected to Add in Create() with pre-inverted
+      // overlay and a separate mask clip, so only use_chroma=false reaches here.
+      // use_chroma=false: flat-weight subtract without alpha mask.
 #ifdef INTEL_INTRINSICS
-        if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_AVX2))
-        {
-          layer_rgb32_subtract_avx2<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_SSE2))
-        {
-          layer_rgb32_subtract_sse2<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_subtract_isse<true>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
-        else
-#endif
-        {
-          if (pixelsize == 1)
-            layer_rgb32_subtract_chroma_c<uint8_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-          else
-            layer_rgb32_subtract_chroma_c<uint16_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
+      if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_AVX2))
+      {
+        layer_rgb32_subtract_avx2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
+      }
+      else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_SSE2))
+      {
+        layer_rgb32_subtract_sse2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
       }
       else
+#endif
       {
-#ifdef INTEL_INTRINSICS
-        if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_AVX2))
-        {
-          layer_rgb32_subtract_avx2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_SSE2))
-        {
-          layer_rgb32_subtract_sse2<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#ifdef X86_32
-        else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE))
-        {
-          layer_rgb32_subtract_isse<false>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
-#endif
+        if (pixelsize == 1)
+          layer_rgb32_subtract_c<uint8_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
         else
-#endif
-        {
-          if (pixelsize == 1)
-            layer_rgb32_subtract_c<uint8_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-          else
-            layer_rgb32_subtract_c<uint16_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
-        }
+          layer_rgb32_subtract_c<uint16_t>(src1p, src2p, src1_pitch, src2_pitch, width, height, mylevel);
       }
     }
   }
   else if (vi.IsYUV() || vi.IsYUVA())
   {
     // planar YUV(A) source
-
-    const int pixelsize = vi.ComponentSize();
-
-    // when exists, alpha comes from overlay (source) clip. Not used yet
-    //const int src2_pitch_a = hasAlpha ? src2->GetPitch(PLANAR_A) : 0;
-    //const BYTE* srcp2_a = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch_a * ysrc + xsrc * pixelsize : nullptr;
 
     if (!lstrcmpi(Op, "Lighten") || !lstrcmpi(Op, "Darken"))
     {
@@ -2596,8 +2582,8 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       const BYTE* src2p_v = grey ? nullptr : src2->GetReadPtr(PLANAR_V) + src2_pitchUV * (ysrc >> hs) + (xsrc >> ws) * pixelsize;
 
       // target alpha channel is unaffected
-      //BYTE* src1p_a = hasAlpha ? src1->GetWritePtr(PLANAR_Y) + src1_pitch * (ydest)+(xdest)* pixelsize : nullptr;
-      const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * (ysrc)+(xsrc)*pixelsize : nullptr; // overlay alpha
+      // Until we support providing a separate mask clip, we pass A plane pointer for overlay alpha
+      const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * ysrc + xsrc * pixelsize : nullptr; // overlay alpha
       const int mask_pitch = src2->GetPitch(PLANAR_A);
 
       // called only once, for all planes
@@ -2616,7 +2602,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
           src1_pitch, src1_pitchUV,
           src2_pitch, src2_pitchUV,
           mask_pitch,
-          width, height, mylevel, ThresholdParam, bits_per_pixel);
+          width, height, opacity_i, ThresholdParam, bits_per_pixel);
       }
       else if (layer_f_fn && bits_per_pixel == 32) {
         layer_f_fn(
@@ -2629,29 +2615,94 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       }
       // lighten/darken end
     }
+    else if (!lstrcmpi(Op, "mulovr"))
+    {
+      const int src1_pitch   = src1->GetPitch(PLANAR_Y);
+      const int src2_pitch   = src2->GetPitch(PLANAR_Y);
+      const int src1_pitchUV = src1->GetPitch(PLANAR_U);
+
+      const bool grey = vi.IsY();
+      const int ws = grey ? 1 : vi.GetPlaneWidthSubsampling(PLANAR_U);
+      const int hs = grey ? 1 : vi.GetPlaneHeightSubsampling(PLANAR_U);
+
+      BYTE*       src1p   = src1->GetWritePtr(PLANAR_Y) + src1_pitch   * ydest + xdest * pixelsize;
+      const BYTE* src2p   = src2->GetReadPtr (PLANAR_Y) + src2_pitch   * ysrc  + xsrc  * pixelsize;
+      BYTE*       src1p_u = grey ? nullptr : src1->GetWritePtr(PLANAR_U) + src1_pitchUV * (ydest >> hs) + (xdest >> ws) * pixelsize;
+      BYTE*       src1p_v = grey ? nullptr : src1->GetWritePtr(PLANAR_V) + src1_pitchUV * (ydest >> hs) + (xdest >> ws) * pixelsize;
+
+      // mulovr uses only overlay Y; overlay UV is ignored.
+      // mask: overlay alpha plane (if hasAlpha), luma-resolution, same stride as overlay Y.
+      const BYTE* maskp      = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * ysrc + xsrc * pixelsize : nullptr;
+      const int   mask_pitch = hasAlpha ? src2->GetPitch(PLANAR_A) : 0;
+
+      layer_yuv_mulovr_c_t*   layer_fn   = nullptr;
+      layer_yuv_mulovr_f_c_t* layer_f_fn = nullptr;
+      get_layer_yuv_mulovr_functions(hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+
+      if (layer_fn)
+        layer_fn(src1p, src1p_u, src1p_v, src2p, maskp,
+          src1_pitch, src1_pitchUV, src2_pitch, mask_pitch,
+          width, height, opacity_i, bits_per_pixel);
+      else if (layer_f_fn)
+        layer_f_fn(src1p, src1p_u, src1p_v, src2p, maskp,
+          src1_pitch, src1_pitchUV, src2_pitch, mask_pitch,
+          width, height, opacity);
+    }
     else {
-      // not Lighten and not Darken, process planes individually
-      const int maxPlanes = std::min(vi.NumComponents(), 3); // do not process alpha plane
+      // not Lighten, Darken, or mulovr — process planes individually.
+      // Add (Subtract is pre-inverted Add), Fast, Mul will follow
+      const int maxPlanes = std::min(vi.NumComponents(), 3); // intentionally do not process alpha plane
       const int planesYUV[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
       for (int channel = 0; channel < maxPlanes; channel++)
       {
         const int plane = planesYUV[channel];
 
         const int src1_pitch = src1->GetPitch(plane);
-        const int src2_pitch = src2->GetPitch(plane);
+        int src2_pitch = src2->GetPitch(plane); // not const, maybe changed later
 
         const int ws = vi.GetPlaneWidthSubsampling(plane);
         const int hs = vi.GetPlaneHeightSubsampling(plane);
-        const int currentwidth = width >> ws;
-        const int currentheight = height >> hs;
+
+        // For chroma planes, the processing width/height is reduced by the subsampling factor.
+        // old formula: assuming that xdest and ydest was already snapped to the chroma grid
+        //const int currentwidth  = width  >> ws;
+        //const int currentheight = height >> hs;
+
+        // Ceiling formula: account for odd xdest/ydest so the last partial chroma
+        // column/row is included when xdest (or ydest) is misaligned to the chroma grid.
+        const int ws_mask = (1 << ws) - 1;
+        const int hs_mask = (1 << hs) - 1;
+        const int currentwidth = (ws > 0) ? ((xdest & ws_mask) + width + ws_mask) >> ws : width;
+        const int currentheight = (hs > 0) ? ((ydest & hs_mask) + height + hs_mask) >> hs : height;
 
         BYTE* src1p = src1->GetWritePtr(plane) + src1_pitch * (ydest >> hs) + (xdest >> ws) * pixelsize; // destination
         const BYTE* src2p = src2->GetReadPtr(plane) + src2_pitch * (ysrc >> hs) + (xsrc >> ws) * pixelsize; // source plane
 
-        const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2_pitch * (ysrc >> hs) + (xsrc >> ws) * pixelsize : nullptr; // alpha plane from Overlay
+        const BYTE* maskp = hasAlpha ? src2->GetReadPtr(PLANAR_A) + src2->GetPitch(PLANAR_A) * (ysrc) + (xsrc) * pixelsize : nullptr; // alpha plane from Overlay
         const int mask_pitch = hasAlpha ? src2->GetPitch(PLANAR_A) : 0;
 
         const bool is_chroma = plane != PLANAR_Y;
+
+        // Special "Add" and "Mul" use_chroma == false case for chroma planes
+        // Overlay chroma data is ignored, blending occurs toward grey (e.g. 128) instead of the chroma source pixel.
+        // We can "Fake" a chroma scanline buffer of chroma center ("half") by passing a pointer to a local variable, and ignoring the pitch.
+        // This is a special "Layer" mode, if we pass a prepared overlay plane, MaskedMerge or Weighted Merge is transparently using this
+        // buffer.
+        std::vector <uint8_t> chroma_scanline_buffer; // only used if is_chroma && !chroma
+        if (!lstrcmpi(Op, "Add") || !lstrcmpi(Op, "Mul")) {
+          if (is_chroma && !chroma) {
+            chroma_scanline_buffer.resize(pixelsize * currentwidth);
+            if (bits_per_pixel == 8)
+              std::fill((uint8_t *)chroma_scanline_buffer.data(), (uint8_t *)chroma_scanline_buffer.data() + chroma_scanline_buffer.size(), 128);
+            else if (bits_per_pixel <= 16)
+              std::fill((uint16_t *)chroma_scanline_buffer.data(), (uint16_t *)chroma_scanline_buffer.data() + chroma_scanline_buffer.size() / sizeof(uint16_t), 1 << (bits_per_pixel - 1));
+            else // float
+              std::fill((float*)chroma_scanline_buffer.data(), (float*)chroma_scanline_buffer.data() + chroma_scanline_buffer.size() / sizeof(float), 0.0f); // chroma center: 0.0f
+            src2p = chroma_scanline_buffer.data();
+            src2_pitch = 0; // pitch is 0, so this prepared scanline is used for every line of the chroma plane.
+          }
+        }
+        // preparation end
 
         if (!lstrcmpi(Op, "Mul"))
         {
@@ -2660,97 +2711,71 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
 #ifdef INTEL_INTRINSICS
           if (env->GetCPUFlags() & CPUF_AVX2) {
-            // wrapper for the avx2 module, which calls its local scoped get_layer_yuv_mul_functions the included layer.hpp
-            get_layer_yuv_mul_functions_avx2(is_chroma, chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+            // no SIMD yet, wrapper for the avx2 module, which calls its local scoped get_layer_yuv_mul_functions the included layer.hpp
+            get_layer_yuv_mul_functions_avx2(is_chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
           }
           else
 #endif
-            get_layer_yuv_mul_functions(is_chroma, chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+            get_layer_yuv_mul_functions(is_chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
 
           if (layer_fn && bits_per_pixel != 32) {
             layer_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
-              currentwidth, currentheight, mylevel, bits_per_pixel);
+              currentwidth, currentheight, opacity_i, bits_per_pixel);
           }
           else if (layer_f_fn && bits_per_pixel == 32) {
             layer_f_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
               currentwidth, currentheight, opacity);
           }
         }
-        else if (!lstrcmpi(Op, "Add"))
+        else if (!lstrcmpi(Op, "Add") || !lstrcmpi(Op, "Fast"))
         {
-          layer_yuv_add_subtract_c_t* layer_fn = nullptr;
-          layer_yuv_add_subtract_f_c_t* layer_f_fn = nullptr;
+          // Note: "Subtract" is handled by pre-inverting the overlay in Layer::Create
+          // for planar YUV(A) formats.  GetFrame never sees Op="Subtract" for these.
+          const bool is_fast = !lstrcmpi(Op, "Fast");
+          if (is_fast) {
+            // "Fast" is weighted merge with exact 0.5 weight, and it is optimized inside the called merge function
+            const bool use_padded_width = false; // exact width
+            // in merge.cpp/h
+            merge_plane(src1p, src2p, src1_pitch, src2_pitch, currentwidth * pixelsize /*src_rowsize*/, currentheight, 0.5f, bits_per_pixel, use_padded_width, env);
+          }
+          else if (!hasAlpha) {
+            // check for weighted merge: this call is automatically dispatches to the proper bit_depth, CPU opt
+            const bool use_padded_width = false; // exact width
+            // in merge.cpp/h
+            merge_plane(src1p, src2p, src1_pitch, src2_pitch, currentwidth * pixelsize /*src_rowsize*/, currentheight, opacity, bits_per_pixel, use_padded_width, env);
+          }
+          else {
+            // masked merge, use the unified masked blend functions
+            layer_yuv_add_c_t* layer_fn = nullptr;
+            layer_yuv_add_f_c_t* layer_f_fn = nullptr;
 
-          // template: subtract = true, add = false
 #ifdef INTEL_INTRINSICS
-          if (env->GetCPUFlags() & CPUF_AVX2) {
-            // wrapper for the avx2 module, which calls its local scoped get_layer_yuv_add_subtract_functions the included layer.hpp
-            get_layer_yuv_add_subtract_functions_avx2<false>(is_chroma, chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
-          }
-          else
+            if (env->GetCPUFlags() & CPUF_AVX2) {
+              // AVX2 masked merge with chroma placement support
+              get_layer_yuv_masked_add_functions_avx2(is_chroma, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+            }
+            else if (env->GetCPUFlags() & CPUF_SSE4_1) {
+              // SSE4.1 masked merge with chroma placement support
+              get_layer_yuv_masked_add_functions_sse41(is_chroma, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+            }
+            else
+#elif defined(NEON_INTRINSICS)
+            if (env->GetCPUFlags() & CPUF_ARM_NEON)
+              get_layer_yuv_masked_add_functions_neon(is_chroma, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+            else
 #endif
-            get_layer_yuv_add_subtract_functions<false>(is_chroma, chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+            {
+              get_layer_yuv_add_masked_functions(is_chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+            }
 
-          if (layer_fn && bits_per_pixel != 32) {
-            layer_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
-              currentwidth, currentheight, mylevel, bits_per_pixel);
-          }
-          else if (layer_f_fn && bits_per_pixel == 32) {
-            layer_f_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
-              currentwidth, currentheight, opacity);
-          }
-        }
-        if (!lstrcmpi(Op, "Subtract"))
-        {
-          layer_yuv_add_subtract_c_t* layer_fn = nullptr;
-          layer_yuv_add_subtract_f_c_t* layer_f_fn = nullptr;
-
-          // template: subtract = true, add = false
-#ifdef INTEL_INTRINSICS
-          if (env->GetCPUFlags() & CPUF_AVX2) {
-            // wrapper for the avx2 module, which calls its local scoped get_layer_yuv_add_subtract_functions the included layer.hpp
-            get_layer_yuv_add_subtract_functions_avx2<true>(is_chroma, chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
-          }
-          else
-#endif
-            get_layer_yuv_add_subtract_functions<true>(is_chroma, chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
-
-          if (layer_fn && bits_per_pixel != 32) {
-            layer_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
-              currentwidth, currentheight, mylevel, bits_per_pixel);
-          }
-          else if (layer_f_fn && bits_per_pixel == 32) {
-            layer_f_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
-              currentwidth, currentheight, opacity);
-          }
-        }
-        if (!lstrcmpi(Op, "Fast"))
-        {
-          // only chroma == true
-#ifdef INTEL_INTRINSICS
-          if (env->GetCPUFlags() & CPUF_AVX2 && bits_per_pixel != 32)
-          {
-            if (bits_per_pixel == 8)
-              layer_genericplane_fast_avx2<uint8_t>(src1p, src2p, src1_pitch, src2_pitch, currentwidth, currentheight, mylevel);
-            else if (bits_per_pixel <= 16) // simply averaging, no difference for 10-16 bits
-              layer_genericplane_fast_avx2<uint16_t>(src1p, src2p, src1_pitch, src2_pitch, currentwidth, currentheight, mylevel);
-          }
-          else if (env->GetCPUFlags() & CPUF_SSE2 && bits_per_pixel != 32)
-          {
-            if (bits_per_pixel == 8)
-              layer_genericplane_fast_sse2<uint8_t>(src1p, src2p, src1_pitch, src2_pitch, currentwidth, currentheight, mylevel);
-            else if (bits_per_pixel <= 16) // simply averaging, no difference for 10-16 bits
-              layer_genericplane_fast_sse2<uint16_t>(src1p, src2p, src1_pitch, src2_pitch, currentwidth, currentheight, mylevel);
-          }
-          else
-#endif
-          {
-            if (bits_per_pixel == 8)
-              layer_genericplane_fast_c<uint8_t>(src1p, src2p, src1_pitch, src2_pitch, currentwidth, currentheight, mylevel);
-            else if (bits_per_pixel <= 16) // simply averaging, no difference for 10-16 bits
-              layer_genericplane_fast_c<uint16_t>(src1p, src2p, src1_pitch, src2_pitch, currentwidth, currentheight, mylevel);
-            else // 32 bit
-              layer_genericplane_fast_f_c(src1p, src2p, src1_pitch, src2_pitch, currentwidth, currentheight, opacity /*n/a*/);
+            if (layer_fn && bits_per_pixel != 32) {
+              layer_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
+                currentwidth, currentheight, opacity_i, bits_per_pixel);
+            }
+            else if (layer_f_fn && bits_per_pixel == 32) {
+              layer_f_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
+                currentwidth, currentheight, opacity);
+            }
           }
         }
       } // for one channel
@@ -2759,8 +2784,6 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
   }
   else if (vi.IsPlanarRGB() || vi.IsPlanarRGBA())
   {
-    const int pixelsize = vi.ComponentSize();
-
     BYTE* dstp[4];
     const BYTE* ovrp[4];
     const int dstp_pitch = src1->GetPitch(PLANAR_G); // same for all
@@ -2775,6 +2798,26 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       ovrp[channel] = src2->GetReadPtr(plane) + ovrp_pitch * ysrc + xsrc * pixelsize; // overlay
     }
 
+    // Per-pixel blend weight (maskp): normally the overlay's A plane.
+    // For Subtract, mask_child holds ExtractA of the pre-Invert overlay (original A = weight);
+    // ovrp[3] then points to the inverted A, used only as the alpha blend target when
+    // process_alpha_channel=true.  For all other ops mask_child is nullptr.
+    PVideoFrame mask_frame;
+    const BYTE* maskp = nullptr;
+    int mask_pitch = 0;
+    if (hasAlpha) {
+      if (mask_child) {
+        mask_frame = mask_child->GetFrame(std::min(n, overlay_frames - 1), env);
+        maskp = mask_frame->GetReadPtr(PLANAR_Y) + mask_frame->GetPitch(PLANAR_Y) * ysrc + xsrc * pixelsize;
+        mask_pitch = mask_frame->GetPitch(PLANAR_Y);
+      }
+      else {
+        // Direct add/mul/lighten/darken: overlay A plane is the blend weight.
+        maskp = src2->GetReadPtr(PLANAR_A) + ovrp_pitch * ysrc + xsrc * pixelsize;
+        mask_pitch = ovrp_pitch;
+      }
+    }
+
     if (!lstrcmpi(Op, "Mul"))
     {
       // called only once, for all planes
@@ -2783,53 +2826,90 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
 #ifdef INTEL_INTRINSICS
       if (env->GetCPUFlags() & CPUF_AVX2) {
-        get_layer_planarrgb_mul_functions_avx2(chroma, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
+        get_layer_planarrgb_mul_functions_avx2(chroma, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
       }
       else
 #endif
-        get_layer_planarrgb_mul_functions(chroma, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
+      {
+        get_layer_planarrgb_mul_functions(chroma, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
+      }
 
       if (layer_fn && bits_per_pixel != 32)
-        layer_fn(dstp, ovrp, dstp_pitch, ovrp_pitch, width, height, mylevel, bits_per_pixel);
+        layer_fn(dstp, ovrp, maskp, dstp_pitch, ovrp_pitch, mask_pitch, width, height, opacity_i, bits_per_pixel);
       else if (layer_f_fn && bits_per_pixel == 32)
-        layer_f_fn(dstp, ovrp, dstp_pitch, ovrp_pitch, width, height, opacity);
+        layer_f_fn(dstp, ovrp, maskp, dstp_pitch, ovrp_pitch, mask_pitch, width, height, opacity);
       // planar_rgba mul end
     }
-    else if (!lstrcmpi(Op, "Add") || !lstrcmpi(Op, "Subtract"))
+    else if (!lstrcmpi(Op, "Add") || !lstrcmpi(Op, "Fast"))
     {
-      const bool isSubtract = !lstrcmpi(Op, "Subtract");
+      // no subsampling
+      // use the unified weigthed blend or masked blend function depending on the presence of alpha,
+      // for both Add and Fast (Fast is just a special case of weighted blend with fixed 0.5 weight, and may be optimized internally in the called function)
+      const int currentwidth = width;
+      const int currentheight = height;
+      // Note: "Subtract" is handled by pre-inverting the overlay in Layer::Create
+      // for planar YUV(A) formats.  GetFrame never sees Op="Subtract" for these.
+      const bool is_fast = !lstrcmpi(Op, "Fast");
+      if (is_fast || !hasAlpha) {
+        const float actual_opacity = is_fast ? 0.5f : opacity; // "Add" with opacity=0.5 is the same as "Fast", but "Fast" is optimized for this case, and may be faster than a general weighted merge.
+        // "Fast" is weighted merge with exact 0.5 weight, and it is optimized inside the called merge function
+        const bool use_padded_width = false; // exact width
 
-      // called only once, for all planes
-      layer_planarrgb_add_subtract_c_t* layer_fn = nullptr;
-      layer_planarrgb_add_subtract_f_c_t* layer_f_fn = nullptr;
-
-      if (isSubtract) {
-#ifdef INTEL_INTRINSICS
-        if (env->GetCPUFlags() & CPUF_AVX2) {
-          // wrapper for the avx2 module, which calls its local scoped get_layer_planarrgb_add_subtract_functions the included layer.hpp
-          get_layer_planarrgb_add_subtract_functions_avx2<true>(chroma, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
+        for (int channel = 0; channel < maxPlanes; channel++)
+        {
+          uint8_t *src1p = dstp[channel];
+          const uint8_t *src2p = ovrp[channel];
+          int src1_pitch = dstp_pitch;
+          int src2_pitch = ovrp_pitch;
+          // in merge.cpp/h
+          merge_plane(src1p, src2p, src1_pitch, src2_pitch, currentwidth * pixelsize /*src_rowsize*/, currentheight, 0.5f, bits_per_pixel, use_padded_width, env);
         }
-        else
-#endif
-          get_layer_planarrgb_add_subtract_functions<true>(chroma, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
       }
       else {
+        // masked merge, use the unified masked blend functions
+        layer_yuv_add_c_t* layer_fn = nullptr;
+        layer_yuv_add_f_c_t* layer_f_fn = nullptr;
+
+        const bool effective_is_chroma = false; // rgb: all planes are treated as luma for blending purposes
+        // placement is n/a
+
 #ifdef INTEL_INTRINSICS
         if (env->GetCPUFlags() & CPUF_AVX2) {
-          // wrapper for the avx2 module, which calls its local scoped get_layer_planarrgb_add_subtract_functions the included layer.hpp
-          get_layer_planarrgb_add_subtract_functions_avx2<false>(chroma, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
+          // AVX2 masked merge with chroma placement support
+          get_layer_yuv_masked_add_functions_avx2(effective_is_chroma, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+        }
+        else if (env->GetCPUFlags() & CPUF_SSE4_1) {
+          // SSE4.1 masked merge with chroma placement support
+          get_layer_yuv_masked_add_functions_sse41(effective_is_chroma, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
         }
         else
+#elif defined(NEON_INTRINSICS)
+        if (env->GetCPUFlags() & CPUF_ARM_NEON)
+          get_layer_yuv_masked_add_functions_neon(effective_is_chroma, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+        else
 #endif
-          get_layer_planarrgb_add_subtract_functions<false>(chroma, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
-      }
+        {
+          get_layer_yuv_add_masked_functions(effective_is_chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+        }
 
-      if (layer_fn && bits_per_pixel != 32)
-        layer_fn(dstp, ovrp, dstp_pitch, ovrp_pitch, width, height, mylevel, bits_per_pixel);
-      else if (layer_f_fn && bits_per_pixel == 32)
-        layer_f_fn(dstp, ovrp, dstp_pitch, ovrp_pitch, width, height, opacity);
-      // planar rgb(a) sub end
-    }
+        for (int channel = 0; channel < maxPlanes; channel++)
+        {
+          uint8_t* src1p = dstp[channel];
+          const uint8_t* src2p = ovrp[channel];
+          int src1_pitch = dstp_pitch;
+          int src2_pitch = ovrp_pitch;
+
+          if (layer_fn && bits_per_pixel != 32) {
+            layer_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
+              currentwidth, currentheight, opacity_i, bits_per_pixel);
+          }
+          else if (layer_f_fn && bits_per_pixel == 32) {
+            layer_f_fn(src1p, src2p, maskp, src1_pitch, src2_pitch, mask_pitch,
+              currentwidth, currentheight, opacity);
+          }
+        }
+      }
+    } // Add/Fast
     else if (!lstrcmpi(Op, "Lighten") || !lstrcmpi(Op, "Darken"))
     {
       const bool isLighten = !lstrcmpi(Op, "Lighten");
@@ -2844,49 +2924,17 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 #ifdef INTEL_INTRINSICS
       if (env->GetCPUFlags() & CPUF_AVX2) {
         // wrapper for the avx2 module, which calls its local scoped get_layer_planarrgb_lighten_darken_functions the included layer.hpp
-        get_layer_planarrgb_lighten_darken_functions_avx2(isLighten, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
+        get_layer_planarrgb_lighten_darken_functions_avx2(isLighten, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
       }
       else
 #endif
-        get_layer_planarrgb_lighten_darken_functions(isLighten, hasAlpha, bits_per_pixel, &layer_fn, &layer_f_fn);
+        get_layer_planarrgb_lighten_darken_functions(isLighten, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
 
       if (layer_fn && bits_per_pixel != 32)
-        layer_fn(dstp, ovrp, dstp_pitch, ovrp_pitch, width, height, mylevel, ThresholdParam, bits_per_pixel);
+        layer_fn(dstp, ovrp, maskp, dstp_pitch, ovrp_pitch, mask_pitch, width, height, opacity_i, ThresholdParam, bits_per_pixel);
       else if (layer_f_fn && bits_per_pixel == 32)
-        layer_f_fn(dstp, ovrp, dstp_pitch, ovrp_pitch, width, height, opacity, ThresholdParam_f);
+        layer_f_fn(dstp, ovrp, maskp, dstp_pitch, ovrp_pitch, mask_pitch, width, height, opacity, ThresholdParam_f);
       // planar rgba lighten/darken end
-    }
-    if (!lstrcmpi(Op, "Fast"))
-    {
-      // only chroma == true
-      // target alpha channel is unaffected
-      for (int i = 0; i < std::min(vi.NumComponents(), 3); i++) {
-#ifdef INTEL_INTRINSICS
-        if (env->GetCPUFlags() & CPUF_AVX2 && bits_per_pixel != 32)
-        {
-          if (bits_per_pixel == 8)
-            layer_genericplane_fast_avx2<uint8_t>(dstp[i], ovrp[i], dstp_pitch, ovrp_pitch, width, height, mylevel);
-          else if (bits_per_pixel <= 16) // simply averaging, no difference for 10-16 bits
-            layer_genericplane_fast_avx2<uint16_t>(dstp[i], ovrp[i], dstp_pitch, ovrp_pitch, width, height, mylevel);
-        }
-        else if (env->GetCPUFlags() & CPUF_SSE2 && bits_per_pixel != 32)
-        {
-          if (bits_per_pixel == 8)
-            layer_genericplane_fast_sse2<uint8_t>(dstp[i], ovrp[i], dstp_pitch, ovrp_pitch, width, height, mylevel);
-          else if (bits_per_pixel <= 16) // simply averaging, no difference for 10-16 bits
-            layer_genericplane_fast_sse2<uint16_t>(dstp[i], ovrp[i], dstp_pitch, ovrp_pitch, width, height, mylevel);
-        }
-        else
-#endif
-        {
-          if (bits_per_pixel == 8)
-            layer_genericplane_fast_c<uint8_t>(dstp[i], ovrp[i], dstp_pitch, ovrp_pitch, width, height, mylevel);
-          else if (bits_per_pixel <= 16) // simply averaging, no difference for 10-16 bits
-            layer_genericplane_fast_c<uint16_t>(dstp[i], ovrp[i], dstp_pitch, ovrp_pitch, width, height, mylevel);
-          else // 32 bit
-            layer_genericplane_fast_f_c(dstp[i], ovrp[i], dstp_pitch, ovrp_pitch, width, height, opacity /*n/a*/);
-        }
-      }
     }
     // Layer planar RGB(A) end
   }
@@ -2900,18 +2948,30 @@ AVSValue __cdecl Layer::Create(AVSValue args, void*, IScriptEnvironment* env)
   const VideoInfo& vi1 = args[0].AsClip()->GetVideoInfo();
   const VideoInfo& vi2 = args[1].AsClip()->GetVideoInfo();
 
-  // convert old RGB format to planar RGB
+  // "Add" and "Subtract" (use_chroma=true) have native interleaved paths for RGB32
+  // (masked_blend_packedrgba_avx2/sse41/c — magic-div, correct at both endpoints).
+  // For those ops the packed clips are passed straight through; no round-trip conversion
+  // to PlanarRGBA is needed.  Subtract pre-inverts the overlay and extracts the original
+  // alpha as a separate clip (mask_child) below — see the comment on the Subtract redirect.
+  // All other ops (Mul, Lighten, Darken, Fast, ...) still require the planar path, and
+  // RGB24/RGB48/RGB64/YUY2 always convert regardless of op.
+  const char* opStr = args[2].AsString("Add");
+  const bool packedRGBNativePath =
+    vi1.IsRGB32() &&
+    (!lstrcmpi(opStr, "Add") || !lstrcmpi(opStr, "Subtract"));
+
+  // Convert base clip to planar when needed.
+  // RGB24/RGB48 → PlanarRGB; RGB32/RGB64 → PlanarRGBA (unless native path).
+  // ConvertToPlanarRGB(A) handles the packed-RGB vertical flip.
   PClip clip1;
-  if (vi1.IsRGB24() || vi1.IsRGB48()) {
-    AVSValue new_args[1] = { args[0].AsClip() };
-    clip1 = env->Invoke("ConvertToPlanarRGB", AVSValue(new_args, 1)).AsClip();
-  }
-  /* formats handled by Layer core
-  else if (vi1.IsRGB32() || vi1.IsRGB64()) {
+  if (!packedRGBNativePath && (vi1.IsRGB32() || vi1.IsRGB64())) {
     AVSValue new_args[1] = { args[0].AsClip() };
     clip1 = env->Invoke("ConvertToPlanarRGBA", AVSValue(new_args, 1)).AsClip();
   }
-  */
+  else if (vi1.IsRGB24() || vi1.IsRGB48()) {
+    AVSValue new_args[1] = { args[0].AsClip() };
+    clip1 = env->Invoke("ConvertToPlanarRGB", AVSValue(new_args, 1)).AsClip();
+  }
   else if (vi1.IsYUY2()) {
     AVSValue new_args[1] = { args[0].AsClip() };
     clip1 = env->Invoke("ConvertToYV16", AVSValue(new_args, 1)).AsClip();
@@ -2920,17 +2980,20 @@ AVSValue __cdecl Layer::Create(AVSValue args, void*, IScriptEnvironment* env)
     clip1 = args[0].AsClip();
   }
 
+  // Convert overlay clip to planar when needed.
+  // For the native packed path the overlay stays as RGB32/RGB64 so GetFrame can read
+  // the interleaved alpha directly (Add) or from a separate extracted clip (Subtract).
+  // For the planar path, RGB32/RGB64 → PlanarRGBA so that the A plane is available
+  // as the per-pixel blend weight.
   PClip clip2;
-  if (vi2.IsRGB24() || vi2.IsRGB48()) {
-    AVSValue new_args[1] = { args[1].AsClip() };
-    clip2 = env->Invoke("ConvertToPlanarRGB", AVSValue(new_args, 1)).AsClip();
-  }
-  /* formats handled by Layer core
-  else if (vi2.IsRGB32() || vi2.IsRGB64()) {
+  if (!packedRGBNativePath && (vi2.IsRGB32() || vi2.IsRGB64())) {
     AVSValue new_args[1] = { args[1].AsClip() };
     clip2 = env->Invoke("ConvertToPlanarRGBA", AVSValue(new_args, 1)).AsClip();
   }
-  */
+  else if (vi2.IsRGB24() || vi2.IsRGB48()) {
+    AVSValue new_args[1] = { args[1].AsClip() };
+    clip2 = env->Invoke("ConvertToPlanarRGB", AVSValue(new_args, 1)).AsClip();
+  }
   else if (vi2.IsYUY2()) {
     AVSValue new_args[1] = { args[1].AsClip() };
     clip2 = env->Invoke("ConvertToYV16", AVSValue(new_args, 1)).AsClip();
@@ -2939,7 +3002,52 @@ AVSValue __cdecl Layer::Create(AVSValue args, void*, IScriptEnvironment* env)
     clip2 = args[1].AsClip();
   }
 
-  Layer* Result = new Layer(clip1, clip2, args[2].AsString("Add"), args[3].AsInt(-1),
+  // When op="Subtract", pre-invert the overlay clip and redirect to "Add".
+  // This eliminates the subtract template dimension in layer.hpp and the SIMD dispatchers.
+  // Equivalence is exact for Y/U/V/R/G/B planes.
+  //
+  // Alpha treatment: alpha is just another plane — Invert() inverts ALL channels including A.
+  // For overlay clips that have an alpha plane (YUVA / PlanarRGBA / RGB32 / RGB64), we must
+  // save the original (pre-invert) A before calling Invert, because:
+  //   - The original A is the per-pixel blend *weight* for all colour channels.
+  //   - The inverted A is the blend *target* for the alpha channel itself when both clips
+  //     have alpha (process_alpha_channel=true, or packed-RGB native path).
+  // ExtractA is a free SubplanarFrame alias (no copy) for planar formats; for packed
+  // RGB32/RGB64 it produces a separate 8/16-bit Y grayscale clip.
+  // The result is stored in mask_child and wired into GetFrame as the per-pixel mask.
+  // For overlay clips without alpha, and for all non-Subtract operations, mask_child stays
+  // nullptr and GetFrame reads the mask directly from the overlay's alpha channel.
+  //
+  // Native packed RGB32 Subtract (use_chroma=true): treated uniformly here —
+  // ExtractA + Invert + redirect to Add — so no subtract logic remains in any kernel.
+  // use_chroma=false Subtract keeps the old formula-based kernels (no alpha mask).
+  const bool use_chroma_arg = args[7].AsBool(true);
+  PClip mask_clip = nullptr;
+  if (!lstrcmpi(opStr, "Subtract")) {
+    const VideoInfo& vi_c2 = clip2->GetVideoInfo();
+    if (packedRGBNativePath && use_chroma_arg) {
+      // Native packed RGB32 Subtract (use_chroma=true):
+      // extract original alpha as separate mask, pre-invert the overlay, redirect.
+      AVSValue ea_args[1] = { AVSValue(clip2) };
+      mask_clip = env->Invoke("ExtractA", AVSValue(ea_args, 1)).AsClip();
+      AVSValue inv_args[1] = { AVSValue(clip2) };
+      clip2 = env->Invoke("Invert", AVSValue(inv_args, 1)).AsClip();
+      opStr = "Add";
+    }
+    else if (vi_c2.IsYUV() || vi_c2.IsYUVA() || vi_c2.IsPlanarRGB() || vi_c2.IsPlanarRGBA()) {
+      // Save pre-invert alpha as the per-pixel blend weight.
+      if (vi_c2.IsYUVA() || vi_c2.IsPlanarRGBA()) {
+        AVSValue ea_args[1] = { AVSValue(clip2) };
+        mask_clip = env->Invoke("ExtractA", AVSValue(ea_args, 1)).AsClip();
+      }
+      // Invert ALL channels — alpha is treated uniformly like any other plane.
+      AVSValue inv_args[1] = { AVSValue(clip2) };
+      clip2 = env->Invoke("Invert", AVSValue(inv_args, 1)).AsClip();
+      opStr = "Add";
+    }
+  }
+
+  Layer* Result = new Layer(clip1, clip2, mask_clip, opStr, args[3].AsInt(-1),
     args[4].AsInt(0), args[5].AsInt(0), args[6].AsInt(0),
     args[7].AsBool(true), // chroma
     args[8].AsFloatf(-1.0f), // opacity
@@ -2954,18 +3062,16 @@ AVSValue __cdecl Layer::Create(AVSValue args, void*, IScriptEnvironment* env)
     AVSValue new_args2[1] = { Result };
     return env->Invoke("ConvertToRGB48", AVSValue(new_args2, 1)).AsClip();
   }
-  /* formats handled by Layer core
-  else if (vi1.IsRGB32()) {
+  else if (!packedRGBNativePath && vi1.IsRGB32()) {
+    // Non-native op: result is PlanarRGBA, convert back to packed.
     AVSValue new_args2[1] = { Result };
     return env->Invoke("ConvertToRGB32", AVSValue(new_args2, 1)).AsClip();
   }
-  else if (vi1.IsRGB64()) {
+  else if (!packedRGBNativePath && vi1.IsRGB64()) {
     AVSValue new_args2[1] = { Result };
     return env->Invoke("ConvertToRGB64", AVSValue(new_args2, 1)).AsClip();
   }
-  */
   else if (vi1.IsYUY2()) {
-    // convert back to original
     AVSValue new_args2[1] = { Result };
     return env->Invoke("ConvertToYUY2", AVSValue(new_args2, 1)).AsClip();
   }
@@ -2995,15 +3101,15 @@ Subtract::Subtract(PClip _child1, PClip _child2, IScriptEnvironment* env)
     env->ThrowError("Subtract: image formats don't match");
 
   vi = vi1;
-  vi.num_frames = max(vi1.num_frames, vi2.num_frames);
-  vi.num_audio_samples = max(vi1.num_audio_samples, vi2.num_audio_samples);
+  vi.num_frames = std::max(vi1.num_frames, vi2.num_frames);
+  vi.num_audio_samples = std::max(vi1.num_audio_samples, vi2.num_audio_samples);
 
   pixelsize = vi.ComponentSize();
   bits_per_pixel = vi.BitsPerComponent();
 
   if (!DiffFlag) { // Init the global Diff table
     DiffFlag = true;
-    for (int i = 0; i <= 512; i++) LUT_Diff8[i] = max(0, min(255, i - 129));
+    for (int i = 0; i <= 512; i++) LUT_Diff8[i] = std::max(0, std::min(255, i - 129));
     // 0 ..  129  130 131   ... 255 256 257 258     384 ... 512
     // 0 ..   0    1   2  3 ... 126 127 128 129 ... 255 ... 255
   }
@@ -3019,11 +3125,10 @@ static void subtract_plane(BYTE* src1p, const BYTE* src2p, int src1_pitch, int s
   const limits_t equal_luma = sizeof(pixel_t) == 1 ? midpixel : sizeof(pixel_t) == 2 ? (midpixel << (bits_per_pixel - 8)) : (limits_t)(chroma ? uv8tof(midpixel) : c8tof(midpixel));
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
+      limits_t val = reinterpret_cast<const pixel_t*>(src2p)[x] - reinterpret_cast<const pixel_t*>(src1p)[x] + equal_luma;
+      // 126: luma of equality
       reinterpret_cast<pixel_t*>(src1p)[x] =
-        (pixel_t)clamp(
-          (limits_t)(reinterpret_cast<pixel_t*>(src1p)[x] - reinterpret_cast<const pixel_t*>(src2p)[x] + equal_luma), // 126: luma of equality
-          limit_lo,
-          limit_hi);
+        (pixel_t)std::min(std::max(val, limit_lo), limit_hi);
     }
     src1p += src1_pitch;
     src2p += src2_pitch;

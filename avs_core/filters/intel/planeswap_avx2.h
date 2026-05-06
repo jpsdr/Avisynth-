@@ -32,77 +32,28 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
-// Overlay (c) 2003, 2004 by Klaus Post
+#ifndef __Planeswap_AVX2_H__
+#define __Planeswap_AVX2_H__
 
-#ifndef __Overlay_h
-#define __Overlay_h
+#include <avs/types.h>
 
-#include <avisynth.h>
-#include "444convert.h"
-#include "overlayfunctions.h"
-#include "blend_common.h"
+// Packed RGB32/RGB64 single-channel extraction — AVX2.
+// srcp: last (bottom) row of source.  Pitch is positive; each row
+// steps srcp -= src_pitch upward.  channel_index: B=0 G=1 R=2 A=3.
+// Width must be a multiple of 16 (RGB32) / 8 (RGB64) — guaranteed by 64-byte alignment.
+template<int channel_index>
+void extract_packed_rgb32_channel_avx2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
 
+template<int channel_index>
+void extract_packed_rgb64_channel_avx2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
 
-class Overlay : public GenericVideoFilter
-/**
-  *
-**/
-{
-public:
-  Overlay(PClip _child, AVSValue args, IScriptEnvironment *env);
-  PVideoFrame __stdcall GetFrame(int n, IScriptEnvironment *env) override;
-  ~Overlay();
-  static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env);
+// Packed RGB24/RGB48 single-channel extraction — AVX2.
+// pixel_t = uint8_t (RGB24) or uint16_t (RGB48).  channel_index: B=0 G=1 R=2.
+// Processes 32 pixels (RGB24) or 16 pixels (RGB48) per main iteration, both consuming
+// 96 source bytes.  Caller must ensure width >= 32 (RGB24) or >= 16 (RGB48).
+// Remainder (width not a multiple of pixels_per_iter) handled by overlapping re-run.
+#include <cstdint>
+template<typename pixel_t, int channel_index>
+void extract_packed_rgb_noalpha_channel_avx2(const BYTE* srcp, BYTE* dstp, int src_pitch, int dst_pitch, int width, int height);
 
-  int __stdcall SetCacheHints(int cachehints, int frame_range) override
-  {
-    AVS_UNUSED(frame_range);
-    return cachehints == CACHE_GET_MTMODE ? MT_NICE_FILTER : 0;
-  }
-
-private:
-  void SetOfModeByName(const char* name, IScriptEnvironment* env);
-  OverlayFunction* SelectFunction();
-  static void ClipFrames(ImageOverlayInternal* input, ImageOverlayInternal* overlay, int x, int y);
-  static void FetchConditionals(IScriptEnvironment* env, int*, float *, int*, int*, bool, const char *);
-
-  VideoInfo overlayVi;
-  VideoInfo maskVi;
-  VideoInfo inputVi;
-  VideoInfo outputVi;
-  VideoInfo viInternalWorkingFormat;
-  VideoInfo viInternalOverlayWorkingFormat; // different size
-
-  PClip overlay;
-  PClip mask;
-  int opacity;
-  float opacity_f;
-  bool greymask;
-  bool ignore_conditional;
-  bool full_range;
-  int offset_x, offset_y;
-  bool use444; // conversionless support
-  const char* condVarSuffix;
-
-  const char* name; // Blend parameter
-
-  int pixelsize;
-  int bits_per_pixel;
-  int of_mode;
-
-  const char* output_pixel_format_override;
-
-  int placement; // PLACEMENT_MPEG2 (default) or PLACEMENT_MPEG1
-
-  bool isInternalRGB; // must be planar rgb
-  bool isInternalGrey;
-  bool isInternal444;
-  bool isInternal422;
-  bool isInternal420;
-
-  PClip child444;
-
-};
-
-
-#endif //Overlay_h
+#endif  // __Planeswap_AVX2_H__

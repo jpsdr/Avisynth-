@@ -123,37 +123,8 @@ static void average_plane_c_float(BYTE *p1, const BYTE *p2, int p1_pitch, int p2
   }
 }
 
-/* -----------------------------------
- *       weighted_merge_planar
- * -----------------------------------
- */
-
-template<typename pixel_t>
-void weighted_merge_planar_c(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch,int rowsize, int height, float weight_f, int weight_i, int invweight_i) {
-  AVS_UNUSED(weight_f);
-  for (int y=0;y<height;y++) {
-    for (size_t x=0;x<rowsize / sizeof(pixel_t);x++) {
-      (reinterpret_cast<pixel_t *>(p1))[x] = ((reinterpret_cast<pixel_t *>(p1))[x]*invweight_i + (reinterpret_cast<const pixel_t *>(p2))[x]*weight_i + 32768) >> 16;
-    }
-    p2+=p2_pitch;
-    p1+=p1_pitch;
-  }
-}
-
-void weighted_merge_planar_c_float(BYTE *p1, const BYTE *p2, int p1_pitch, int p2_pitch, int rowsize, int height, float weight_f, int weight_i, int invweight_i) {
-  AVS_UNUSED(weight_i);
-  AVS_UNUSED(invweight_i);
-  float invweight_f = 1.0f - weight_f;
-  size_t rs = rowsize / sizeof(float);
-
-  for (int y = 0; y < height; ++y) {
-    for (size_t x = 0; x < rs; ++x) {
-      reinterpret_cast<float *>(p1)[x] = (reinterpret_cast<float *>(p1)[x] * invweight_f + reinterpret_cast<const float *>(p2)[x] * weight_f);
-    }
-    p1 += p1_pitch;
-    p2 += p2_pitch;
-  }
-}
+// weighted_merge_planar C reference and SIMD are now in overlay/blend_common*.
+// merge_plane uses get_weighted_merge_fn / get_weighted_merge_float_fn from merge.h.
 
 
 /********************************************************************
@@ -168,70 +139,22 @@ extern const AVSFunction Merge_filters[] = {
   { 0 }
 };
 
-// also returns the proper integer weight/inverse weight for 8-16 bits
-#ifdef INTEL_INTRINSICS
-MergeFuncPtr getMergeFunc(int bits_per_pixel, int cpuFlags, BYTE *srcp, const BYTE *otherp, float weight_f, int &weight_i, int &invweight_i)
-#else
-MergeFuncPtr getMergeFunc(int bits_per_pixel, BYTE *srcp, const BYTE *otherp, float weight_f, int &weight_i, int &invweight_i)
-#endif
-{
-  const int pixelsize = bits_per_pixel == 8 ? 1 : (bits_per_pixel == 32 ? 4 : 2);
+void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other_pitch, int src_rowsize, int src_height, float weight, int bits_per_pixel, bool use_padded_width, IScriptEnvironment* env) {
 
-  // SIMD 8-16 bit: bitshift 15 integer arithmetic
-  // C    8-16 bit: bitshift 16 integer arithmetic
-  // SIMD/C Float: original float weight
-
-  // set basic 8-16bit SIMD
-  weight_i = (int)(weight_f * 32767.0f + 0.5f);
-  invweight_i = 32767 - weight_i;
-
-  if (pixelsize == 1) {
-#ifdef INTEL_INTRINSICS
-    if (cpuFlags & CPUF_AVX2)
-      return &weighted_merge_planar_avx2;
-    if (cpuFlags & CPUF_SSE2)
-      return &weighted_merge_planar_sse2;
-#ifdef X86_32
-    if (cpuFlags & CPUF_MMX)
-      return &weighted_merge_planar_mmx;
-#endif
-#endif
-    // C: different scale!
-    weight_i = (int)(weight_f * 65535.0f + 0.5f);
-    invweight_i = 65535 - weight_i;
-    return &weighted_merge_planar_c<uint8_t>;
-  }
-  if (pixelsize == 2) {
-#ifdef INTEL_INTRINSICS
-    if (cpuFlags & CPUF_AVX2)
-    {
-      if (bits_per_pixel == 16)
-        return &weighted_merge_planar_uint16_avx2<false>;
-      return &weighted_merge_planar_uint16_avx2<true>;
-    }
-    if (cpuFlags & CPUF_SSE2)
-    {
-      if (bits_per_pixel == 16)
-        return &weighted_merge_planar_uint16_sse2<false>;
-      return &weighted_merge_planar_uint16_sse2<true>;
-    }
-#endif
-    // C: different scale!
-    weight_i = (int)(weight_f * 65535.0f + 0.5f);
-    invweight_i = 65535 - weight_i;
-    return &weighted_merge_planar_c<uint16_t>;
+  if (use_padded_width) {
+    // Align the width to the next multiple of FRAME_ALIGN (64) bytes, which is the alignment used for AviSynth+ frame buffers.
+    // This allows SIMD kernels to process the entire row without a scalar tail, improving performance for full-frame merges.
+    src_rowsize = AlignNumber(src_rowsize, FRAME_ALIGN);
   }
 
-  // pixelsize == 4
-#ifdef INTEL_INTRINSICS
-  if (cpuFlags & CPUF_SSE2)
-    return &weighted_merge_planar_sse2_float;
-#endif
-  return &weighted_merge_planar_c_float;
-}
+  // 15 bit arithmetic for integer weighted merge: weight is in [0..32768], invweight = 32768 - weight.
+  const int weight_i = (int)(weight * 32768.0f + 0.5f);
+  const int invweight_i = 32768 - weight_i;
 
-static void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other_pitch, int src_rowsize, int src_height, float weight, int pixelsize, int bits_per_pixel, IScriptEnvironment* env) {
-  if ((weight > 0.4961f) && (weight < 0.5039f))
+  const int pixelsize = bits_per_pixel == 8 ? 1 : (bits_per_pixel <= 16 ? 2 : 4);
+
+  const bool use_average = (bits_per_pixel == 32) ? (weight == 0.5f) : (weight_i == 16384);
+  if (use_average)
   {
     //average of two planes
     if (pixelsize != 4) // 1 or 2
@@ -250,15 +173,6 @@ static void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other
           average_plane_sse2<uint16_t>(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
       }
       else
-#ifdef X86_32
-        if (env->GetCPUFlags() & CPUF_INTEGER_SSE) {
-          if (pixelsize == 1)
-            average_plane_isse<uint8_t>(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
-          else // pixel_size==2
-            average_plane_isse<uint16_t>(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
-        }
-        else
-#endif
 #endif
         {
           if (pixelsize == 1)
@@ -269,7 +183,9 @@ static void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other
     }
     else { // if (pixelsize == 4)
 #ifdef INTEL_INTRINSICS
-      if (env->GetCPUFlags() & CPUF_SSE2)
+      if (env->GetCPUFlags() & CPUF_AVX2)
+        average_plane_avx2_float(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
+      else if (env->GetCPUFlags() & CPUF_SSE2)
         average_plane_sse2_float(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height);
       else
 #endif
@@ -278,14 +194,19 @@ static void merge_plane(BYTE* srcp, const BYTE* otherp, int src_pitch, int other
   }
   else
   {
-    int weight_i;
-    int invweight_i;
-#ifdef INTEL_INTRINSICS
-    MergeFuncPtr weighted_merge_planar = getMergeFunc(bits_per_pixel, env->GetCPUFlags(), srcp, otherp, weight, /*out*/weight_i, /*out*/invweight_i);
-#else
-    MergeFuncPtr weighted_merge_planar = getMergeFunc(bits_per_pixel, srcp, otherp, weight, /*out*/weight_i, /*out*/invweight_i);
-#endif
-    weighted_merge_planar(srcp, otherp, src_pitch, other_pitch, src_rowsize, src_height, weight, weight_i, invweight_i);
+    // Frame scanlines are always padded to FRAME_ALIGN (64) bytes in AviSynth+.
+    // When called from the "Merge" filter, we are passing the aligned width, since it eliminates the
+    // scalar tail in all weighted_merge SIMD kernels.
+    // When called from other filters, like Overlay and Layer, the width must be exact.
+    // Overreading/writing into the alignment padding is safe for full-frame merges.
+    // See use_padded_width parameter.
+    const int width_pixels = src_rowsize / pixelsize;
+    const int cpuFlags = env->GetCPUFlags();
+    if (bits_per_pixel == 32) {
+      get_weighted_merge_float_fn(cpuFlags)(srcp, otherp, src_pitch, other_pitch, width_pixels, src_height, weight);
+    } else {
+      get_weighted_merge_fn(cpuFlags, weight_i)(srcp, otherp, src_pitch, other_pitch, width_pixels, src_height, weight_i, invweight_i, bits_per_pixel);
+    }
   }
 }
 
@@ -319,14 +240,21 @@ PVideoFrame __stdcall MergeChroma::GetFrame(int n, IScriptEnvironment* env)
 {
   PVideoFrame src = child->GetFrame(n, env);
 
-  if (weight < 0.0039f) return src;
+  // Threshold: for integer clips snap based on the SIMD integer scale (0..32768);
+  // for float clips use exact float comparison.
+  const int weight_i_simd = (bits_per_pixel != 32) ? (int)(weight * 32768.0f + 0.5f) : 0;
+  const int inv_weight_i_simd = 32768 - weight_i_simd;
+  const bool weight_is_zero = (bits_per_pixel == 32) ? (weight == 0.0f) : (weight_i_simd == 0);
+  const bool weight_is_one  = (bits_per_pixel == 32) ? (weight == 1.0f) : (weight_i_simd >= 32768);
+
+  if (weight_is_zero) return src;
 
   PVideoFrame chroma = clip->GetFrame(n, env);
 
   int h = src->GetHeight();
   int w = src->GetRowSize(); // width in pixels
 
-  if (weight < 0.9961f) {
+  if (!weight_is_one) {
     if (vi.IsYUY2()) {
       env->MakeWritable(&src);
       BYTE* srcp = src->GetWritePtr();
@@ -337,19 +265,19 @@ PVideoFrame __stdcall MergeChroma::GetFrame(int n, IScriptEnvironment* env)
 #ifdef INTEL_INTRINSICS
       if (env->GetCPUFlags() & CPUF_SSE2)
       {
-        weighted_merge_chroma_yuy2_sse2(srcp, chromap, src_pitch, chroma_pitch, w, h, (int)(weight * 32768.0f), 32768 - (int)(weight * 32768.0f));
+        weighted_merge_chroma_yuy2_sse2(srcp, chromap, src_pitch, chroma_pitch, w, h, weight_i_simd, inv_weight_i_simd);
       }
       else
 #ifdef X86_32
         if (env->GetCPUFlags() & CPUF_MMX)
         {
-          weighted_merge_chroma_yuy2_mmx(srcp, chromap, src_pitch, chroma_pitch, w, h, (int)(weight * 32768.0f), 32768 - (int)(weight * 32768.0f));
+          weighted_merge_chroma_yuy2_mmx(srcp, chromap, src_pitch, chroma_pitch, w, h, weight_i_simd, inv_weight_i_simd);
         }
         else
 #endif
 #endif
         {
-          weighted_merge_chroma_yuy2_c(srcp, chromap, src_pitch, chroma_pitch, w, h, (int)(weight * 32768.0f), 32768 - (int)(weight * 32768.0f));
+          weighted_merge_chroma_yuy2_c(srcp, chromap, src_pitch, chroma_pitch, w, h, weight_i_simd, inv_weight_i_simd);
         }
     }
     else {  // Planar YUV
@@ -366,12 +294,13 @@ PVideoFrame __stdcall MergeChroma::GetFrame(int n, IScriptEnvironment* env)
       int src_rowsize_v = src->GetRowSize(PLANAR_V_ALIGNED);
       int src_height_uv = src->GetHeight(PLANAR_U);
 
-      merge_plane(srcpU, chromapU, src_pitch_uv, chroma_pitch_uv, src_rowsize_u, src_height_uv, weight, pixelsize, bits_per_pixel, env);
-      merge_plane(srcpV, chromapV, src_pitch_uv, chroma_pitch_uv, src_rowsize_v, src_height_uv, weight, pixelsize, bits_per_pixel, env);
+      merge_plane(srcpU, chromapU, src_pitch_uv, chroma_pitch_uv, src_rowsize_u, src_height_uv, weight, bits_per_pixel, true, env);
+      merge_plane(srcpV, chromapV, src_pitch_uv, chroma_pitch_uv, src_rowsize_v, src_height_uv, weight, bits_per_pixel, true, env);
 
+      // FIXME: MergeChroma should not be modifying the alpha plane
       if (vi.IsYUVA())
         merge_plane(src->GetWritePtr(PLANAR_A), chroma->GetReadPtr(PLANAR_A), src->GetPitch(PLANAR_A), chroma->GetPitch(PLANAR_A),
-          src->GetRowSize(PLANAR_A_ALIGNED), src->GetHeight(PLANAR_A), weight, pixelsize, bits_per_pixel, env);
+          src->GetRowSize(PLANAR_A_ALIGNED), src->GetHeight(PLANAR_A), weight, bits_per_pixel, true, env);
     }
   }
   else { // weight == 1.0
@@ -471,7 +400,13 @@ PVideoFrame __stdcall MergeLuma::GetFrame(int n, IScriptEnvironment* env)
 {
   PVideoFrame src = child->GetFrame(n, env);
 
-  if (weight < 0.0039f) return src;
+  // Threshold: for integer clips snap based on the SIMD integer scale (0..32767);
+  // for float clips use exact float comparison.
+  const int weight_i_simd = (bits_per_pixel != 32) ? (int)(weight * 32767.0f + 0.5f) : 0;
+  const bool weight_is_zero = (bits_per_pixel == 32) ? (weight == 0.0f) : (weight_i_simd == 0);
+  const bool weight_is_one  = (bits_per_pixel == 32) ? (weight == 1.0f) : (weight_i_simd >= 32767);
+
+  if (weight_is_zero) return src;
 
   PVideoFrame luma = clip->GetFrame(n, env);
 
@@ -486,7 +421,7 @@ PVideoFrame __stdcall MergeLuma::GetFrame(int n, IScriptEnvironment* env)
     int h = src->GetHeight();
     int w = src->GetRowSize();
 
-    if (weight < 0.9961f) {
+    if (!weight_is_one) {
 #ifdef INTEL_INTRINSICS
       if (env->GetCPUFlags() & CPUF_SSE2)
       {
@@ -526,8 +461,8 @@ PVideoFrame __stdcall MergeLuma::GetFrame(int n, IScriptEnvironment* env)
     }
     return src;
   }  // Planar
-  if (weight > 0.9961f) {
-    // 2nd clip weight is almost 100%: no merge, just copy
+  if (weight_is_one) {
+    // 2nd clip weight is 100%: no merge, just copy
     const VideoInfo& vi2 = clip->GetVideoInfo();
     if (luma->IsWritable() && vi.IsSameColorspace(vi2)) {
       if (luma->GetRowSize(PLANAR_U)) {
@@ -554,7 +489,7 @@ PVideoFrame __stdcall MergeLuma::GetFrame(int n, IScriptEnvironment* env)
       return dst;
     }
   }
-  else { // weight <= 0.9961f
+  else { // weight < 1.0 (integer scale)
     env->MakeWritable(&src);
     BYTE* srcpY = (BYTE*)src->GetWritePtr(PLANAR_Y);
     BYTE* lumapY = (BYTE*)luma->GetReadPtr(PLANAR_Y);
@@ -563,7 +498,7 @@ PVideoFrame __stdcall MergeLuma::GetFrame(int n, IScriptEnvironment* env)
     int src_rowsize = src->GetRowSize(PLANAR_Y);
     int src_height = src->GetHeight(PLANAR_Y);
 
-    merge_plane(srcpY, lumapY, src_pitch, luma_pitch, src_rowsize, src_height, weight, pixelsize, bits_per_pixel, env);
+    merge_plane(srcpY, lumapY, src_pitch, luma_pitch, src_rowsize, src_height, weight, bits_per_pixel, true, env);
   }
 
   return src;
@@ -602,8 +537,11 @@ MergeAll::MergeAll(PClip _child, PClip _clip, float _weight, IScriptEnvironment*
 
 PVideoFrame __stdcall MergeAll::GetFrame(int n, IScriptEnvironment* env)
 {
-  if (weight<0.0039f) return child->GetFrame(n, env);
-  if (weight>0.9961f) return clip->GetFrame(n, env);
+  // Threshold: for integer clips snap based on the SIMD integer scale (0..32768);
+  // for float clips use exact float comparison.
+  const int weight_i_simd = (bits_per_pixel != 32) ? (int)(weight * 32768.0f + 0.5f) : 0;
+  if ((bits_per_pixel == 32) ? (weight == 0.0f) : (weight_i_simd == 0))    return child->GetFrame(n, env);
+  if ((bits_per_pixel == 32) ? (weight == 1.0f) : (weight_i_simd >= 32768)) return clip->GetFrame(n, env);
 
   PVideoFrame src  = child->GetFrame(n, env);
   PVideoFrame src2 =  clip->GetFrame(n, env);
@@ -615,7 +553,7 @@ PVideoFrame __stdcall MergeAll::GetFrame(int n, IScriptEnvironment* env)
   const int src_pitch = src->GetPitch();
   const int src_rowsize = src->GetRowSize();
 
-  merge_plane(srcp, srcp2, src_pitch, src2->GetPitch(), src_rowsize, src->GetHeight(), weight, pixelsize, bits_per_pixel, env);
+  merge_plane(srcp, srcp2, src_pitch, src2->GetPitch(), src_rowsize, src->GetHeight(), weight, bits_per_pixel, true, env);
 
   if (vi.IsPlanar()) {
     const int planesYUV[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A};
@@ -624,7 +562,7 @@ PVideoFrame __stdcall MergeAll::GetFrame(int n, IScriptEnvironment* env)
     // first plane is already processed
     for (int p = 1; p < vi.NumComponents(); p++) {
       const int plane = planes[p];
-      merge_plane(src->GetWritePtr(plane), src2->GetReadPtr(plane), src->GetPitch(plane), src2->GetPitch(plane), src->GetRowSize(plane), src->GetHeight(plane), weight, pixelsize, bits_per_pixel, env);
+      merge_plane(src->GetWritePtr(plane), src2->GetReadPtr(plane), src->GetPitch(plane), src2->GetPitch(plane), src->GetRowSize(plane), src->GetHeight(plane), weight, bits_per_pixel, true, env);
     }
   }
 
