@@ -473,7 +473,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
           if (final_is_float) {
 #else
-          if constexpr (final_is_float) {
+          if (final_is_float) {
 #endif
             const int pix_idx = x / sizeof(pixel_t);
             float* f_dst = reinterpret_cast<float*>(plane_ptr) + pix_idx;
@@ -553,7 +553,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
             if (!final_is_float)
 #else
-            if constexpr (!final_is_float)
+            if (!final_is_float)
 #endif
               sum = _mm_srai_epi32(sum, target_shift);
             return sum;
@@ -565,7 +565,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
           if (final_is_float) {
 #else
-          if constexpr (final_is_float) {
+          if (final_is_float) {
 #endif
             const int pix_idx = x / sizeof(pixel_t);
             float* f_dst = reinterpret_cast<float*>(plane_ptr) + pix_idx;
