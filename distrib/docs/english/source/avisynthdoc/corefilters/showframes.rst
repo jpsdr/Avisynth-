@@ -2,11 +2,12 @@
 ShowFrames
 ==========
 
-Set of filters to overlay frame numbers and timecodes onto a video clip:
+Set of filters to overlay frame numbers, timecodes, and debug information onto a video clip:
 
 * `ShowFrameNumber`_ displays the frame number on each frame.
 * `ShowSMPTE`_ displays SMPTE timecodes.
 * `ShowTime`_ displays time for the current frame.
+* `ShowCRC32`_ computes and displays the CRC32 checksum of selected planes (debug filter).
 
 See the `Examples`_ section for visuals.
 
@@ -392,6 +393,152 @@ See the :ref:`ShowTime examples <ShowTime-examples>` section.
 
     Default: false
 
+.. _ShowCRC32:
+
+ShowCRC32
+---------
+
+A debug filter that computes the CRC32 checksum of selected planes of each frame and overlays
+the result as an uppercase hexadecimal string.
+
+By default (no ``channels`` or ``mode`` given) the result is a single 8-character value
+(e.g. ``"AB12CD34"``).  With the ``channels`` and ``mode`` parameters the filter can cover
+any combination of planes and either combine them into one CRC or show them side by side.
+
+For **packed formats** (YUY2, RGB24/32/48/64) with default parameters the interleaved
+buffer is hashed directly, matching the original pre-3.7.6 behaviour.  When ``channels``
+or ``mode`` is specified the clip is internally converted to a planar equivalent first.
+
+For **planar RGB(A)** clips planes are always processed in R, G, B, A logical order,
+regardless of the physical plane storage order.
+
+The text placement and scrolling behaviour are identical to `ShowFrameNumber`_.
+
+.. rubric:: Syntax and Parameters
+
+::
+
+    ShowCRC32 (clip, bool "scroll", int "offset", float "x", float "y", string "font", float "size",
+               int "text_color", int "halo_color", float "font_width", float "font_angle",
+               bool "bold", bool "italic", bool "noaa", string "channels", int "mode",
+               int "showmode")
+
+.. describe:: clip
+
+    Source clip; all color formats supported.
+
+.. describe:: scroll
+
+    | If *true*, the checksum will be drawn only once on the video and
+      scroll from top to bottom;
+    | If *false*, it will be drawn on one side, stacked vertically as often
+      as it fits.
+
+    Default: false
+
+.. describe:: offset
+
+    Frame number offset added to the internal counter. A positive value makes the
+    display start from a later logical frame; a negative value from an earlier one.
+
+    Default: 0
+
+.. describe:: x, y
+
+    Text position. Their interpretation corresponds to :doc:`Subtitle's <subtitle>`
+    *align=4*. ``x`` and ``y`` must be used together or not at all; when present,
+    the ``scroll`` option is ignored.
+
+    Default: 0.0, 0.0
+
+.. describe:: font
+
+    Font name; can be the name of any installed Windows font.
+
+    Default: "Arial"
+
+.. describe:: size
+
+    Height of the text in pixels.
+
+    Default: 24
+
+.. describe:: text_color, halo_color
+
+    | Colors for font fill and outline respectively. Default is yellow and black.
+    | See :doc:`Subtitle <subtitle>` and the :doc:`colors <../syntax/syntax_colors>`
+      page for more information on specifying colors.
+
+    Default: $00FFFF00, $00000000
+
+.. describe:: font_width
+
+    | Set character width in logical units, to the nearest 0.125 unit.
+    | See the example section of :doc:`Subtitle <subtitle>` for an example.
+
+    Default: 0 (use Windows' default width)
+
+.. describe:: font_angle
+
+    Adjust the baseline angle of text in degrees anti-clockwise to the
+    nearest 0.1 degree.
+
+    Default: 0.0 (no rotation)
+
+.. describe:: bold
+
+    Using bold letters or not.
+
+    Default: true on Windows GDI, false otherwise (e.g. Linux)
+
+.. describe:: italic
+
+    Using italic letters or not.
+
+    Default: false
+
+.. describe:: noaa
+
+    Disables antialiasing when drawing the text.
+
+    Default: false
+
+.. describe:: channels
+
+    | Selects which planes to include in the checksum, using their initial letters.
+    | For YUV(A) clips: Y, U, V, A.  For RGB(A) clips: R, G, B, A.
+    | Letters are not case-sensitive and may appear in any order; unrecognised
+      letters are silently ignored.
+    | For planar RGB(A) planes are always processed in R, G, B, A order regardless
+      of the order given here.
+
+    Default: all planes of the current color space (same set as ``Invert``).
+
+.. describe:: mode
+
+    | Controls how checksums from multiple planes are combined.
+    | ``0`` — compute a single CRC32 over all selected planes concatenated in order;
+      the result is one 8-character hex value (e.g. ``"AB12CD34"``).
+    | ``1`` — compute a separate CRC32 per selected plane; the result shows each
+      plane label followed by its value (e.g. ``"Y:AB12CD34 U:12345678 V:ABCDEF01"``).
+
+    Default: 0
+
+.. describe:: showmode
+
+    | Controls whether the CRC result is overlaid as text, stored as a frame property,
+      or both.
+    | ``0`` — display only (default; original behaviour).
+    | ``1`` — display the text *and* store the CRC value(s) as an integer array frame
+      property named ``ShowCRC32``.  For ``mode=0`` the array has one element; for
+      ``mode=1`` it has one element per active plane, in display order.
+    | ``2`` — store the frame property only; no text is drawn on the output.
+    | Values are unsigned 32-bit integers stored as ``int64`` (the native array element
+      type for AviSynth frame properties).
+
+    Default: 0
+
+
 Examples
 --------
 
@@ -484,13 +631,52 @@ Examples
             LSMASHSource("sintel-2048-surround.mp4")
             ShowTime()
 
+.. _ShowCRC32-examples:
+
+.. rubric:: `ShowCRC32`_
+
+* Default behaviour on a packed RGB32 clip — the whole interleaved frame buffer is
+  hashed and a single 8-character hex value is overlaid::
+
+    ColorBars(pixel_type="RGB32").ShowCRC32()
+
+* Equivalent explicit call — ``mode=0`` combines all RGBA planes into one CRC.
+  For packed RGB32 with explicit parameters the clip is first converted to planar
+  RGBA internally, so all four planes are covered::
+
+    ColorBars(pixel_type="RGB32").ShowCRC32(mode=0, channels="RGBA")
+
+* Per-plane mode — display a separate CRC for each of the R, G, B planes side by
+  side (e.g. ``"R:AB12CD34 G:12345678 B:ABCDEF01"``)::
+
+    ColorBars(pixel_type="RGB32").ShowCRC32(mode=1, channels="RGB")
+
+* Store CRC values as a frame property without drawing anything on screen, then
+  display the property with ``propShow``.  ``channels="RGBA"`` is specified, but
+  ``RGBP8`` has no alpha plane — the ``A`` letter is silently ignored, so the
+  property array will have three elements (R, G, B) rather than four.  No error
+  is raised::
+
+    ColorBars(pixel_type="RGBP8")
+    ShowCRC32(mode=1, channels="RGBA", showmode=2)
+    propShow(props="ShowCRC32", align=1)
+
 Changelog
 ---------
 
 +-----------------+-----------------------------------------------------------------------------+
 | Version         | Changes                                                                     |
 +=================+=============================================================================+
+| AviSynth+ 3.7.6 || ``ShowCRC32``: add ``channels``, ``mode``, and ``showmode`` parameters.    |
+|                 || ``channels``: select planes individually.                                  |
+|                 || ``mode``: combined (0) or per-plane (1) CRC output.                        |
+|                 || ``showmode``: display only (0), display + frame property (1), property     |
+|                 |  only (2). Frame property name: ``ShowCRC32`` (int64 array).                |
+|                 || Planar RGB(A): planes always processed in R, G, B, A order.                |
++-----------------+-----------------------------------------------------------------------------+
 | AviSynth+ 3.7.3 | Add ``bold``, ``italic`` and ``noaa``                                       |
++-----------------+-----------------------------------------------------------------------------+
+| AviSynth+ 3.7.0 | Added ``ShowCRC32``.                                                        |
 +-----------------+-----------------------------------------------------------------------------+
 | AviSynth 2.6.0  || All functions: position (x,y) can be float (previously int) (with 0.125    |
 |                 |  pixel granularity).                                                        |
@@ -502,7 +688,7 @@ Changelog
 | AviSynth 2.5.6  | Added ``offset`` and other options.                                         |
 +-----------------+-----------------------------------------------------------------------------+
 
-$Date: 2023/11/03 11:15:00 $
+$Date: 2026/05/08 11:57:00 $
 
 .. _Interlaced Fieldbased:
     http://avisynth.nl/index.php/Interlaced_fieldbased
