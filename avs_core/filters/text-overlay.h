@@ -57,9 +57,7 @@
 #if defined(AVS_WINDOWS) && !defined(NO_WIN_GDI)
 #include "overlay/blend_common.h"  // MaskMode, PLACEMENT_*
 #include <vector>
-#ifdef INTEL_INTRINSICS
 #include "getalpharect_impl.h"
-#endif
 
 /*
  * Antialiaser — GDI-based anti-aliased text renderer for AviSynth+ video frames.
