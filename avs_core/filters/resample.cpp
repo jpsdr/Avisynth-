@@ -202,8 +202,10 @@ void resize_prepare_coeffs(ResamplingProgram* p, IScriptEnvironment* env, int fi
     checkAndSetOverread(start_pos + 32 - 1, p->safelimit_32_pixels, start_pos, i, p->source_size);
     // for permutex-based AVX2 ks4 float H resizers, where we read 8 pixels at a time exactly from
     // start_pos of each Nth pixel output block
-    if (i % 8 == 0)
+    if (i % 8 == 0) {
       checkAndSetOverread(start_pos + 8 - 1, p->safelimit_8_pixels_each8th_target, start_pos, i, p->source_size);
+      checkAndSetOverread(start_pos + 16 - 1, p->safelimit_16_pixels_each8th_target, start_pos, i, p->source_size);
+    }
     if (i % 16 == 0)
       checkAndSetOverread(start_pos + 16 - 1, p->safelimit_16_pixels_each16th_target, start_pos, i, p->source_size);
     if (i % 32 == 0) // avx512 uint16_t 32 target pixels, handling 64 source pixels
@@ -211,7 +213,7 @@ void resize_prepare_coeffs(ResamplingProgram* p, IScriptEnvironment* env, int fi
     if (i % 64 == 0) // avx512 uint8_t 64 target pixels, handling 128 source pixels
       checkAndSetOverread(start_pos + 128 - 1, p->safelimit_128_pixels_each64th_target, start_pos, i, p->source_size);
 
-      }
+  }
 
   // from now on, kernel_sizes[] has no role, each is filter_size_real
   p->kernel_sizes.clear();
@@ -972,7 +974,7 @@ AVS_FORCEINLINE static void process_two_pixels_h_uint8_16(const pixel_t* AVS_RES
         _result1 = result1;
         _result2 = result2;
         return;
-    }
+      }
     }
 
     // Process remaining 1-3 elements with scalar operations
@@ -1013,7 +1015,7 @@ AVS_FORCEINLINE static void process_two_pixels_h_uint8_16(const pixel_t* AVS_RES
 }
 
 
-// NO Forceinline! Helps MSVC, by starting a new stack trame and have enough registers again.
+// NO Forceinline! Helps MSVC, by starting a new stack frame and have enough registers again.
 template<bool is_safe, typename pixel_t, bool lessthan16bit>
 static void process_eight_pixels_h_uint8_16(const pixel_t * AVS_RESTRICT src, int x, const short* current_coeff_base, int filter_size,
   const Int32x4& rounder128, const Int16x8& shifttosigned, const uint16_t clamp_limit,
@@ -1078,7 +1080,7 @@ static void process_eight_pixels_h_uint8_16(const pixel_t * AVS_RESTRICT src, in
     sumQuad5678 += shiftfromsigned;
   }
 
-  const int current_fp_scale_bits = (sizeof(pixel_t) == 1) ? FPScale8bits : FPScale16bits;
+  constexpr int current_fp_scale_bits = (sizeof(pixel_t) == 1) ? FPScale8bits : FPScale16bits;
   // scale back, store
   sumQuad1234 >>= current_fp_scale_bits;
   sumQuad5678 >>= current_fp_scale_bits;
@@ -1332,9 +1334,10 @@ static void GetCenterShiftForResizers(double& center_pos_luma, double& center_po
 FilteredResizeH::FilteredResizeH(PClip _child, double subrange_left, double subrange_width,
   int target_width, ResamplingFunction* func, bool preserve_center, int chroma_placement, IScriptEnvironment* env)
   : GenericVideoFilter(_child),
-  resampling_program_luma(nullptr), resampling_program_chroma(nullptr), 
+  resampling_program_luma(nullptr), resampling_program_chroma(nullptr),
   resampler_h_luma(nullptr), resampler_h_chroma(nullptr),
   resampler_h_luma_mt(nullptr), resampler_h_chroma_mt(nullptr),
+  use_alternative_h_avx512_mt_fallback(false),
   resampler_luma(nullptr), resampler_chroma(nullptr),
   num_threads(0)
 
@@ -1367,7 +1370,7 @@ FilteredResizeH::FilteredResizeH(PClip _child, double subrange_left, double subr
   // 3.7.4- parameter, old Avisynth behavior: 0.5, 0.5
 
   // Main resampling program
-  resampling_program_luma = func->GetResamplingProgram(vi.width, subrange_left, subrange_width, target_width, bits_per_pixel, 
+  resampling_program_luma = func->GetResamplingProgram(vi.width, subrange_left, subrange_width, target_width, bits_per_pixel,
     center_pos_h_luma, center_pos_h_luma, // for resizing it's the same for source and dest
     env);
   if (vi.IsPlanar() && !grey && !isRGBPfamily) {
@@ -1385,7 +1388,7 @@ FilteredResizeH::FilteredResizeH(PClip _child, double subrange_left, double subr
       env);
   }
 
-// when not fast_resize, then we use vertical resizers between turnleft/turnright
+  // when not fast_resize, then we use vertical resizers between turnleft/turnright
 #ifdef INTEL_INTRINSICS
   int cpu = env->GetCPUFlags();
   bool has_sse2 = (cpu & CPUF_SSE2) != 0;
@@ -1401,158 +1404,163 @@ FilteredResizeH::FilteredResizeH(PClip _child, double subrange_left, double subr
   // PF 2025: H is not slower than V in C implementation.
   // Still, H resizers are incompatible with packed RGB formats
 
-    if (!fast_resize) {
+  if (!fast_resize) {
 
-      // nonfast-resize: using V resizer for horizontal resizing between a turnleft/right
-      // For packed RGB formats this is the only way
+    // nonfast-resize: using V resizer for horizontal resizing between a turnleft/right
+    // For packed RGB formats this is the only way
 
-      resampler_luma = FilteredResizeV::GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_luma, env);
+    resampler_luma = FilteredResizeV::GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_luma, env);
 
-      if (vi.IsPlanar() && !grey && !isRGBPfamily) {
-        resampler_chroma = FilteredResizeV::GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_chroma, env);
-      }
+    if (vi.IsPlanar() && !grey && !isRGBPfamily) {
+      resampler_chroma = FilteredResizeV::GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_chroma, env);
+    }
 
-      // Temporary buffer size for turns
-      temp_1_pitch = AlignNumber(vi.BytesFromPixels(src_height), FRAME_ALIGN);
-      temp_2_pitch = AlignNumber(vi.BytesFromPixels(dst_height), FRAME_ALIGN);
+    // Temporary buffer size for turns
+    temp_1_pitch = AlignNumber(vi.BytesFromPixels(src_height), FRAME_ALIGN);
+    temp_2_pitch = AlignNumber(vi.BytesFromPixels(dst_height), FRAME_ALIGN);
 
-      // Initialize Turn function
-      // see turn.cpp
-      if (vi.IsRGB24()) {
+    // Initialize Turn function
+    // see turn.cpp
+    if (vi.IsRGB24()) {
 #ifdef INTEL_INTRINSICS
-        // no intel intentionally
+      // no intel intentionally
 #endif
-        turn_left = turn_left_rgb24;
-        turn_right = turn_right_rgb24;
-      }
-      else if (vi.IsRGB32()) {
+      turn_left = turn_left_rgb24;
+      turn_right = turn_right_rgb24;
+    }
+    else if (vi.IsRGB32()) {
 #ifdef INTEL_INTRINSICS
       if (has_avx2) {
         turn_left = turn_left_rgb32_avx2;
         turn_right = turn_right_rgb32_avx2;
       }
       else if (has_sse2) {
-          turn_left = turn_left_rgb32_sse2;
-          turn_right = turn_right_rgb32_sse2;
-        }
-        else
+        turn_left = turn_left_rgb32_sse2;
+        turn_right = turn_right_rgb32_sse2;
+      }
+      else
 #elif NEON_INTRINSICS
-        if (has_neon) {
-          turn_left = turn_left_rgb32_neon;
-          turn_right = turn_right_rgb32_neon;
-        }
-        else
-#endif
-        {
-          turn_left = turn_left_rgb32_c;
-          turn_right = turn_right_rgb32_c;
-        }
+      if (has_neon) {
+        turn_left = turn_left_rgb32_neon;
+        turn_right = turn_right_rgb32_neon;
       }
-      else if (vi.IsRGB48()) {
+      else
+#endif
+      {
+        turn_left = turn_left_rgb32_c;
+        turn_right = turn_right_rgb32_c;
+      }
+    }
+    else if (vi.IsRGB48()) {
 #ifdef INTEL_INTRINSICS
-        // no intel intentionally
+      // no intel intentionally
 #endif
-        turn_left = turn_left_rgb48_c;
-        turn_right = turn_right_rgb48_c;
-      }
-      else if (vi.IsRGB64()) {
+      turn_left = turn_left_rgb48_c;
+      turn_right = turn_right_rgb48_c;
+    }
+    else if (vi.IsRGB64()) {
 #ifdef INTEL_INTRINSICS
       if (has_avx2) {
         turn_left = turn_left_rgb64_avx2;
         turn_right = turn_right_rgb64_avx2;
       }
       else if (has_sse2) {
-          turn_left = turn_left_rgb64_sse2;
-          turn_right = turn_right_rgb64_sse2;
-        }
-        else
-#elif defined(NEON_INTRINSICS)
-        if (has_neon) {
-          turn_left = turn_left_rgb64_neon;
-          turn_right = turn_right_rgb64_neon;
-        }
-        else
-#endif
-        {
-          turn_left = turn_left_rgb64_c;
-          turn_right = turn_right_rgb64_c;
-        }
+        turn_left = turn_left_rgb64_sse2;
+        turn_right = turn_right_rgb64_sse2;
       }
-      else {
-        switch (vi.ComponentSize()) {// AVS16
-        case 1: // 8 bit
+      else
+#elif defined(NEON_INTRINSICS)
+      if (has_neon) {
+        turn_left = turn_left_rgb64_neon;
+        turn_right = turn_right_rgb64_neon;
+      }
+      else
+#endif
+      {
+        turn_left = turn_left_rgb64_c;
+        turn_right = turn_right_rgb64_c;
+      }
+    }
+    else {
+      switch (vi.ComponentSize()) {// AVS16
+      case 1: // 8 bit
 #ifdef INTEL_INTRINSICS
         if (has_avx2) {
           turn_left = turn_left_plane_8_avx2;
           turn_right = turn_right_plane_8_avx2;
         }
         else if (has_sse2) {
-            turn_left = turn_left_plane_8_sse2;
-            turn_right = turn_right_plane_8_sse2;
-          }
-          else
+          turn_left = turn_left_plane_8_sse2;
+          turn_right = turn_right_plane_8_sse2;
+        }
+        else
 #elif defined(NEON_INTRINSICS)
-          if (has_neon) {
-            turn_left = turn_left_plane_8_neon;
-            turn_right = turn_right_plane_8_neon;
-          }
-          else
+        if (has_neon) {
+          turn_left = turn_left_plane_8_neon;
+          turn_right = turn_right_plane_8_neon;
+        }
+        else
 #endif
-          {
-            turn_left = turn_left_plane_8_c;
-            turn_right = turn_right_plane_8_c;
-          }
-          break;
-        case 2: // 16 bit
+        {
+          turn_left = turn_left_plane_8_c;
+          turn_right = turn_right_plane_8_c;
+        }
+        break;
+      case 2: // 16 bit
 #ifdef INTEL_INTRINSICS
         if (has_avx2) {
           turn_left = turn_left_plane_16_avx2;
           turn_right = turn_right_plane_16_avx2;
         }
         else if (has_sse2) {
-            turn_left = turn_left_plane_16_sse2;
-            turn_right = turn_right_plane_16_sse2;
-          }
-          else
+          turn_left = turn_left_plane_16_sse2;
+          turn_right = turn_right_plane_16_sse2;
+        }
+        else
 #elif defined(NEON_INTRINSICS)
-          if (has_neon) {
-            turn_left = turn_left_plane_16_neon;
-            turn_right = turn_right_plane_16_neon;
-          }
-          else
+        if (has_neon) {
+          turn_left = turn_left_plane_16_neon;
+          turn_right = turn_right_plane_16_neon;
+        }
+        else
 #endif
-          {
-            turn_left = turn_left_plane_16_c;
-            turn_right = turn_right_plane_16_c;
-          }
-          break;
-        default: // 32 bit
+        {
+          turn_left = turn_left_plane_16_c;
+          turn_right = turn_right_plane_16_c;
+        }
+        break;
+      default: // 32 bit
 #ifdef INTEL_INTRINSICS
         if (has_avx2) {
           turn_left = turn_left_plane_32_avx2;
           turn_right = turn_right_plane_32_avx2;
         }
         else if (has_sse2) {
-            turn_left = turn_left_plane_32_sse2;
-            turn_right = turn_right_plane_32_sse2;
-          }
-          else
+          turn_left = turn_left_plane_32_sse2;
+          turn_right = turn_right_plane_32_sse2;
+        }
+        else
 #endif
-          {
-            turn_left = turn_left_plane_32_c;
-            turn_right = turn_right_plane_32_c;
-          }
+        {
+          turn_left = turn_left_plane_32_c;
+          turn_right = turn_right_plane_32_c;
         }
       }
     }
-    else {
-      // planar format (or Y)
-      resampler_h_luma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_luma, /*out*/resampler_h_luma_mt, env);
+  }
+  else {
+    // planar format (or Y)
+    resampler_h_luma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_luma, /*out*/resampler_h_luma_mt, env);
 
-      if (!grey && !isRGBPfamily) {
-        resampler_h_chroma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_chroma, /*out*/resampler_h_chroma_mt, env);
-      }
+    if (!grey && !isRGBPfamily) {
+      resampler_h_chroma = GetResampler(cpu, pixelsize, bits_per_pixel, resampling_program_chroma, /*out*/resampler_h_chroma_mt, env);
     }
+
+    if (!use_alternative_h_avx512_mt_fallback) {
+      resampler_h_luma_mt = nullptr;
+      resampler_h_chroma_mt = nullptr;
+    }
+  }
   // Change target video info size
   vi.width = target_width;
 }
@@ -1662,9 +1670,6 @@ PVideoFrame __stdcall FilteredResizeH::GetFrame(int n, IScriptEnvironment* env)
   return dst;
 }
 
-//#define SPEEDTEST_MPZ 1
-//#define USE_MPZ_VNNI 1
-
 ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pixel, ResamplingProgram* program, ResamplerH &out_resampler_h_alternative_for_mt, IScriptEnvironment* env)
 {
   out_resampler_h_alternative_for_mt = nullptr;
@@ -1674,7 +1679,7 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
   // Floats also use 32 bytes, but since 32/sizeof(float) = 8, processing 16 pixels is unnecessary.
   // Even in C, the code is optimized to be vector-friendly.
   if (pixelsize == 1 || pixelsize == 2)
-    simd_coeff_count_padding = 16;
+    simd_coeff_count_padding = 16; // FIXME: make it 8
 
   // Not only does it prepare and pad for SIMD/vector code, but it also corrects, reorders, and equalizes coefficients 
   // at the right and bottom ends, since we may have variable kernel sizes due to boundary conditions.
@@ -1695,7 +1700,23 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
 #endif
       // feature flag, grouping many avx512 features
       // in case of optimized avx512_permutex_vstripe resizer found, set alternative resizer for MT use
-        out_resampler_h_alternative_for_mt = resizer_h_avx2_generic_uint8_t; // AVX2 should present if AVX512 present
+      out_resampler_h_alternative_for_mt = resizer_h_avx2_generic_uint8_t; // AVX2 should present if AVX512 present
+      //
+      // AVX-512 uint8 horizontal resizer selection (pretransposed-coeffs variants, normal builds):
+      //
+      // Function                                  | Pixels/iter | Source window | Use case
+      // ------------------------------------------|-------------|---------------|------------------------------------------
+      // mpz_ks4_pretransposed_coeffs              |     64      |  128 bytes    | filter_size <= 4, upscale / mild downscale
+      // mpz_ks8_pretransposed_coeffs              |     64      |  128 bytes    | filter_size <= 8, upscale / mild downscale (1st choice)
+      // 2s32_ks8_pretransposed_coeffs             |   2x32      | 2x128 bytes   | filter_size <= 8, heavier downscale (~0.5x), two independent source strips
+      // mpz_ks16_pretransposed_coeffs             |     32      |  128 bytes    | filter_size <= 16, upscale / mild downscale
+      // 2s32_ks64_pretransposed_coeffs            |   2x32      | 2x128 bytes   | filter_size up to ~64, variable inner loop over taps
+      //
+      // "mpz" = maskz-permutex: single 128-byte source window per 64 (or 32) target pixels.
+      // "2s32" = two strips of 32: two independent 128-byte windows to cover wider source spans.
+      // VNNI path: uses native vpermi2b (VBMI) + dpwssd. BASE path: simulates vpermi2b via
+      // precomputed word-index/shift-amount pairs fed to vpermw+vpsrlvw (avoids costly VBMI instruction).
+      //
       if (program->filter_size_real <= 4) {
         if (!program->resize_h_planar_gather_permutex_vstripe_check(64/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, 4/*kernel_size*/)) {
           /*
@@ -1711,25 +1732,12 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
 
             Winners: (Fast) resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks4_vnni (Base) resize_h_planar_uint8_avx512_permutex_vstripe_ks4_base
           */
-#ifdef SPEEDTEST_MPZ
-#ifdef USE_MPZ_VNNI
-          if(has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks4_vnni; // Chosen for CPUF_AVX512_FAST
-          else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks4_base; // Huge register pressure, -50% compared to resize_h_planar_uint8_avx512_permutex_vstripe_ks4_base
-#else
-          if(has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks4_vbmi;
-          else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks4_base; // Chosen for CPUF_AVX512_BASE
-#endif
-#else
+          resize_prepare_coeffs_AVX512_H(program, env, 64/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
           if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks4_vnni;
+            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks4_pretransposed_coeffs_vnni;
           else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks4_base;
-#endif
-      }
+            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks4_pretransposed_coeffs_base;
+        }
       }
       if (program->filter_size_real <= 8) {
         /*
@@ -1755,31 +1763,18 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
 
           Winners: (Fast) resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks8_vnni (Base) resize_h_planar_uint8_avx512_permutex_vstripe_ks8_base
           */
-#ifdef SPEEDTEST_MPZ
-#ifdef USE_MPZ_VNNI
+          resize_prepare_coeffs_AVX512_H(program, env, 64/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
           if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks8_vnni;
+            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks8_pretransposed_coeffs_vnni;
           else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks8_base;
-#else
-          if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks8_vbmi;
-          else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks8_base;
-#endif
-#else
-          if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks8_vnni;
-          else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks8_base;
-
-#endif
-    }
+            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks8_pretransposed_coeffs_base;
+        }
         if (!program->resize_h_planar_gather_permutex_vstripe_check(32/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, 8/*kernel_size*/)) { // slower ks8 but more downsample ratio for /2
+          resize_prepare_coeffs_AVX512_H(program, env, 32/*iSamplesInTheGroup*/, 2/*iGroupsCount*/);
           if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_2s32_ks8_vbmi;
+            return resize_h_planar_uint8_avx512_permutex_vstripe_2s32_ks8_pretransposed_coeffs_vnni;
           else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_2s32_ks8_base;
+            return resize_h_planar_uint8_avx512_permutex_vstripe_2s32_ks8_pretransposed_coeffs_base;
         }
       }
       if (program->filter_size_real <= 16) {
@@ -1799,25 +1794,20 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
 
           Winners: (Fast) resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks16_vnni (Base) resize_h_planar_uint8_avx512_permutex_vstripe_ks16_base
           */
-#ifdef SPEEDTEST_MPZ
-#ifdef USE_MPZ_VNNI
+          resize_prepare_coeffs_AVX512_H(program, env, 32/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
           if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks16_vnni;
+            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks16_pretransposed_coeffs_vnni;
           else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks16_base;
-#else
-          if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks16_vbmi;
-          else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks16_base;
-#endif
-#else
-          if (has_AVX512_fast)
-            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks16_vnni;
-          else
-            return resize_h_planar_uint8_avx512_permutex_vstripe_ks16_base;
-#endif
+            return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_ks16_pretransposed_coeffs_base;
+        }
       }
+      if (!program->resize_h_planar_gather_permutex_vstripe_check(32/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, program->filter_size_real/*kernel_size*/))
+      {
+        resize_prepare_coeffs_AVX512_H(program, env, 32/*iSamplesInTheGroup*/, 2/*iGroupsCount*/);
+        if (has_AVX512_fast)
+          return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_2s32_ks64_pretransposed_coeffs_vnni;
+        else
+          return resize_h_planar_uint8_avx512_permutex_vstripe_mpz_2s32_ks64_pretransposed_coeffs_base;
       }
       out_resampler_h_alternative_for_mt = nullptr; // not needed
     }
@@ -1856,48 +1846,27 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
             AVX512 Fast
             resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_vnni 2578fps
             resize_h_planar_uint16_avx512_permutex_vstripe_ks4         2310fps (only base)
+            resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks4 2643fps
             AVX512 Base
             resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_base 2556fps
             resize_h_planar_uint16_avx512_permutex_vstripe_ks4         2310fps (only base)
+            resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks4 2685fps
             Fazit: The MP versions' difference is only two VNNI instructions between BASE/FAST, in benchmarks zero visible speed benefit is seen.
             Winners: (Both mp) (Fast) resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_vnni (Base) resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_base
           */
-#ifdef SPEEDTEST_MPZ
-#ifdef USE_MPZ_VNNI
+          resize_prepare_coeffs_AVX512_H(program, env, 64/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
           if (bits_per_pixel < 16) {
             if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_vnni<true>; // true: lessthan16bit
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks4_pretransposed_coeffs_vnni<true>;
             else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_base<true>;
-          } 
-          else {
-            if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_vnni<false>;
-            else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_base<false>;
-          }
-#else
-          if (bits_per_pixel < 16) {
-            return resize_h_planar_uint16_avx512_permutex_vstripe_ks4<true>;
-          }
-          else {
-            return resize_h_planar_uint16_avx512_permutex_vstripe_ks4<false>;
-          }
-#endif
-#else
-          if (bits_per_pixel < 16) {
-            if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_vnni<true>; // true: lessthan16bit
-            else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_base<true>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks4_pretransposed_coeffs_base<true>;
           }
           else {
             if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_vnni<false>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks4_pretransposed_coeffs_vnni<false>;
             else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks4_base<false>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks4_pretransposed_coeffs_base<false>;
           }
-#endif
         }
       }
       if (program->filter_size_real <= 8) {
@@ -1906,52 +1875,52 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
             Contenders:
             resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_vnni
             resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_base
+            resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks8_vnni (20260118) Case Q
             resize_h_planar_uint16_avx512_permutex_vstripe_ks8  (base avx512 only, no special intructions)
             Fazit: The MP versions' difference is only two VNNI instructions between BASE/FAST, in benchmarks 1-2% visible speed benefit is seen.
             Winners: (Both mp) (Fast) resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_vnni (Base) resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_base
           */
-#ifdef SPEEDTEST_MPZ
-#ifdef USE_MPZ_VNNI
+          resize_prepare_coeffs_AVX512_H(program, env, 64/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
           if (bits_per_pixel < 16) {
             if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_vnni<true>; // true: lessthan16bit
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks8_pretransposed_coeffs_vnni<true>;
             else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_base<true>;
-          } 
-          else {
-            if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_vnni<false>;
-            else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_base<false>;
-          }
-#else
-          if (bits_per_pixel < 16)
-            return resize_h_planar_uint16_avx512_permutex_vstripe_ks8<true>;
-          else
-            return resize_h_planar_uint16_avx512_permutex_vstripe_ks8<false>;
-#endif
-#else
-          if (bits_per_pixel < 16) {
-            if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_vnni<true>; // true: lessthan16bit
-            else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_base<true>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks8_pretransposed_coeffs_base<true>;
           }
           else {
             if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_vnni<false>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks8_pretransposed_coeffs_vnni<false>;
             else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_base<false>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_2s32_ks8_pretransposed_coeffs_base<false>;
           }
-#endif
-        }
-        if (!program->resize_h_planar_gather_permutex_vstripe_check(32/*iSamplesInTheGroup*/, 128/*permutex_index_diff_limit*/, 8/*kernel_size*/)) { // slower ks8 but more downsample ratio for /2
-          if (bits_per_pixel < 16)
-            return resize_h_planar_uint16_avx512_permutex_vstripe_2s16_ks8<true>;
-          else
-            return resize_h_planar_uint16_avx512_permutex_vstripe_2s16_ks8<false>;
-        }
-      }
+        } // check(32/*iSamplesInTheGroup*/, 64/*permutex_index_diff_limit*/, 8/*kernel_size*/)
+
+        // 
+        // Analysis                                                        C_VNNI C_BASE E_VNNI E_BASE R_VNNI R_BASE
+        // resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks8       3588   3604   3576  3601    3426  3611 [fps]
+        // resize_h_planar_uint16_avx512_permutex_vstripe_2s16_ks8          3383   3269   3378  3287    3293  3270
+        // Case C LanczosResize(int(width*0.5 + 0.5), height, taps=1) kernel size 4, downsampling
+        // Case E LanczosResize(int(width*0.5 + 0.5), height, taps=2) kernel size 8
+        // Case R: LanczosResize(int(width*0.5 + 0.5), height, taps=2) kernel size 8 
+        if (!program->resize_h_planar_gather_permutex_vstripe_check(16/*iSamplesInTheGroup*/, 64/*permutex_index_diff_limit*/, 8/*kernel_size*/)) {
+          resize_prepare_coeffs_AVX512_H(program, env, 64/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
+          if (bits_per_pixel < 16) {
+            if (has_AVX512_fast)
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks8_pretransposed_coeffs_vnni<true>;
+            else
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks8_pretransposed_coeffs_base<true>;
+          }
+          else {
+            // bits_per_pixel == 16
+            if (has_AVX512_fast)
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks8_pretransposed_coeffs_vnni<false>;
+            else
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks8_pretransposed_coeffs_base<false>;
+          }
+        } // check(16/*iSamplesInTheGroup*/, 64/*permutex_index_diff_limit*/, 8/*kernel_size*/)
+
+      } // if (program->filter_size_real <= 8)
+
       if (program->filter_size_real <= 16) {
         if (!program->resize_h_planar_gather_permutex_vstripe_check(32/*iSamplesInTheGroup*/, 64/*permutex_index_diff_limit*/, 16/*kernel_size*/))
         {
@@ -1968,18 +1937,43 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
             resizer_h_avx2_generic_uint16_t (fallback)                  1156 1085 1292
             Winners: (Both mp) (Fast) resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_vnni (Base) resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks8_base
           */
+          resize_prepare_coeffs_AVX512_H(program, env, 32/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
           if (bits_per_pixel < 16) {
             if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_vnni<true>; // true: lessthan16bit
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_pretransposed_coeffs_vnni<true>;
             else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_base<true>;
-    }
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_pretransposed_coeffs_base<true>;
+          }
           else {
             if (has_AVX512_fast)
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_vnni<false>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_pretransposed_coeffs_vnni<false>;
             else
-              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_base<false>;
+              return resize_h_planar_uint16_avx512_permutex_vstripe_mp_ks16_pretransposed_coeffs_base<false>;
           }
+        }
+      }
+      // "ks48" catch-all: handles any filter_size_real that fits within the
+      // _mm512_permutex2var_epi16 index range of 64 uint16 elements (two ZMMs).
+      // The check condition is: pixel_offset[x+15] - pixel_offset[x] + filter_size_real - 1 < 64.
+      // At 1:1 scale the 16-pixel group spans 15 source positions, leaving room for
+      // filter_size_real up to 48 (max even value: 15 + 48 - 1 = 62 < 64; 49 rounds up
+      // to 50 → 15 + 49 = 64, fails). For downscaling the offset span grows and the
+      // usable kernel shrinks — the check enforces this automatically per x-group.
+      // The function itself has no hard 48 limit; it loops over filter_size_real directly.
+      if (!program->resize_h_planar_gather_permutex_vstripe_check(16/*iSamplesInTheGroup*/, 64/*permutex_index_diff_limit*/, program->filter_size_real/*kernel_size*/))
+      {
+        resize_prepare_coeffs_AVX512_H(program, env, 64/*iSamplesInTheGroup*/, 1/*iGroupsCount*/);
+        if (bits_per_pixel < 16) {
+          if (has_AVX512_fast)
+            return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks48_pretransposed_coeffs_vnni<true>;
+          else
+            return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks48_pretransposed_coeffs_base<true>;
+        }
+        else {
+          if (has_AVX512_fast)
+            return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks48_pretransposed_coeffs_vnni<false>;
+          else
+            return resize_h_planar_uint16_avx512_permutex_vstripe_mp_4s16_ks48_pretransposed_coeffs_base<false>;
         }
       }
       out_resampler_h_alternative_for_mt = nullptr; // not needed
@@ -2000,10 +1994,10 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
 #endif
     if (bits_per_pixel == 16)
       return resizer_h_c_generic_uint8_16_vectorized<uint16_t, false>;
-      // return resize_h_c_planar<uint16_t, 0>;
+    // return resize_h_c_planar<uint16_t, 0>;
     else
       return resizer_h_c_generic_uint8_16_vectorized<uint16_t, true>;
-      // return resize_h_c_planar<uint16_t, 1>;
+    // return resize_h_c_planar<uint16_t, 1>;
   }
   else { //if (pixelsize == 4)
 #ifdef INTEL_INTRINSICS
@@ -2019,9 +2013,9 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
         if (!program->resize_h_planar_gather_permutex_vstripe_check(16 /*iSamplesInTheGroup*/, 32 /*permutex_index_diff_limit*/, 4 /*kernel_size*/)) {
           return resize_h_planar_float_avx512_permutex_vstripe_ks4;
         }
-          return resize_h_planar_float_avx512_transpose_vstripe_ks4;
-        }
-      if (program->filter_size_real <= 8) {
+        return resize_h_planar_float_avx512_transpose_vstripe_ks4;
+      }
+      if (program->filter_size_real <= 8) { 
         // up to 8 coeffs it can be highly optimized with transposes, gather/permutex choice
         out_resampler_h_alternative_for_mt = resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16; // jolly joker
         // first check 16 pixels per cycle version, probably resize_h_planar_float_avx512_permutex_vstripe_2s8_ks8 is faster,
@@ -2044,24 +2038,53 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
       }
 
       if (program->filter_size_real <= 16) {
-        // up to 16 coeffs it can be highly optimized with transposes, gather/permutex choice
+        // Dispatcher for float ks16 (filter_size_real 9..16).
+        //
+        // check(N, 32, ks) returns TRUE when N consecutive output pixels' source span
+        // EXCEEDS 32 floats (two ZMMs), making _mm512_permutex2var_ps unusable for that
+        // group size. FALSE means the group fits and permutex is valid.
+        //
+        // Strategy: try the widest feasible group first (best parallelism), fall back
+        // to progressively narrower groups, then to generic if none fit.
+        //
+        //   check(16)=false → ks16:   all 16-px groups fit in 32 sources  (mild downscale / upscale)
+        //   check(16)=true,
+        //     check(8)=false → 2s8:   16-px groups too wide, but 8-px groups fit  (moderate downscale)
+        //     check(8)=true,
+        //       check(4)=false → 4s4: even 8-px groups too wide, but 4-px groups fit (heavy downscale)
+        //       check(4)=true → generic: even 4-px groups too wide (very heavy downscale)
+        //
+        // Note: 4s4_ks16 is benchmarked SLOWER than generic in its applicable range because
+        // at such heavy downscale ratios the source taps are nearly consecutive in memory,
+        // so the generic's sequential-load FMA tree outperforms 4x permutex2var + 3x blend
+        // (112 port-5 ops vs generic's streaming loads). Kept for possible future use.
         out_resampler_h_alternative_for_mt = resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16; // jolly joker
         if (program->resize_h_planar_gather_permutex_vstripe_check(16/*iSamplesInTheGroup*/, 32/*permutex_index_diff_limit*/, 16/*kernel_size*/)) {
+          // 16-px groups are too wide for permutex2var_ps — ks16 cannot be used.
           if (!program->resize_h_planar_gather_permutex_vstripe_check(8/*iSamplesInTheGroup*/, 32/*permutex_index_diff_limit*/, 16/*kernel_size*/)) {
-            // LanczosResize(int(width * 0.9 + 0.5), height, taps = 4) # case K: H kernel size 9
-            // LanczosResize(int(width * 0.5 + 0.5), height, taps = 3) # case N: H kernel size 12
-
-            // Speed ranking fps, just to have a clue, higher is better.
-            // 1902 2809 resize_h_planar_float_avx512_permutex_vstripe_ks16 (invalid here, but for reference)
-            // 1356 2137 resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16 
-            // 1278 1997 resize_h_planar_float_avx512_permutex_vstripe_2s8_ks16 test 2x8 output version
-
-            // return resize_h_planar_float_avx512_permutex_vstripe_2s8_ks16; // This one is slower than the generic version
-            // Anyway we keep this branch, maybe in future 2s8_ks16 can be optimized better, till then, use generic.
-      return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16;
+            // 8-px groups fit: use 2s8_ks16 (2 independent groups of 8, each in a 32-float window).
+            // generic resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16: 2650 fps
+            // 2s8: 3392 fps
+            resize_prepare_coeffs_AVX512_float_H(program, env);
+            return resize_h_planar_float_avx512_permutex_vstripe_2s8_ks16;
           }
-          return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16; // todo: _ks16 transpose-based version to be designed and checked 
+          // 8-px groups are also too wide.
+#if 0
+          // 4s4_ks16 DISABLED: slower than generic in this range (heavy downscale).
+          // At such ratios source taps are nearly sequential, so generic's streaming
+          // loads beat 4x permutex2var + 3x blend (112 vs ~48 port-5 ops per y).
+          // generic: 4081 fps, 4s4_ks16: 3113 fps
+          if (!program->resize_h_planar_gather_permutex_vstripe_check(4/*iSamplesInTheGroup*/, 32/*permutex_index_diff_limit*/, 16/*kernel_size*/)) {
+            resize_prepare_coeffs_AVX512_float_H(program, env);
+            return resize_h_planar_float_avx512_permutex_vstripe_4s4_ks16;
+          }
+#endif
+          // Even 4-px groups too wide (or 4s4 disabled): fall back to generic.
+          return resizer_h_avx512_generic_float_pix16_sub4_ks_4_8_16;
         }
+        // 16-px groups fit: use ks16 (single source group, best case).
+        // ks16: 5500 fps (reference), generic: 2650 fps
+        resize_prepare_coeffs_AVX512_float_H(program, env);
         return resize_h_planar_float_avx512_permutex_vstripe_ks16;
       }
       
@@ -2084,7 +2107,7 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
       out_resampler_h_alternative_for_mt = resize_h_planar_float_avx2_permutex_vstripe_ks4; // jolly joker
       if (program->filter_size_real <= 4) {
         if (program->resize_h_planar_gather_permutex_vstripe_check(8 /*iSamplesInTheGroup*/, 8 /*permutex_index_diff_limit*/, 4 /*kernel_size*/)) {
-      switch (program->filter_size_real) {
+          switch (program->filter_size_real) {
           case 1: return resize_h_planar_float_avx2_transpose_vstripe_ks4<1>; break;
           case 2: return resize_h_planar_float_avx2_transpose_vstripe_ks4<2>; break;
           case 3: return resize_h_planar_float_avx2_transpose_vstripe_ks4<3>; break;
@@ -2093,6 +2116,23 @@ ResamplerH FilteredResizeH::GetResampler(int CPU, int pixelsize, int bits_per_pi
         }
         return resize_h_planar_float_avx2_permutex_vstripe_ks4;
       }
+#if 0
+      // ks8 DISABLED: slower than generic (1102 fps vs 1196 fps).
+      // Root cause: avx2_permutex2var_ps (dual-source simulation) costs 3 port-5 ops per call
+      // (2x permutevar8x32 + blendv). With 8 taps: 24 port-5 ops per y-iteration, making port 5
+      // the bottleneck at ~24 cycles. The generic uses gather (ports 2+3, load units) instead,
+      // not competing on port 5 at all. Single-source ks4 uses 1 port-5 per tap (4 total) and wins;
+      // dual-source ks8 uses 3x that and loses. Crossover is around tap 5.
+      // Pre-transposing coefficients is feasible but saves only outside-y-loop cost (amortized
+      // over height scanlines = negligible) and does not touch the y-loop bottleneck.
+      if (program->filter_size_real <= 8) {
+        // check(8,16,8)=false: 8 output pixels' source span fits in 16 floats (two YMMs via avx2_permutex2var_ps)
+        if (!program->resize_h_planar_gather_permutex_vstripe_check(8, 16, 8)) {
+          out_resampler_h_alternative_for_mt = resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16;
+          return resize_h_planar_float_avx2_permutex_vstripe_ks8;
+        }
+      }
+#endif
       return resizer_h_avx2_generic_float_pix16_sub4_ks_4_8_16; // new generic, like avx512 version
       // return resizer_h_avx2_generic_float; old generic would be named pix8_sub2_ks8
     }
@@ -2455,6 +2495,15 @@ PClip FilteredResize::CreateResize(PClip clip, int target_width, int target_heig
   // 3 - force H and V
   const bool force_H = force == 1 || force == 3;
   const bool force_V = force == 2 || force == 3;
+#ifdef DTL2D
+  if (force == 3) // not very good manual forcing of special 2pass mode, better to nake selection if both H and V resizs required, currently for test only
+    result = new FilteredResize_2p(clip,
+      subrange_left, subrange_width, target_width,
+      subrange_top, subrange_height, target_height,
+      f, preserve_center, chroma_placement, env); 
+  else
+#endif
+  {
   if (area_FirstH < area_FirstV)
   {
     result = CreateResizeV(clip, subrange_top, subrange_height, target_height, force_V, f, preserve_center, chroma_placement, env);
@@ -2464,6 +2513,7 @@ PClip FilteredResize::CreateResize(PClip clip, int target_width, int target_heig
   {
     result = CreateResizeH(clip, subrange_left, subrange_width, target_width, force_H, f, preserve_center, chroma_placement, env);
     result = CreateResizeV(result, subrange_top, subrange_height, target_height, force_V, f, preserve_center, chroma_placement, env);
+  }
   }
   return result;
 }
@@ -2641,3 +2691,484 @@ AVSValue __cdecl FilteredResize::Create_UserDefined2Resize(AVSValue args, void*,
   return CreateResize(args[0].AsClip(), args[1].AsInt(), args[2].AsInt(), &args[6], force, &f, preserve_center, placement_name, forced_chroma_placement, env);
 }
 
+#ifdef DTL2D
+
+/***************************************
+ *****    Filtered Resize - 2p    ******
+ ***************************************/
+
+FilteredResize_2p::FilteredResize_2p(PClip _child,
+  double subrange_left, double subrange_width, int target_width,
+  double subrange_top, double subrange_height, int target_height,
+  ResamplingFunction* func, bool preserve_center, int chroma_placement, IScriptEnvironment* env)
+  : GenericVideoFilter(_child),
+  resampling_program_luma_h(0), resampling_program_chroma_h(0),
+  resampling_program_luma_v(0), resampling_program_chroma_v(0)
+{
+  if (target_height <= 0)
+    env->ThrowError("Resize: Height must be greater than 0.");
+
+  if (target_width <= 0)
+    env->ThrowError("Resize: Width must be greater than 0.");
+
+  // set class globals
+  src_width = vi.width;
+  src_height = vi.height;
+  dst_width = target_width;
+  dst_height = target_height;
+
+  pixelsize = vi.ComponentSize(); // AVS16
+  bits_per_pixel = vi.BitsPerComponent();
+  grey = vi.IsY();
+  bool isRGBPfamily = vi.IsPlanarRGB() || vi.IsPlanarRGBA();
+
+  if (vi.IsPlanar() && !grey && !isRGBPfamily) {
+    const int mask = (1 << vi.GetPlaneHeightSubsampling(PLANAR_U)) - 1;
+
+    if (target_height & mask)
+      env->ThrowError("Resize: Planar destination height must be a multiple of %d.", mask + 1);
+  }
+
+  if (vi.IsRGB() && !isRGBPfamily)
+    subrange_top = vi.height - subrange_top - subrange_height; // packed RGB upside down
+
+#ifdef INTEL_INTRINSICS
+  int cpu = env->GetCPUFlags();
+#else
+  int cpu = 0;
+#endif
+
+  double center_pos_v_luma;
+  double center_pos_v_chroma;
+  GetCenterShiftForResizers(center_pos_v_luma, center_pos_v_chroma, preserve_center, chroma_placement, vi, false /* for vertical */);
+
+  double center_pos_h_luma;
+  double center_pos_h_chroma;
+  GetCenterShiftForResizers(center_pos_h_luma, center_pos_h_chroma, preserve_center, chroma_placement, vi, true /* for horizontal */);
+  // 3.7.4- parameter, old Avisynth behavior: 0.5, 0.5
+
+  // Create resampling program and pitch table for H
+  resampling_program_luma_h = func->GetResamplingProgram(vi.width, subrange_left, subrange_width, target_width, bits_per_pixel,
+    center_pos_h_luma, center_pos_h_luma, // for resizing it's the same for source and dest
+    env);
+  resampler_luma_h = GetResamplerH(cpu, pixelsize, bits_per_pixel, resampling_program_luma_h, env);
+
+  // Create resampling program and pitch table for V
+  resampling_program_luma_v = func->GetResamplingProgram(vi.height, subrange_top, subrange_height, target_height, bits_per_pixel,
+    center_pos_v_luma, center_pos_v_luma, // for resizing it's the same for source and dest
+    env);
+  resampler_luma_v = GetResamplerV(cpu, pixelsize, bits_per_pixel, resampling_program_luma_v, env);
+
+
+  if (vi.IsPlanar() && !grey && !isRGBPfamily) {
+    const int shift = vi.GetPlaneHeightSubsampling(PLANAR_U);
+    const int div = 1 << shift;
+
+    resampling_program_chroma_v = func->GetResamplingProgram(
+      vi.height >> shift,
+      subrange_top / div,
+      subrange_height / div,
+      target_height >> shift,
+      bits_per_pixel,
+      center_pos_v_chroma, center_pos_v_chroma, // for resizing it's the same for source and dest
+      env);
+
+    resampler_chroma_v = GetResamplerV(cpu, pixelsize, bits_per_pixel, resampling_program_chroma_v, env);
+  }
+
+  if (vi.IsPlanar() && !grey && !isRGBPfamily) {
+    const int shift = vi.GetPlaneWidthSubsampling(PLANAR_U);
+    const int div = 1 << shift;
+
+    resampling_program_chroma_h = func->GetResamplingProgram(
+      vi.width >> shift,
+      subrange_left / div,
+      subrange_width / div,
+      target_width >> shift,
+      bits_per_pixel,
+      center_pos_h_chroma, center_pos_h_chroma, // horizontal
+      env);
+
+    resampler_chroma_h = GetResamplerH(cpu, pixelsize, bits_per_pixel, resampling_program_chroma_h, env);
+  }
+
+  // Change target video info size
+  vi.height = target_height;
+  vi.width = target_width;
+}
+
+#if 0 // expected worse in performance - left for performance tests
+PVideoFrame __stdcall FilteredResize_2p::GetFrame(int n, IScriptEnvironment* env) // use env->Allocate() to get temp buf from other allocated memory - it is NOT returned to the memory pool for the NewVideoFrameP for the downstream filter to write to ?
+{
+  PVideoFrame src = child->GetFrame(n, env);
+  PVideoFrame dst = env->NewVideoFrameP(vi, &src);
+  int src_pitch = src->GetPitch();
+  int dst_pitch = dst->GetPitch();
+  const BYTE* srcp = src->GetReadPtr();
+  BYTE* dstp = dst->GetWritePtr(); // for first (largest ?) plane or for single ?
+
+  bool isRGBPfamily = vi.IsPlanarRGB() || vi.IsPlanarRGBA();
+
+  BYTE* temp_1 = static_cast<BYTE*>(env->Allocate(dst_pitch * dst_height, FRAME_ALIGN, AVS_POOLED_ALLOC));
+  if (!temp_1 ) {
+    env->Free(temp_1);
+    env->ThrowError("Could not reserve temp memory in a resampler_2p.");
+  }
+
+  // Do resizing, single plane by plane
+  resampler_luma_h(temp_1, srcp, dst_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+  int work_height = vi.IsPlanar() ? vi.width : vi.BytesFromPixels(vi.width) / pixelsize; // packed RGB: or vi.width * vi.NumComponent()
+  resampler_luma_v(dstp, temp_1, dst_pitch, dst_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+
+  if (isRGBPfamily)
+  {
+    src_pitch = src->GetPitch(PLANAR_B);
+    dst_pitch = dst->GetPitch(PLANAR_B);
+    srcp = src->GetReadPtr(PLANAR_B);
+    dstp = dst->GetWritePtr(PLANAR_B);
+
+    resampler_luma_h(temp_1, srcp, dst_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+    int work_height = vi.IsPlanar() ? vi.width : vi.BytesFromPixels(vi.width) / pixelsize; // packed RGB: or vi.width * vi.NumComponent()
+    resampler_luma_v(dstp, temp_1, dst_pitch, dst_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+
+    src_pitch = src->GetPitch(PLANAR_R);
+    dst_pitch = dst->GetPitch(PLANAR_R);
+    srcp = src->GetReadPtr(PLANAR_R);
+    dstp = dst->GetWritePtr(PLANAR_R);
+
+    resampler_luma_h(temp_1, srcp, dst_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+    resampler_luma_v(dstp, temp_1, dst_pitch, dst_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+
+  }
+  else if (!grey && vi.IsPlanar()) {
+    int width = vi.width >> vi.GetPlaneWidthSubsampling(PLANAR_U);
+    int height = vi.height >> vi.GetPlaneHeightSubsampling(PLANAR_U);
+
+    // Plane U resizing
+    src_pitch = src->GetPitch(PLANAR_U);
+    dst_pitch = dst->GetPitch(PLANAR_U);
+    srcp = src->GetReadPtr(PLANAR_U);
+    dstp = dst->GetWritePtr(PLANAR_U);
+
+    resampler_chroma_h(temp_1, srcp, dst_pitch, src_pitch, resampling_program_chroma_h, width, src_height >> vi.GetPlaneHeightSubsampling(PLANAR_U), bits_per_pixel);
+    resampler_chroma_v(dstp, temp_1, dst_pitch, dst_pitch, resampling_program_chroma_v, width, height, bits_per_pixel);
+
+    // Plane V resizing
+    src_pitch = src->GetPitch(PLANAR_V);
+    dst_pitch = dst->GetPitch(PLANAR_V);
+    srcp = src->GetReadPtr(PLANAR_V);
+    dstp = dst->GetWritePtr(PLANAR_V);
+
+    resampler_chroma_h(temp_1, srcp, dst_pitch, src_pitch, resampling_program_chroma_h, width, src_height >> vi.GetPlaneHeightSubsampling(PLANAR_U), bits_per_pixel);
+    resampler_chroma_v(dstp, temp_1, dst_pitch, dst_pitch, resampling_program_chroma_v, width, height, bits_per_pixel);
+
+  }
+
+  if (vi.IsYUVA() || vi.IsPlanarRGBA()) {
+    src_pitch = src->GetPitch(PLANAR_A);
+    dst_pitch = dst->GetPitch(PLANAR_A);
+    srcp = src->GetReadPtr(PLANAR_A);
+    dstp = dst->GetWritePtr(PLANAR_A);
+
+    resampler_luma_h(temp_1, srcp, dst_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+    int work_height = vi.IsPlanar() ? vi.width : vi.BytesFromPixels(vi.width) / pixelsize; // packed RGB: or vi.width * vi.NumComponent()
+    resampler_luma_v(dstp, temp_1, dst_pitch, dst_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+  }
+
+  env->Free(temp_1);
+
+  return dst;
+}
+#endif
+
+PVideoFrame __stdcall FilteredResize_2p::GetFrame(int n, IScriptEnvironment* env) // use NewVideoFrame as temp buf to return it in the vfb pool after exit this filter
+{
+  PVideoFrame src = child->GetFrame(n, env);
+  PVideoFrame dst = env->NewVideoFrameP(vi, &src);
+
+  PVideoFrame tmp = env->NewVideoFrame(vi); // no need frame properties copy, use as temporal buffer only and its refcount will be zeroed at function exit with object auto-release/destructor (PVideoFrame::~PVideoFrame() )
+  /*
+  Here we need to ask ScriptEnvironment to look for output format of downstream filter ? So it is not trans-in-place filter we can request frame buffer larger and left
+  it unused after exiting this function. Only in this case there is a big probability the env->NewVideoFrameP(vi, &src); for downstream filter call will return this same virtual address buffer
+  to the downstream filter and it can be (at least partially) overwritten saving from useless downloading from CPU cache. It is new TODO idea for modification of ScriptEnvironment vfb memory management.
+  After this will be implemented - we can use such method of requesting temp buffer (frame) to use in 2pass resize.
+  If this is last filter in a chain - simply request lowest possible sized frame.
+
+  Update 30.05.2025: The expected transfer of tmp buf address to downstream fiter dst frame sometime happens - but how frequently it happens in real scripts running - need to be discovered.
+
+  As env->Allocate/Free buffers are definitely worse (only good if downstream filter will request same temp buf for write) - this temp method expected to be faster (as first expectations).
+  */
+
+  int src_pitch = src->GetPitch();
+  int dst_pitch = dst->GetPitch();
+  const BYTE* srcp = src->GetReadPtr();
+  BYTE* dstp = dst->GetWritePtr(); // for first (largest ?) plane or for single ?
+
+  bool isRGBPfamily = vi.IsPlanarRGB() || vi.IsPlanarRGBA();
+
+  const BYTE* tmp_srcp = tmp->GetReadPtr();
+  BYTE* tmp_dstp = tmp->GetWritePtr(); // for first (largest ?) plane or for single ?
+  int tmp_pitch = tmp->GetPitch();
+
+  // Do resizing, single plane by plane
+  resampler_luma_h(tmp_dstp, srcp, tmp_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+  int work_height = vi.IsPlanar() ? vi.width : vi.BytesFromPixels(vi.width) / pixelsize; // packed RGB: or vi.width * vi.NumComponent()
+  resampler_luma_v(dstp, tmp_srcp, dst_pitch, tmp_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+
+  
+  if (isRGBPfamily)
+  {
+    src_pitch = src->GetPitch(PLANAR_B);
+    dst_pitch = dst->GetPitch(PLANAR_B);
+    srcp = src->GetReadPtr(PLANAR_B);
+    dstp = dst->GetWritePtr(PLANAR_B);
+
+    resampler_luma_h(tmp_dstp, srcp, tmp_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+    int work_height = vi.IsPlanar() ? vi.width : vi.BytesFromPixels(vi.width) / pixelsize; // packed RGB: or vi.width * vi.NumComponent()
+    resampler_luma_v(dstp, tmp_srcp, dst_pitch, tmp_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+
+    src_pitch = src->GetPitch(PLANAR_R);
+    dst_pitch = dst->GetPitch(PLANAR_R);
+    srcp = src->GetReadPtr(PLANAR_R);
+    dstp = dst->GetWritePtr(PLANAR_R);
+
+    resampler_luma_h(tmp_dstp, srcp, tmp_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+    resampler_luma_v(dstp, tmp_srcp, dst_pitch, tmp_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+
+  }
+  else if (!grey && vi.IsPlanar()) {
+    int width = vi.width >> vi.GetPlaneWidthSubsampling(PLANAR_U);
+    int height = vi.height >> vi.GetPlaneHeightSubsampling(PLANAR_U);
+
+    // Plane U resizing
+    src_pitch = src->GetPitch(PLANAR_U);
+    dst_pitch = dst->GetPitch(PLANAR_U);
+    srcp = src->GetReadPtr(PLANAR_U);
+    dstp = dst->GetWritePtr(PLANAR_U);
+
+    resampler_chroma_h(tmp_dstp, srcp, tmp_pitch, src_pitch, resampling_program_chroma_h, width, src_height >> vi.GetPlaneHeightSubsampling(PLANAR_U), bits_per_pixel);
+    resampler_chroma_v(dstp, tmp_dstp, dst_pitch, tmp_pitch, resampling_program_chroma_v, width, height, bits_per_pixel);
+
+    // Plane V resizing
+    src_pitch = src->GetPitch(PLANAR_V);
+    dst_pitch = dst->GetPitch(PLANAR_V);
+    srcp = src->GetReadPtr(PLANAR_V);
+    dstp = dst->GetWritePtr(PLANAR_V);
+
+    resampler_chroma_h(tmp_dstp, srcp, tmp_pitch, src_pitch, resampling_program_chroma_h, width, src_height >> vi.GetPlaneHeightSubsampling(PLANAR_V), bits_per_pixel);
+    resampler_chroma_v(dstp, tmp_dstp, dst_pitch, tmp_pitch, resampling_program_chroma_v, width, height, bits_per_pixel);
+
+  }
+
+  if (vi.IsYUVA() || vi.IsPlanarRGBA()) {
+    src_pitch = src->GetPitch(PLANAR_A);
+    dst_pitch = dst->GetPitch(PLANAR_A);
+    srcp = src->GetReadPtr(PLANAR_A);
+    dstp = dst->GetWritePtr(PLANAR_A);
+
+    resampler_luma_h(tmp_dstp, srcp, tmp_pitch, src_pitch, resampling_program_luma_h, dst_width, src_height, bits_per_pixel);
+    int work_height = vi.IsPlanar() ? vi.width : vi.BytesFromPixels(vi.width) / pixelsize; // packed RGB: or vi.width * vi.NumComponent()
+    resampler_luma_v(dstp, tmp_dstp, dst_pitch, tmp_pitch, resampling_program_luma_v, work_height, vi.height, bits_per_pixel);
+  }
+
+  return dst;
+}
+
+
+ResamplerV FilteredResize_2p::GetResamplerV(int CPU, int pixelsize, int bits_per_pixel, ResamplingProgram* program, IScriptEnvironment* env) // may be somehow call same method from FilteredResizeV class ?
+{
+
+  resize_prepare_coeffs(program, env, 8);
+  // for SIMD friendliness and more: consolidate the kernel_size vs filter_size at the end.
+  // See comments at FilteredResizeH::GetResampler
+
+  if (program->filter_size == 1) {
+    // Fast pointresize
+    switch (pixelsize) // AVS16
+    {
+    case 1: return resize_v_planar_pointresize<uint8_t>;
+    case 2: return resize_v_planar_pointresize<uint16_t>;
+    default: // case 4:
+      return resize_v_planar_pointresize<float>;
+    }
+  }
+  else {
+    // Other resizers
+    if (pixelsize == 1)
+    {
+#ifdef INTEL_INTRINSICS
+#ifdef INTEL_INTRINSICS_AVX512
+      if (CPU & CPUF_AVX512F)
+        return resize_v_avx512_planar_uint8_t_w_sr;
+#endif
+      if (CPU & CPUF_AVX2)
+        return resize_v_avx2_planar_uint8_t;
+      if (CPU & CPUF_SSE2)
+        return resize_v_sse2_planar;
+#ifdef X86_32
+      if (CPU & CPUF_MMX)
+        return resize_v_mmx_planar;
+#endif
+#endif
+      // C version
+      return resize_v_c_planar_uint8_16_t_auto_vectorized<uint8_t, true>;
+    }
+    else if (pixelsize == 2)
+    {
+#ifdef INTEL_INTRINSICS
+#ifdef INTEL_INTRINSICS_AVX512
+      if (CPU & CPUF_AVX512F)
+        if (bits_per_pixel < 16)
+          return resize_v_avx512_planar_uint16_t_w_sr<true>;
+        else
+          return resize_v_avx512_planar_uint16_t_w_sr<false>;
+#endif
+      if (CPU & CPUF_AVX2) {
+        if (bits_per_pixel < 16)
+          return resize_v_avx2_planar_uint16_t<true>;
+        else
+          return resize_v_avx2_planar_uint16_t<false>;
+      }
+      if (CPU & CPUF_SSE2) {
+        if (bits_per_pixel < 16)
+          return resize_v_sse2_planar_uint16_t<true>;
+        else
+          return resize_v_sse2_planar_uint16_t<false>;
+      }
+#endif
+      // C version
+      if (bits_per_pixel == 16)
+        return resize_v_c_planar_uint8_16_t_auto_vectorized<uint16_t, false>;
+      else
+        return resize_v_c_planar_uint8_16_t_auto_vectorized<uint16_t, true>;
+    }
+    else // pixelsize== 4
+    {
+#ifdef INTEL_INTRINSICS
+#ifdef INTEL_INTRINSICS_AVX512
+      if (CPU & CPUF_AVX512F) {
+//        return resize_v_avx512_planar_float;
+        return resize_v_avx512_planar_float_w_sr;
+      }
+#endif
+      if (CPU & CPUF_AVX2) {
+        return resize_v_avx2_planar_float;
+      }
+      if (CPU & CPUF_SSE2) {
+        return resize_v_sse2_planar_float;
+      }
+#endif
+      return resize_v_c_planar_float_auto_vectorized;
+    }
+  }
+}
+
+ResamplerH FilteredResize_2p::GetResamplerH(int CPU, int pixelsize, int bits_per_pixel, ResamplingProgram* program, IScriptEnvironment* env) // may be somehow call same method from FilteredResizeH class ?
+{
+  int simd_coeff_count_padding = 8;
+
+  // Both 8-bit and 16-bit SSSE3 and AVX2 horizontal resizers benefit from processing 16 pixels per cycle.
+  // Floats also use 32 bytes, but since 32/sizeof(float) = 8, processing 16 pixels is unnecessary.
+  // Even in C, the code is optimized to be vector-friendly.
+  if (pixelsize == 1 || pixelsize == 2)
+    simd_coeff_count_padding = 16;
+
+  // Not only does it prepare and pad for SIMD/vector code, but it also corrects, reorders, and equalizes coefficients 
+  // at the right and bottom ends, since we may have variable kernel sizes due to boundary conditions.
+  resize_prepare_coeffs(program, env, simd_coeff_count_padding);
+
+  if (pixelsize == 1)
+  {
+#ifdef INTEL_INTRINSICS
+    if (CPU & CPUF_AVX2) {
+      return resizer_h_avx2_generic_uint8_t;
+    }
+    if (CPU & CPUF_SSSE3) {
+      return resizer_h_ssse3_generic_uint8_16<uint8_t, true>;
+    }
+#endif
+    return resizer_h_c_generic_uint8_16_vectorized<uint8_t, true>;
+    //return resize_h_c_planar<uint8_t, 1>;
+  }
+  else if (pixelsize == 2) {
+#ifdef INTEL_INTRINSICS
+    if (CPU & CPUF_AVX2) {
+      if (bits_per_pixel < 16)
+        return resizer_h_avx2_generic_uint16_t<true>;
+      else
+        return resizer_h_avx2_generic_uint16_t<false>;
+    }
+    if (CPU & CPUF_SSSE3) {
+      if (bits_per_pixel < 16)
+        return resizer_h_ssse3_generic_uint8_16<uint16_t, true>;
+      else
+        return resizer_h_ssse3_generic_uint8_16<uint16_t, false>;
+    }
+#endif
+    if (bits_per_pixel == 16)
+      return resizer_h_c_generic_uint8_16_vectorized<uint16_t, false>;
+    // return resize_h_c_planar<uint16_t, 0>;
+    else
+      return resizer_h_c_generic_uint8_16_vectorized<uint16_t, true>;
+    // return resize_h_c_planar<uint16_t, 1>;
+  }
+  else { //if (pixelsize == 4)
+#ifdef INTEL_INTRINSICS
+#ifdef INTEL_INTRINSICS_AVX512
+    if ((CPU & CPUF_AVX512F) && program->filter_size_real <= 4) {
+      //return resize_h_planar_float_avx2_permutex_vstripe_ks4;
+      switch (program->filter_size_real) {
+        /*      case 1: return resize_h_planar_float_avx512_transpose_vstripe_ks4<1>; break;
+              case 2: return resize_h_planar_float_avx512_transpose_vstripe_ks4<2>; break;
+              case 3: return resize_h_planar_float_avx512_transpose_vstripe_ks4<3>; break;
+              case 4: return resize_h_planar_float_avx512_transpose_vstripe_ks4<0>; break;*/
+      case 1: return resize_h_planar_float_avx512_gather_permutex_vstripe_ks4_2w<1>; break;
+      case 2: return resize_h_planar_float_avx512_gather_permutex_vstripe_ks4_2w<2>; break;
+      case 3: return resize_h_planar_float_avx512_gather_permutex_vstripe_ks4_2w<3>; break;
+      case 4: return resize_h_planar_float_avx512_gather_permutex_vstripe_ks4_2w<0>; break;
+      }
+    }
+#endif
+    if (CPU & CPUF_AVX2) {
+      //return resize_h_planar_float_avx2_permutex_vstripe_ks4;
+
+      switch (program->filter_size_real) {
+        /*      case 1: return resize_h_planar_float_avx_transpose_vstripe_ks4<1>; break;
+              case 2: return resize_h_planar_float_avx_transpose_vstripe_ks4<2>; break;
+              case 3: return resize_h_planar_float_avx_transpose_vstripe_ks4<3>; break;
+              case 4: return resize_h_planar_float_avx_transpose_vstripe_ks4<0>; break;*/
+      case 1: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<1>; break;
+      case 2: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<2>; break;
+      case 3: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<3>; break;
+      case 4: return resize_h_planar_float_avx2_gather_permutex_vstripe_ks4<0>; break;
+      default: return resizer_h_avx2_generic_float;
+      }
+
+    }
+    if (CPU & CPUF_SSSE3) {
+      //      return resizer_h_ssse3_generic_float;
+      switch (program->filter_size_real) {
+      case 1: return resize_h_planar_float_sse_transpose_vstripe_ks4<1>; break;
+      case 2: return resize_h_planar_float_sse_transpose_vstripe_ks4<2>; break;
+      case 3: return resize_h_planar_float_sse_transpose_vstripe_ks4<3>; break;
+      case 4: return resize_h_planar_float_sse_transpose_vstripe_ks4<0>; break;
+      default: return resizer_h_ssse3_generic_float;
+      }
+    }
+#endif
+    return resize_h_c_planar<float, 0>;
+  }
+}
+
+
+FilteredResize_2p::~FilteredResize_2p(void)
+{
+  if (resampling_program_luma_h) { delete resampling_program_luma_h; }
+  if (resampling_program_chroma_h) { delete resampling_program_chroma_h; }
+
+  if (resampling_program_luma_v) { delete resampling_program_luma_v; }
+  if (resampling_program_chroma_v) { delete resampling_program_chroma_v; }
+
+
+}
+#endif

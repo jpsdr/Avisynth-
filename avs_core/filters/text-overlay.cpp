@@ -1,4 +1,4 @@
-﻿// Avisynth v2.5.  Copyright 2002 Ben Rudiak-Gould et al.
+// Avisynth v2.5.  Copyright 2002 Ben Rudiak-Gould et al.
 // http://avisynth.nl
 
 // This program is free software; you can redistribute it and/or modify
@@ -40,16 +40,16 @@
 #endif
 
 #include "text-overlay.h"
+#include "getalpharect_impl.h"
+#include "getalpharect_scalar.h"
 #ifdef INTEL_INTRINSICS
 #include "intel/text-overlay_sse.h"
-#include "getalpharect_impl.h"
 #ifdef INTEL_INTRINSICS_AVX512
 #include "intel/getalpharect_avx512.h"
 #endif
 #include "overlay/intel/masked_rowprep_sse41.h"
 #include "overlay/intel/masked_rowprep_avx2.h"
 #endif
-#include "getalpharect_scalar.h"
 #include "../convert/convert_matrix.h"  // for RGB2YUV_Rec601
 #include "../convert/convert_helper.h"  // chroma location
 
@@ -93,7 +93,7 @@ extern const AVSFunction Text_filters[] = {
   { "ShowSMPTE",BUILTIN_FUNC_PREFIX,
   "c[fps]f[offset]s[offset_f]i[x]f[y]f[font]s[size]f[text_color]i[halo_color]i[font_width]f[font_angle]f[bold]b[italic]b[noaa]b[gdi]b",
   ShowSMPTE::CreateSMTPE },
-
+    
   { "ShowTime",BUILTIN_FUNC_PREFIX,
   "c[offset_f]i[x]f[y]f[font]s[size]f[text_color]i[halo_color]i[font_width]f[font_angle]f[bold]b[italic]b[noaa]b[gdi]b",
   ShowSMPTE::CreateTime },
@@ -325,7 +325,7 @@ void Antialiaser::Apply(const VideoInfo& vi, PVideoFrame* frame, int pitch)
     }
     // Compute MaskMode from clip subsampling + stored chromaplacement
     MaskMode mode = MASK444;
-    if (vi.IsYUV() || vi.IsYUVA()) {
+    if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
       const int sx = vi.GetPlaneWidthSubsampling(PLANAR_U);
       const int sy = vi.GetPlaneHeightSubsampling(PLANAR_U);
       if (sx == 2) {
