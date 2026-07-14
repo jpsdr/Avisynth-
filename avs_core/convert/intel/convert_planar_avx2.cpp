@@ -586,7 +586,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
         // RGB→YUV: All RGB inputs are pivoted, need to account for all three
         // Out0=Y (luma offset), Out1=U and Out2=V (chroma offset)
         // Y output = y_r*R + y_g*G + y_b*B
-        if constexpr (!would_need_64bit_v_patch) {
+        if (!would_need_64bit_v_patch) {
           v_patch_G = _mm256_set1_epi32(luma_or_rgbin_pivot * (m.y_r + m.y_g + m.y_b) + offset_out_for_patch);
           // U output = u_r*R + u_g*G + u_b*B
           v_patch_B = _mm256_set1_epi32(luma_or_rgbin_pivot * (m.u_r + m.u_g + m.u_b) + chroma_offset_out_for_patch);
@@ -605,7 +605,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
         // RGB→YUV: All RGB inputs are pivoted, need to account for all three
         // Out0=Y (luma offset), No chroma
         // Y output = y_r*R + y_g*G + y_b*B
-        if constexpr (!would_need_64bit_v_patch) {
+        if (!would_need_64bit_v_patch) {
           v_patch_G = _mm256_set1_epi32(luma_or_rgbin_pivot * (m.y_r + m.y_g + m.y_b) + offset_out_for_patch);
           //v_patch_B = _mm256_set1_epi32(0); // no chroma
           //v_patch_R = _mm256_set1_epi32(0); // no chroma
@@ -1269,7 +1269,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
               if (!would_need_64bit_v_patch)
 #else
-              if constexpr (!would_need_64bit_v_patch)
+              if (!would_need_64bit_v_patch)
 #endif
               {
                 sum = _mm256_add_epi32(sum, v_patch);
@@ -1286,7 +1286,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
               if (!would_need_64bit_v_patch) {
 #else
-              if constexpr (!would_need_64bit_v_patch) {
+              if (!would_need_64bit_v_patch) {
 #endif
                 sum = _mm256_srai_epi32(sum, target_shift);
               }
@@ -1298,7 +1298,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
               if (would_need_64bit_v_patch) {
 #else
-              if constexpr (would_need_64bit_v_patch) {
+              if (would_need_64bit_v_patch) {
 #endif
                 // pack back to 32 bit: no _mm256_cvtepi64_epi32 in AVX2
                 __m256i pack_lo = _mm256_shuffle_epi32(sum_lo, _MM_SHUFFLE(3, 2, 2, 0));

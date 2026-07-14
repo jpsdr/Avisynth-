@@ -270,7 +270,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
         v_patch_R = _mm_set1_epi32(luma_or_rgbin_pivot * (m.y_r + m.u_r + m.v_r) + offset_out_for_patch);
       }
       else if constexpr (direction == ConversionDirection::RGB_TO_YUV) {
-        if constexpr (!would_need_64bit_v_patch) {
+        if (!would_need_64bit_v_patch) {
           v_patch_G = _mm_set1_epi32(luma_or_rgbin_pivot * (m.y_r + m.y_g + m.y_b) + offset_out_for_patch);
           v_patch_B = _mm_set1_epi32(luma_or_rgbin_pivot * (m.u_r + m.u_g + m.u_b) + chroma_offset_out_for_patch);
           v_patch_R = _mm_set1_epi32(luma_or_rgbin_pivot * (m.v_r + m.v_g + m.v_b) + chroma_offset_out_for_patch);
@@ -283,7 +283,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
         }
       }
       else if constexpr (direction == ConversionDirection::RGB_TO_Y) {
-        if constexpr (!would_need_64bit_v_patch) {
+        if (!would_need_64bit_v_patch) {
           v_patch_G = _mm_set1_epi32(luma_or_rgbin_pivot * (m.y_r + m.y_g + m.y_b) + offset_out_for_patch);
         }
         else {
@@ -600,7 +600,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
               if (!would_need_64bit_v_patch) {
 #else
-              if constexpr (!would_need_64bit_v_patch) {
+              if (!would_need_64bit_v_patch) {
 #endif
               sum = _mm_add_epi32(sum, v_patch);
               }
@@ -617,7 +617,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
               if (!would_need_64bit_v_patch) {
 #else
-              if constexpr (!would_need_64bit_v_patch) {
+              if (!would_need_64bit_v_patch) {
 #endif
                 sum = _mm_srai_epi32(sum, target_shift);
               }
@@ -629,7 +629,7 @@ static void convert_yuv_to_planarrgb_sse2_internal(BYTE* (&dstp)[3], int(&dstPit
 #ifdef XP_TLS
               if (would_need_64bit_v_patch) {
 #else
-              if constexpr (would_need_64bit_v_patch) {
+              if (would_need_64bit_v_patch) {
 #endif
                 // pack back to 32 bit, SSE2: cvtepi64_epi32 is avx512 only
                 /*
