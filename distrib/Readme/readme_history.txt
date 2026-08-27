@@ -9,8 +9,12 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20260826 3.7.5.rXXXX (pre 3.7.6)
+20260827 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
+- New array syntax: add dictionary-style ArraySet (replaces or appends)
+- New array syntax: add dictionary-style ArrayDel (deletes by key, no-op if not found)
+- New array syntax: add ArrayIndexOf which returns the actual index of the dictionary-style array search
+  See https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/script_ref/script_ref_arrays.html
 - Fix #505: Expr Vector-C relative-row addressing (x[dx,dy]) ignored the current row
   entirely, and additionally mis-scaled the row byte offset for 16-bit/float sources.
 - Fix #506: Compare 32-bit SAD/SD accumulators (8-bit packed/planar, C and SSE2/ISSE
@@ -29,6 +33,12 @@ https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 - Fix #512: "Overlay" masked "add"/"subtract"/"darken"/"lighten"/"difference"/"exclusion"/
   "softlight"/"hardlight" a fully-opaque mask did not reproduce the same result as omitting the mask.
   As a side effect, also added finer opacity-granularity over 8 bits at integer formats.
+- Fix: ArrayIns/ArraySet/ArrayDel: bounds check the index parameter(s) (preventing Access Violation)
+- Fix/optimize: avs/minmax.h content now is force-inlined, since MSVC placed a function call for them! 
+  (checked with actual disassembly).
+  Plus: wrap min/max/clamp in an anonymous namespace to prevent a theoretical translation unit mismatch across archs
+  (e.g. when SSE2/AVX2/AVX512 specific .cpp files are built with different per-file compiler flags). 
+  Part of our public headers, but no interface change was done.
 
 20260622 3.7.5.r4626 (pre 3.7.6)
 --------------------------------

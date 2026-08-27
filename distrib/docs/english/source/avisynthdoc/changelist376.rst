@@ -3,6 +3,13 @@ Changes from 3.7.5 to 3.7.6
 
 Additions, changes
 ~~~~~~~~~~~~~~~~~~
+- New array syntax: 
+
+  * dictionary-style ArraySet (replaces or appends).
+  * dictionary-style ArrayDel (deletes by key, no-op if not found).
+  * dictionary-style ArrayIndexOf (returns the actual index of the dictionary-style array search).
+
+  See :doc:`Arrays <./script_ref/script_ref_arrays>`.
 - Added ``SetFilterProp``, ``GetFilterProps``, and ``SetFilterPropPassthrough``:
 
   * ``SetFilterProp`` — automatically inject a frame property on the output of a named filter
@@ -230,6 +237,11 @@ Build environment, Interface
   (``-DDEVIL_LIBRARY`` / ``-DDEVIL_INCLUDE_DIR``).
 - CMakeLists: apply compiler parameter settings (warnings, compile flags) to all plugin
   sub-projects in addition to the core library.
+- Fix/optimize: ``avs/minmax.h`` content now is force-inlined, since MSVC placed a function call for them! 
+  (checked with actual disassembly).
+  Plus: wrap min/max/clamp in an anonymous namespace to prevent a theoretical translation unit mismatch across archs
+  (e.g. when SSE2/AVX2/AVX512 specific ``.cpp`` files are built with different per-file compiler flags). 
+  Part of our public headers, but no interface change was done.
 
 
 Bugfixes
@@ -332,6 +344,8 @@ Bugfixes
 - Fix #512: "Overlay" masked "add"/"subtract"/"darken"/"lighten"/"difference"/"exclusion"/
   "softlight"/"hardlight" a fully-opaque mask did not reproduce the same result as omitting the mask.
   As a side effect, also added finer opacity-granularity over 8 bits at integer formats.
+- Fix: ``ArrayIns``/``ArraySet``/``ArrayDel``: bounds check the index parameter(s)
+  (preventing Access Violation).
 
 
 Optimizations
@@ -435,12 +449,14 @@ Documentation
 - Update :doc:`Layer <./corefilters/layer>` with ``"mulovr"`` mode, ``"top_left"`` placement
   option, and related chroma-placement refactoring notes.
 - Update :doc:`Overlay <./corefilters/overlay>` with ``"placement"`` parameter for ``"blend"`` mode.
+- Update :doc:`Arrays <./script_ref/script_ref_arrays>` with dictionary-style key lookup/set/delete
+  (``ArrayGet``, ``ArraySet``, ``ArrayDel``) and the new ``ArrayIndexOf``.
 
 
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
 
-$Date: 2026/04/30 12:00:00 $
+$Date: 2026/08/27 14:15:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus

@@ -10,7 +10,10 @@ Beginning Avisynth+ 3.6 script arrays are supported. Functionality is different 
 -  Arrays can have one or more dimensions
 -  They even can be empty.
 -  AVSValue (internal representation of any Avisynth variable) is deep copied for arrays (arrays in arrays in ...)
-   (note: this is true when using them through c++ plugins. C interface is different, there is no deep-copy there)
+   (C plugin interface note: since interface V11, this is true for the C interface as well. ``avs_copy_value`` 
+   deep copies and ``avs_release_value`` deep releases arrays, matching C++ assignment and destruction behavior. 
+   Exception: a hand-created raw AVS_Value array that a C interface plugin assembled itself, e.g. on the 
+   stack to pass as call arguments, is not owned by Avisynth and must not be passed to ``avs_release_value``)
 -  untyped and unconstrained element number
 -  arrays can appear as internal filter parameters (named and unnamed).
 -  arrays can appear as user defined function parameters (named and unnamed).
@@ -20,9 +23,10 @@ Beginning Avisynth+ 3.6 script arrays are supported. Functionality is different 
 
   - ArrayIns - insert before position
   - ArrayAdd - append
-  - ArrayDel - delete from position
-  - ArraySet - replace at position
-  - ArrayGet - a function-like version of the bracket-type [] syntax
+  - ArrayDel - delete from position, or by dictionary key
+  - ArraySet - replace at position, or by dictionary key
+  - ArrayGet - a function-like version of the bracket-type [] syntax, also usable for dictionary-style key lookup
+  - ArrayIndexOf - dictionary-style key to index lookup
   - ArraySort - sort arrays of bool, numeric or string values
 
 -  Query the array length with ``ArraySize``
@@ -58,30 +62,64 @@ ArrayDel
 ^^^^^^^^
 ::
 
-    ArrayDel(array_to_mod, index1 (, index2, index3...])
+    ArrayDel(array_to_mod, index1 [, index2, index3...])
+    ArrayDel(array_to_mod, key)
 
 Returns a new array in which the requested position was deleted.
 Original array (as with the other functions) remains untouched.
+
+The second form takes a string ``key`` instead of index(es), for use with a dictionary-style
+array (an array of ``[key, value]`` pairs, see ``ArrayGet`` and ``ArrayIndexOf`` below). If ``key``
+exists (case-insensitive match), that ``[key, value]`` pair is removed; if not found, the array
+is returned unchanged (no-op, not an error). This form only works on a single (non-nested) level.
+
+*Example*
+::
+
+    dictionary = [["one", 1], ["two", 2]]
+    dictionary = ArrayDel(dictionary, "one") # [["two", 2]]
+    dictionary = ArrayDel(dictionary, "missing") # [["two", 2]], unchanged
 
 ArraySet
 ^^^^^^^^
 ::
 
     ArraySet(array_to_mod, replacement_value, index1 [, index2, index3...])
+    ArraySet(array_to_mod, replacement_value, key)
 
 Returns a new array with array_to_mod[index1 (, index2, index3...)] = replacement_value
 
 Original array (as with the other functions) remains untouched.
+
+The second form takes a string ``key`` instead of index(es), for use with a dictionary-style
+array (an array of ``[key, value]`` pairs, see ``ArrayGet`` and ``ArrayIndexOf`` below). It acts
+as a "smart" combination of ``ArraySet`` and ``ArrayAdd``: if ``key`` already exists
+(case-insensitive match), its value is replaced (``ArraySet`` behavior); otherwise a new
+``[key, value]`` pair is appended (``ArrayAdd`` behavior). This form only works on a single
+(non-nested) level.
+
+*Example*
+::
+
+    dictionary = [["one", 1], ["two", 2]]
+    dictionary = ArraySet(dictionary, 22, "two") # [["one", 1], ["two", 22]]
+    dictionary = ArraySet(dictionary, 3, "three") # [["one", 1], ["two", 22], ["three", 3]]
 
 ArrayGet
 ^^^^^^^^
 ::
 
     ArrayGet(array, index1 [, index2, index3...])
+    ArrayGet(array, key)
 
 A function version of accessing an array element.
 
 During the script parsing the bracketed syntax is silenly converted to ``ArrayGet``.
+
+The second form performs a dictionary-style lookup: when ``key`` is a string, ``array`` is
+treated as a list of ``[key, value]`` pairs and the value of the first case-insensitive tag
+match is returned (``Undefined`` if not found). This applies to the bracketed syntax as well:
+``a["key"]`` is converted to ``ArrayGet(a, "key")``, exactly like the integer-index case.
 
 *Example*
 ::
@@ -93,6 +131,28 @@ During the script parsing the bracketed syntax is silenly converted to ``ArrayGe
     n = b[3, 2]
     n = ArrayGet(b, 3, 2)
     n = b.ArrayGet(3, 2)
+
+    # dictionary-style lookup, these are the same too
+    dictionary = [["one", 1], ["two", 2]]
+    v = dictionary["two"]
+    v = ArrayGet(dictionary, "two")
+    v = dictionary.ArrayGet("two")
+
+ArrayIndexOf
+^^^^^^^^^^^^
+::
+
+    ArrayIndexOf(array, key)
+
+Returns the index of the first ``[key, value]`` pair in a dictionary-style array (see
+``ArrayGet`` above) whose tag matches ``key`` (case-insensitive), or ``-1`` if not found.
+
+*Example*
+::
+
+    dictionary = [["one", 1], ["two", 2]]
+    i = ArrayIndexOf(dictionary, "two") # 1
+    i = ArrayIndexOf(dictionary, "four") # -1
 
 ArraySize
 ^^^^^^^^^
