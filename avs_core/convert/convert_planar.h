@@ -173,7 +173,9 @@ public:
   }
 
   static AVSValue __cdecl CreateY(AVSValue args, void* user_data, IScriptEnvironment* env);
-  static AVSValue __cdecl CreateYV411(AVSValue args, void* user_data, IScriptEnvironment* env);
+  static AVSValue __cdecl CreateYUV411(AVSValue args, void* user_data, IScriptEnvironment* env);
+  static AVSValue __cdecl CreateYUV440(AVSValue args, void* user_data, IScriptEnvironment* env);
+  static AVSValue __cdecl CreateYUV410(AVSValue args, void* user_data, IScriptEnvironment* env);
   static AVSValue __cdecl CreateYUV420(AVSValue args, void* user_data, IScriptEnvironment* env);
   static AVSValue __cdecl CreateYUV422(AVSValue args, void* user_data, IScriptEnvironment* env);
   static AVSValue __cdecl CreateYUV444(AVSValue args, void* user_data, IScriptEnvironment* env);

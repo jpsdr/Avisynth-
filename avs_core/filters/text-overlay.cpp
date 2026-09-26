@@ -131,7 +131,8 @@ extern const AVSFunction Text_filters[] = {
  *******   Anti-alias    ******
  *****************************/
 
-// Select the best rowprep function for soa_mask_mode at construction time.
+// Select the best rowprep function for soa_mask_mode (SoA = Structure of Arrays,
+// the row-interleaved layout used by soa_buf/ApplyPlanar_SoA below) at construction time.
 using rowprep_u16_fn_t = const uint16_t*(*)(const uint16_t*, int, int, std::vector<uint16_t>&, int, int, MagicDiv);
 
 static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
@@ -141,24 +142,36 @@ static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
     switch (mode) {
     case MASK444:         return prepare_effective_mask_for_row_avx2<MASK444,         uint16_t, true>;
     case MASK411:         return prepare_effective_mask_for_row_avx2<MASK411,         uint16_t, true>;
+    case MASK411_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK411_TOPLEFT, uint16_t, true>;
     case MASK420:         return prepare_effective_mask_for_row_avx2<MASK420,         uint16_t, true>;
     case MASK420_MPEG2:   return prepare_effective_mask_for_row_avx2<MASK420_MPEG2,   uint16_t, true>;
     case MASK420_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK420_TOPLEFT, uint16_t, true>;
     case MASK422:         return prepare_effective_mask_for_row_avx2<MASK422,         uint16_t, true>;
     case MASK422_MPEG2:   return prepare_effective_mask_for_row_avx2<MASK422_MPEG2,   uint16_t, true>;
     case MASK422_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK422_TOPLEFT, uint16_t, true>;
+    case MASK440:         return prepare_effective_mask_for_row_avx2<MASK440,         uint16_t, true>;
+    case MASK440_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK440_TOPLEFT, uint16_t, true>;
+    case MASK410:         return prepare_effective_mask_for_row_avx2<MASK410,         uint16_t, true>;
+    case MASK410_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK410_TOPLEFT, uint16_t, true>;
+    default: break;
     }
   }
   if (cpuFlags & CPUF_SSE4_1) {
     switch (mode) {
     case MASK444:         return prepare_effective_mask_for_row_sse41<MASK444,         uint16_t, true>;
     case MASK411:         return prepare_effective_mask_for_row_sse41<MASK411,         uint16_t, true>;
+    case MASK411_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK411_TOPLEFT, uint16_t, true>;
     case MASK420:         return prepare_effective_mask_for_row_sse41<MASK420,         uint16_t, true>;
     case MASK420_MPEG2:   return prepare_effective_mask_for_row_sse41<MASK420_MPEG2,   uint16_t, true>;
     case MASK420_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK420_TOPLEFT, uint16_t, true>;
     case MASK422:         return prepare_effective_mask_for_row_sse41<MASK422,         uint16_t, true>;
     case MASK422_MPEG2:   return prepare_effective_mask_for_row_sse41<MASK422_MPEG2,   uint16_t, true>;
     case MASK422_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK422_TOPLEFT, uint16_t, true>;
+    case MASK440:         return prepare_effective_mask_for_row_sse41<MASK440,         uint16_t, true>;
+    case MASK440_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK440_TOPLEFT, uint16_t, true>;
+    case MASK410:         return prepare_effective_mask_for_row_sse41<MASK410,         uint16_t, true>;
+    case MASK410_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK410_TOPLEFT, uint16_t, true>;
+    default: break;
     }
   }
 #else
@@ -167,12 +180,18 @@ static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
   switch (mode) {
   case MASK444:         return prepare_effective_mask_for_row<MASK444,         uint16_t, true>;
   case MASK411:         return prepare_effective_mask_for_row<MASK411,         uint16_t, true>;
+  case MASK411_TOPLEFT: return prepare_effective_mask_for_row<MASK411_TOPLEFT, uint16_t, true>;
   case MASK420:         return prepare_effective_mask_for_row<MASK420,         uint16_t, true>;
   case MASK420_MPEG2:   return prepare_effective_mask_for_row<MASK420_MPEG2,   uint16_t, true>;
   case MASK420_TOPLEFT: return prepare_effective_mask_for_row<MASK420_TOPLEFT, uint16_t, true>;
   case MASK422:         return prepare_effective_mask_for_row<MASK422,         uint16_t, true>;
   case MASK422_MPEG2:   return prepare_effective_mask_for_row<MASK422_MPEG2,   uint16_t, true>;
   case MASK422_TOPLEFT: return prepare_effective_mask_for_row<MASK422_TOPLEFT, uint16_t, true>;
+  case MASK440:         return prepare_effective_mask_for_row<MASK440,         uint16_t, true>;
+  case MASK440_TOPLEFT: return prepare_effective_mask_for_row<MASK440_TOPLEFT, uint16_t, true>;
+  case MASK410:         return prepare_effective_mask_for_row<MASK410,         uint16_t, true>;
+  case MASK410_TOPLEFT: return prepare_effective_mask_for_row<MASK410_TOPLEFT, uint16_t, true>;
+  default: break;
   }
   return nullptr;
 }
@@ -190,8 +209,8 @@ Antialiaser::Antialiaser(int width, int height, const char fontname[], int size,
 {
   // row preparation functions convert a luma mask to chroma masks with correct chroma placement
   // for subsampled formats.
-  // Pre-select SIMD rowprep for all 8 MaskModes (411, 420 and 422 variants, 444)
-  for (int m = 0; m < 8; ++m)
+  // Pre-select SIMD rowprep for every MaskMode (411, 420 and 422 variants, 444, 440, 410)
+  for (int m = 0; m < MASK_MODE_COUNT; ++m)
     rowprep_fns[m] = select_rowprep_u16(static_cast<MaskMode>(m), cpuFlags);
 
 #ifdef INTEL_INTRINSICS
@@ -308,7 +327,7 @@ void Antialiaser::Apply(const VideoInfo& vi, PVideoFrame* frame, int pitch)
     BYTE* bufU  = nullptr;
     BYTE* bufV  = nullptr;
     int pitchUV = 0;
-    if (vi.NumComponents() > 1) {
+    if (vi.NumComponents() > 1 && !vi.IsYA()) {
       pitchUV = isRGB ? (*frame)->GetPitch(PLANAR_G) : (*frame)->GetPitch(PLANAR_U);
       bufU    = isRGB ? (*frame)->GetWritePtr(PLANAR_G) : (*frame)->GetWritePtr(PLANAR_U);
       bufV    = isRGB ? (*frame)->GetWritePtr(PLANAR_B) : (*frame)->GetWritePtr(PLANAR_V);
@@ -323,30 +342,26 @@ void Antialiaser::Apply(const VideoInfo& vi, PVideoFrame* frame, int pitch)
     case 16: ApplyPlanar_SoA<mode, 16>(bufY, pitch, pitchUV, bufU, bufV, isRGB); break; \
     case 32: ApplyPlanar_SoA<mode, 32>(bufY, pitch, pitchUV, bufU, bufV, isRGB); break; \
     }
-    // Compute MaskMode from clip subsampling + stored chromaplacement
+    // Compute MaskMode from clip format (Is411()/Is420()/... + stored chromaplacement)
+    // via the shared resolver (blend_common.h), which also drives Overlay/Layer.
     MaskMode mode = MASK444;
-    if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY()) {
-      const int sx = vi.GetPlaneWidthSubsampling(PLANAR_U);
-      const int sy = vi.GetPlaneHeightSubsampling(PLANAR_U);
-      if (sx == 2) {
-        mode = MASK411; // always center averaging
-      } else if (sx == 1 && sy == 1) {
-        switch (chromaplacement) {
-        case ChromaLocation_e::AVS_CHROMA_LEFT: mode = MASK420_MPEG2;   break;
-        case ChromaLocation_e::AVS_CHROMA_TOP_LEFT: mode = MASK420_TOPLEFT; break;
-        default: mode = MASK420; break; // center
-        }
-      } else if (sx == 1 && sy == 0) {
-        switch (chromaplacement) {
-        case ChromaLocation_e::AVS_CHROMA_LEFT:   mode = MASK422_MPEG2;   break;
-        case ChromaLocation_e::AVS_CHROMA_TOP_LEFT: mode = MASK422_TOPLEFT; break;
-        default: mode = MASK422; break; // center
-        }
-      }
+    if ((vi.IsYUV() || vi.IsYUVA()) && !vi.IsY() && !vi.IsYA()) {
+      if (!vi.Is444() && !vi.Is411() && !vi.Is440() && !vi.Is410() && !vi.Is420() && !vi.Is422())
+        throw AvisynthError("Antialiaser::Apply: unsupported chroma subsampling for text overlay");
+      // chromaplacement (raw ChromaLocation_e) -> Overlay/Layer's 3-bucket `placement`.
+      const int placement = (chromaplacement == ChromaLocation_e::AVS_CHROMA_CENTER) ? PLACEMENT_MPEG1
+        : (chromaplacement == ChromaLocation_e::AVS_CHROMA_TOP_LEFT) ? PLACEMENT_TOPLEFT
+        : PLACEMENT_MPEG2; // AVS_CHROMA_LEFT and anything else
+      mode = resolveChromaMaskMode(placement, vi);
     }
     switch (mode) {
     case MASK444:         CALL_SOA(MASK444);         break;
     case MASK411:         CALL_SOA(MASK411);         break;
+    case MASK411_TOPLEFT: CALL_SOA(MASK411_TOPLEFT); break;
+    case MASK440:         CALL_SOA(MASK440);         break;
+    case MASK440_TOPLEFT: CALL_SOA(MASK440_TOPLEFT); break;
+    case MASK410:         CALL_SOA(MASK410);         break;
+    case MASK410_TOPLEFT: CALL_SOA(MASK410_TOPLEFT); break;
     case MASK420:         CALL_SOA(MASK420);         break;
     case MASK420_MPEG2:   CALL_SOA(MASK420_MPEG2);   break;
     case MASK420_TOPLEFT: CALL_SOA(MASK420_TOPLEFT); break;
@@ -363,10 +378,12 @@ template<MaskMode maskMode, int bits_per_pixel>
 void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYTE* bufV, bool isRGB)
 {
   constexpr int shiftX =
-    (maskMode == MASK444) ? 0 :
-    (maskMode == MASK411) ? 2 : 1;
+    (maskMode == MASK444 || maskMode == MASK440 || maskMode == MASK440_TOPLEFT) ? 0 :
+    (maskMode == MASK411 || maskMode == MASK411_TOPLEFT || maskMode == MASK410 || maskMode == MASK410_TOPLEFT) ? 2 : 1;
   constexpr int shiftY =
-    (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT) ? 1 : 0;
+    (maskMode == MASK410 || maskMode == MASK410_TOPLEFT) ? 2 :
+    (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT ||
+     maskMode == MASK440 || maskMode == MASK440_TOPLEFT) ? 1 : 0;
   constexpr int stepX = 1 << shiftX;
   constexpr int stepY = 1 << shiftY;
 
@@ -827,9 +844,10 @@ std::string ShowCRC32::compute_crc_text(PVideoFrame& crc_frame, std::vector<uint
   PlaneEntry entries[4];
   int nentries = 0;
 
+  // IsYUVA includes IsYA
   if (crc_vi.IsYUV() || crc_vi.IsYUVA()) {
     entries[nentries++] = { PLANAR_Y, "Y", doY };
-    if (crc_vi.NumComponents() > 1) {
+    if (crc_vi.NumComponents() > 1 && !crc_vi.IsYA()) { // YA.NumComponents() == 2, so no U/V planes
       entries[nentries++] = { PLANAR_U, "U", doU };
       entries[nentries++] = { PLANAR_V, "V", doV };
     }
@@ -1390,15 +1408,18 @@ AVSValue __cdecl Subtitle::Create(AVSValue args, void*, IScriptEnvironment* env)
 
     VideoInfo vi = clip->GetVideoInfo();
     int ChromaLocation_In = -1;
-    if (vi.IsYV411()) {
+    if (vi.Is411() || vi.Is420() || vi.Is422() || vi.Is440() || vi.Is410() || vi.IsYUY2()) {
       auto frame0 = clip->GetFrame(0, env);
       const AVSMap* props = env->getFramePropsRO(frame0);
-      chromaloc_parse_merge_with_props(vi, placement_name, props, ChromaLocation_In, -1, env);
-    }
-    else if (vi.Is420() || vi.Is422() || vi.IsYUY2()) {
-      auto frame0 = clip->GetFrame(0, env);
-      const AVSMap* props = env->getFramePropsRO(frame0);
-      chromaloc_parse_merge_with_props(vi, placement_name, props, ChromaLocation_In, ChromaLocation_e::AVS_CHROMA_LEFT, env);
+      // For 4:1:1/4:4:0/4:1:0 (no standard siting convention) Antialiaser::Apply only
+      // distinguishes CENTER from everything else (collapsed to point-sample TOPLEFT),
+      // same as Overlay/Layer's own `placement` handling for these formats. Default
+      // matches convert_planar.cpp's chromaloc_default: 'left' for 411, 'top' for 440,
+      // 'top_left' for 410, 'left' otherwise (420/422/YUY2).
+      const int chromaloc_default = vi.Is440() ? ChromaLocation_e::AVS_CHROMA_TOP
+        : vi.Is410() ? ChromaLocation_e::AVS_CHROMA_TOP_LEFT
+        : ChromaLocation_e::AVS_CHROMA_LEFT;
+      chromaloc_parse_merge_with_props(vi, placement_name, props, ChromaLocation_In, chromaloc_default, env);
     }
 
     if ((align < 1) || (align > 9))
@@ -1825,17 +1846,19 @@ AVSValue __cdecl SimpleText::Create(AVSValue args, void*, IScriptEnvironment* en
   // "Text" filter will ignore invalid/not used definitions and use its defaults
   int ChromaLocation_In = -1; // invalid
 
-  if (vi.IsYV411()) {
-    // placement parameter exists, (default none/-1) + input frame properties; 'left'-ish _ChromaLocation is allowed, checked later
+  if (vi.Is411() || vi.Is420() || vi.Is422() || vi.Is440() || vi.Is410() || vi.IsYUY2()) {
+    // placement parameter is valid + input frame properties.
+    // For 4:1:1/4:4:0/4:1:0 (no standard siting convention) Antialiaser::Apply only
+    // distinguishes CENTER from everything else (collapsed to point-sample TOPLEFT),
+    // same as Overlay/Layer's own `placement` handling for these formats. Default
+    // matches convert_planar.cpp's chromaloc_default: 'left' for 411, 'top' for 440,
+    // 'top_left' for 410, 'left' otherwise (420/422/YUY2).
     auto frame0 = clip->GetFrame(0, env);
     const AVSMap* props = env->getFramePropsRO(frame0);
-    chromaloc_parse_merge_with_props(vi, placement_name, props, /* ref*/ChromaLocation_In, -1 /*default none chromaloc */, env);
-  }
-  else if (vi.Is420() || vi.Is422() || vi.IsYUY2()) {
-    // placement parameter is valid + input frame properties
-    auto frame0 = clip->GetFrame(0, env);
-    const AVSMap* props = env->getFramePropsRO(frame0);
-    chromaloc_parse_merge_with_props(vi, placement_name, props, /* ref*/ChromaLocation_In, ChromaLocation_e::AVS_CHROMA_LEFT /*default*/, env);
+    const int chromaloc_default = vi.Is440() ? ChromaLocation_e::AVS_CHROMA_TOP
+      : vi.Is410() ? ChromaLocation_e::AVS_CHROMA_TOP_LEFT
+      : ChromaLocation_e::AVS_CHROMA_LEFT;
+    chromaloc_parse_merge_with_props(vi, placement_name, props, /* ref*/ChromaLocation_In, chromaloc_default, env);
   }
 
   return new SimpleText(clip, text, real_x, real_y, first_frame, last_frame, font, size, text_color,

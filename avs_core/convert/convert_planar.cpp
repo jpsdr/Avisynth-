@@ -110,6 +110,7 @@ template void fill_chroma<float>(uint8_t * dstp_u, uint8_t * dstp_v, int height,
 // Legacy formats (packed RGB/YUY2) are handled uniformly inside.
 AVSValue __cdecl ConvertToPlanarGeneric::CreateY(AVSValue args, void* user_data, IScriptEnvironment* env) {
   bool only_8bit = reinterpret_cast<intptr_t>(user_data) == 0;
+  bool to_yuva = reinterpret_cast<intptr_t>(user_data) == 2; // "ConvertToYA": force/keep alpha (Y+Alpha target)
   PClip clip = args[0].AsClip();
 
   // 0    1       2      3
@@ -133,10 +134,10 @@ AVSValue __cdecl ConvertToPlanarGeneric::CreateY(AVSValue args, void* user_data,
       args[0], args[1], AVSValue(8), args[3]
     };
     AVSValue new_args_val(new_args, 4);
-    return Create(new_args_val, "ConvertToY", only_8bit, false /*to_yuva*/, env);
+    return Create(new_args_val, "ConvertToY", only_8bit, to_yuva, env);
   }
   else {
-    return Create(args, "ConvertToY", only_8bit, false /*to_yuva*/, env);
+    return Create(args, "ConvertToY", only_8bit, to_yuva, env);
   }
 }
 
@@ -172,6 +173,10 @@ ConvertRGBToYUV444::ConvertRGBToYUV444(PClip src, const char *matrix_name, bool 
   // target_bit_depth == -1: no conversion required
   const bool need_bitdepth_conversion = (target_bit_depth != -1);
 
+  isPlanarRGBfamily = vi.IsPlanarRGB() || vi.IsPlanarRGBA();
+  targetHasAlpha = vi.IsPlanarRGBA() || (keep_packedrgb_alpha && (vi.IsRGB32() || vi.IsRGB64()));
+  // for packed RGB it depends: ConvertToYUVAxxx()/ConvertToYA() can force an alpha target option
+
   // get alpha converter, GetFrame is using that if alpha must be depth-converterd and not only copied
   if (need_bitdepth_conversion)
   {
@@ -179,7 +184,7 @@ ConvertRGBToYUV444::ConvertRGBToYUV444(PClip src, const char *matrix_name, bool 
     // 8-16-bits any range to 8-16, 32 bits any range
     bitdepthConverted = true;
 
-    if (!to_y) { // single plane Y only has no alpha
+    if (!to_y || targetHasAlpha) { // single plane Y only has no alpha, unless Y+A requested
 #ifdef INTEL_INTRINSICS
       const bool sse2 = !!(env->GetCPUFlags() & CPUF_SSE2);
       const bool sse4 = !!(env->GetCPUFlags() & CPUF_SSE4_1);
@@ -201,22 +206,19 @@ ConvertRGBToYUV444::ConvertRGBToYUV444(PClip src, const char *matrix_name, bool 
     target_bit_depth = source_bit_depth;
   }
 
-  isPlanarRGBfamily = vi.IsPlanarRGB() || vi.IsPlanarRGBA();
-  targetHasAlpha = vi.IsPlanarRGBA() || (keep_packedrgb_alpha && (vi.IsRGB32() || vi.IsRGB64()));
-  // for packed RGB it depends: ConvertToYUVAxxx() can force YUVA target option
   if (isPlanarRGBfamily)
   {
     if (to_y) {
-      // --> Y
-      pixel_step =  -1;
+      // --> Y or Y+Alpha
+      pixel_step = targetHasAlpha ? -2 : -1;
       switch (target_bit_depth)
       {
-      case 8: vi.pixel_type = VideoInfo::CS_Y8; break;
-      case 10: vi.pixel_type = VideoInfo::CS_Y10; break;
-      case 12: vi.pixel_type = VideoInfo::CS_Y12; break;
-      case 14: vi.pixel_type = VideoInfo::CS_Y14; break;
-      case 16: vi.pixel_type = VideoInfo::CS_Y16; break;
-      case 32: vi.pixel_type = VideoInfo::CS_Y32; break;
+      case 8: vi.pixel_type = targetHasAlpha ? VideoInfo::CS_YA8 : VideoInfo::CS_Y8; break;
+      case 10: vi.pixel_type = targetHasAlpha ? VideoInfo::CS_YA10 : VideoInfo::CS_Y10; break;
+      case 12: vi.pixel_type = targetHasAlpha ? VideoInfo::CS_YA12 : VideoInfo::CS_Y12; break;
+      case 14: vi.pixel_type = targetHasAlpha ? VideoInfo::CS_YA14 : VideoInfo::CS_Y14; break;
+      case 16: vi.pixel_type = targetHasAlpha ? VideoInfo::CS_YA16 : VideoInfo::CS_Y16; break;
+      case 32: vi.pixel_type = targetHasAlpha ? VideoInfo::CS_YAS : VideoInfo::CS_Y32; break;
       }
     }
     else {
@@ -1365,7 +1367,7 @@ ConvertToPlanarGeneric::ConvertToPlanarGeneric(
   IScriptEnvironment* env) : 
   GenericVideoFilter(src), ChromaLocation_In(_ChromaLocation_In), ChromaLocation_Out(_ChromaLocation_Out)
 {
-  Yinput = vi.NumComponents() == 1;
+  Yinput = vi.IsY() || vi.IsYA();
   pixelsize = vi.ComponentSize();
 
   if (Yinput) {
@@ -1376,12 +1378,16 @@ ConvertToPlanarGeneric::ConvertToPlanarGeneric(
     return;
   }
 
-  // Y only output from any YUV: no chroma involved, GetFrame will snatch Y plane
+  // Y (or Y+Alpha) only output from any YUV: no chroma involved, GetFrame will snatch/copy the Y plane.
   if (dst_space == VideoInfo::CS_Y8 || dst_space == VideoInfo::CS_Y10 ||
     dst_space == VideoInfo::CS_Y12 || dst_space == VideoInfo::CS_Y14 || dst_space == VideoInfo::CS_Y16 ||
-    dst_space == VideoInfo::CS_Y32)
+    dst_space == VideoInfo::CS_Y32 ||
+    dst_space == VideoInfo::CS_YA8 || dst_space == VideoInfo::CS_YA10 ||
+    dst_space == VideoInfo::CS_YA12 || dst_space == VideoInfo::CS_YA14 || dst_space == VideoInfo::CS_YA16 ||
+    dst_space == VideoInfo::CS_YAS)
   {
     vi.pixel_type = dst_space;
+    Yinput = true;
     return;
   }
 
@@ -1452,7 +1458,7 @@ ConvertToPlanarGeneric::ConvertToPlanarGeneric(
         xdInV = 0.0f; ydInV = 1.0f; txdInV = 0.0f; tydInV = 0.5f; bxdInV = 0.0f; bydInV = 1.0f;
         break;
       default:
-        env->ThrowError("Convert: not supported ChromaPlacement for 4:2:0 input.");
+        env->ThrowError("Convert: unsupported ChromaPlacement for 4:2:0 input.");
     }
   }
   else if (vi.Is422()) {
@@ -1468,18 +1474,67 @@ ConvertToPlanarGeneric::ConvertToPlanarGeneric(
       xdInV = 0.0f; ydInV = 0.0f; txdInV = 0.0f; tydInV = 0.0f; bxdInV = 0.0f; bydInV = 0.0f;
       break;
     default:
-      env->ThrowError("Convert: not supported ChromaPlacement for 4:2:2 input.");
+      env->ThrowError("Convert: unsupported ChromaPlacement for 4:2:2 input.");
     }
   }
-  else if (vi.IsYV411()) {
-    if (ChromaLocation_In >= 0
-      && ChromaLocation_In != ChromaLocation_e::AVS_CHROMA_TOP_LEFT
-      && ChromaLocation_In != ChromaLocation_e::AVS_CHROMA_LEFT
-      && ChromaLocation_In != ChromaLocation_e::AVS_CHROMA_BOTTOM_LEFT
-      )
-    {
-      // if given, only the 'left'-ish versions are accepted, this is how it is treated
-      env->ThrowError("Convert: not supported ChromaPlacement for 4:1:1 input. Only 'left'-style is allowed if given.");
+  else if (vi.Is411()) {
+    switch (ChromaLocation_In) {
+    case ChromaLocation_e::AVS_CHROMA_CENTER:
+      xdInU = 1.5f; ydInU = 0.0f; txdInU = 1.5f; tydInU = 0.0f; bxdInU = 1.5f; bydInU = 0.0f;
+      xdInV = 1.5f; ydInV = 0.0f; txdInV = 1.5f; tydInV = 0.0f; bxdInV = 1.5f; bydInV = 0.0f;
+      break;
+    case ChromaLocation_e::AVS_CHROMA_TOP_LEFT:
+    case ChromaLocation_e::AVS_CHROMA_LEFT:
+    case ChromaLocation_e::AVS_CHROMA_BOTTOM_LEFT:
+      xdInU = 0.0f; ydInU = 0.0f; txdInU = 0.0f; tydInU = 0.0f; bxdInU = 0.0f; bydInU = 0.0f;
+      xdInV = 0.0f; ydInV = 0.0f; txdInV = 0.0f; tydInV = 0.0f; bxdInV = 0.0f; bydInV = 0.0f;
+      break;
+    default:
+      env->ThrowError("Convert: unsupported ChromaPlacement for 4:1:1 input.");
+    }
+  }
+  else if (vi.Is440()) {
+    // has no standard chroma siting HxV= 1x2
+    switch (ChromaLocation_In) {
+    case ChromaLocation_e::AVS_CHROMA_CENTER:
+      xdInU = 0.0f; ydInU = 0.5f; txdInU = 0.0f; tydInU = 0.25f; bxdInU = 0.0f; bydInU = 0.75f;
+      xdInV = 0.0f; ydInV = 0.5f; txdInV = 0.0f; tydInV = 0.25f; bxdInV = 0.0f; bydInV = 0.75f;
+      break;
+    case ChromaLocation_e::AVS_CHROMA_TOP:
+      // single point top (=top left, no H-subsampling here).
+      // Matches ffmpeg's swscale default
+      xdInU = 0.0f; ydInU = 0.0f; txdInU = 0.0f; tydInU = 0.0f; bxdInU = 0.0f; bydInU = 0.5f;
+      xdInV = 0.0f; ydInV = 0.0f; txdInV = 0.0f; tydInV = 0.0f; bxdInV = 0.0f; bydInV = 0.5f;
+      break;
+    default:
+      env->ThrowError("Convert: 4:4:0 has no standard chroma siting; only 'center' or 'top' is accepted for ChromaInPlacement.");
+    }
+  }
+  else if (vi.Is410()) {
+    // 410 has no standard chroma siting
+    // Field interlaced use: tyd/byd left flat (no top/bottom) since 410's 4 row chroma
+    // group can't be represented properly (not a single offset per field).
+    // This case _can_ occur in 420<->410 interlaced=true, since interlaced is set to false
+    // only if no 420 is involved. Nevertheless, it can't be correct.
+    switch (ChromaLocation_In) {
+    case ChromaLocation_e::AVS_CHROMA_CENTER:
+      // Center of a 4x4 luma block: 1.5 luma pixels shift like in 411 x-pos.
+      xdInU = 1.5f; ydInU = 1.5f; txdInU = 1.5f; tydInU = 1.5f; bxdInU = 1.5f; bydInU = 1.5f;
+      xdInV = 1.5f; ydInV = 1.5f; txdInV = 1.5f; tydInV = 1.5f; bxdInV = 1.5f; bydInV = 1.5f;
+      break;
+    case ChromaLocation_e::AVS_CHROMA_TOP_LEFT:
+    case ChromaLocation_e::AVS_CHROMA_TOP:
+    case ChromaLocation_e::AVS_CHROMA_LEFT:
+      // No standard convention on either axis for a 4x4 block, so unlike 420 there's no
+      // independently different "top-only" or "left-only" siting
+      // We treat "uncentered" names as top-left.
+      // Matches ffmpeg's swscale default.
+      // Field top/bottom kept flat, as with CENTER above.
+      xdInU = 0.0f; ydInU = 0.0f; txdInU = 0.0f; tydInU = 0.0f; bxdInU = 0.0f; bydInU = 0.0f;
+      xdInV = 0.0f; ydInV = 0.0f; txdInV = 0.0f; tydInV = 0.0f; bxdInV = 0.0f; bydInV = 0.0f;
+      break;
+    default:
+      env->ThrowError("Convert: 4:1:0 has no standard chroma siting; only 'center' or 'top_left' (also accepted as 'top'/'left') is accepted for ChromaInPlacement.");
     }
   }
   else if (ChromaLocation_In >= 0)
@@ -1531,7 +1586,7 @@ ConvertToPlanarGeneric::ConvertToPlanarGeneric(
       xdOutV = 0.0f; ydOutV = 1.0f; txdOutV = 0.0f; tydOutV = 0.5f; bxdOutV = 0.0f; bydOutV = 1.0f;
       break;
     default:
-      env->ThrowError("Convert: not supported ChromaPlacement for 4:2:0 output.");
+      env->ThrowError("Convert: unsupported ChromaPlacement for 4:2:0 output.");
     }
   }
   else if (vi.Is422()) {
@@ -1547,11 +1602,63 @@ ConvertToPlanarGeneric::ConvertToPlanarGeneric(
       xdOutV = 0.0f; ydOutV = 0.0f; txdOutV = 0.0f; tydOutV = 0.0f; bxdOutV = 0.0f; bydOutV = 0.0f;
       break;
     default:
-      env->ThrowError("Convert: not supported ChromaPlacement for 4:2:2 output.");
+      env->ThrowError("Convert: unsupported ChromaPlacement for 4:2:2 output.");
     }
   }
-  else if (ChromaLocation_Out >= 0)
-    env->ThrowError("Convert: Output ChromaPlacement only available with 4:2:0 or 4:2:2 output.");
+  else if (vi.Is411()) {
+    switch (ChromaLocation_Out) {
+    case ChromaLocation_e::AVS_CHROMA_CENTER:
+      // Midpoint of 4 luma pixels = 1.5 luma pixels shift
+      xdOutU = 1.5f; ydOutU = 0.0f; txdOutU = 1.5f; tydOutU = 0.0f; bxdOutU = 1.5f; bydOutU = 0.0f;
+      xdOutV = 1.5f; ydOutV = 0.0f; txdOutV = 1.5f; tydOutV = 0.0f; bxdOutV = 1.5f; bydOutV = 0.0f;
+      break;
+    case ChromaLocation_e::AVS_CHROMA_TOP_LEFT:
+    case ChromaLocation_e::AVS_CHROMA_LEFT:
+    case ChromaLocation_e::AVS_CHROMA_BOTTOM_LEFT:
+      xdOutU = 0.0f; ydOutU = 0.0f; txdOutU = 0.0f; tydOutU = 0.0f; bxdOutU = 0.0f; bydOutU = 0.0f;
+      xdOutV = 0.0f; ydOutV = 0.0f; txdOutV = 0.0f; tydOutV = 0.0f; bxdOutV = 0.0f; bydOutV = 0.0f;
+      break;
+    default:
+      env->ThrowError("Convert: unsupported ChromaPlacement for 4:1:1 output.");
+    }
+  }
+  else if (vi.Is440()) {
+    // top/bottom field split as 420, since 440 shares 420's Sub_Height_2 factor).
+    switch (ChromaLocation_Out) {
+    case ChromaLocation_e::AVS_CHROMA_CENTER:
+      xdOutU = 0.0f; ydOutU = 0.5f; txdOutU = 0.0f; tydOutU = 0.25f; bxdOutU = 0.0f; bydOutU = 0.75f;
+      xdOutV = 0.0f; ydOutV = 0.5f; txdOutV = 0.0f; tydOutV = 0.25f; bxdOutV = 0.0f; bydOutV = 0.75f;
+      break;
+    case ChromaLocation_e::AVS_CHROMA_TOP:
+      // Matches ffmpeg's swscale default
+      xdOutU = 0.0f; ydOutU = 0.0f; txdOutU = 0.0f; tydOutU = 0.0f; bxdOutU = 0.0f; bydOutU = 0.5f;
+      xdOutV = 0.0f; ydOutV = 0.0f; txdOutV = 0.0f; tydOutV = 0.0f; bxdOutV = 0.0f; bydOutV = 0.5f;
+      break;
+    default:
+      env->ThrowError("Convert: 4:4:0 has no standard chroma siting; only 'center' or 'top' is accepted for ChromaOutPlacement.");
+    }
+  }
+  else if (vi.Is410()) {
+    // see the Is410() input placement comments above.
+    switch (ChromaLocation_Out) {
+    case ChromaLocation_e::AVS_CHROMA_CENTER:
+      xdOutU = 1.5f; ydOutU = 1.5f; txdOutU = 1.5f; tydOutU = 1.5f; bxdOutU = 1.5f; bydOutU = 1.5f;
+      xdOutV = 1.5f; ydOutV = 1.5f; txdOutV = 1.5f; tydOutV = 1.5f; bxdOutV = 1.5f; bydOutV = 1.5f;
+      break;
+    case ChromaLocation_e::AVS_CHROMA_TOP_LEFT:
+    case ChromaLocation_e::AVS_CHROMA_TOP:
+    case ChromaLocation_e::AVS_CHROMA_LEFT:
+      // Matches ffmpeg's swscale default
+      xdOutU = 0.0f; ydOutU = 0.0f; txdOutU = 0.0f; tydOutU = 0.0f; bxdOutU = 0.0f; bydOutU = 0.0f;
+      xdOutV = 0.0f; ydOutV = 0.0f; txdOutV = 0.0f; tydOutV = 0.0f; bxdOutV = 0.0f; bydOutV = 0.0f;
+      break;
+    default:
+      env->ThrowError("Convert: 4:1:0 has no standard chroma siting; only 'center' or 'top_left' (also accepted as 'top'/'left') is accepted for ChromaOutPlacement.");
+    }
+  }
+  else if (ChromaLocation_Out >= 0) {
+    env->ThrowError("Convert: Output ChromaPlacement is invalid for this format.");
+  }
 
   const int xsOut = 1 << vi.GetPlaneWidthSubsampling(PLANAR_U);
   const int xmask = xsOut - 1;
@@ -1690,18 +1797,14 @@ PVideoFrame __stdcall ConvertToPlanarGeneric::GetFrame(int n, IScriptEnvironment
 
   return dst;
 }
-/*                                           0      1         2             3                  4            5       6         7       8       9
-{ "ConvertToYUV411",  BUILTIN_FUNC_PREFIX, "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[param1]f[param2]f[param3]f[bits]i[quality]b", ConvertToPlanarGeneric::CreateYV411, (void*)1 }, // alias for ConvertToYV411, 8 bit check later
-{ "ConvertToYUV444",  BUILTIN_FUNC_PREFIX, "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[param1]f[param2]f[param3]f[bits]i[quality]b", ConvertToPlanarGeneric::CreateYUV444, (void*)1 },
-{ "ConvertToYUVA444", BUILTIN_FUNC_PREFIX, "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[param1]f[param2]f[param3]f[bits]i[quality]b", ConvertToPlanarGeneric::CreateYUV444, (void*)2 },
-                                             0      1         2             3                   4            5                  6         7          8     9     10
-{ "ConvertToYUV420",  BUILTIN_FUNC_PREFIX, "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[ChromaOutPlacement]s[param1]f[param2]f[param3]f[bits]i[quality]b", ConvertToPlanarGeneric::CreateYUV420, (void*)1 },
-{ "ConvertToYUV422",  BUILTIN_FUNC_PREFIX, "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[ChromaOutPlacement]s[param1]f[param2]f[param3]f[bits]i[quality]b", ConvertToPlanarGeneric::CreateYUV422, (void*)1 },
-{ "ConvertToYUVA420", BUILTIN_FUNC_PREFIX, "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[ChromaOutPlacement]s[param1]f[param2]f[param3]f[bits]i[quality]b", ConvertToPlanarGeneric::CreateYUV420, (void*)2 },
-{ "ConvertToYUVA422", BUILTIN_FUNC_PREFIX, "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[ChromaOutPlacement]s[param1]f[param2]f[param3]f[bits]i[quality]b", ConvertToPlanarGeneric::CreateYUV422, (void*)2 },
-                                            0   1        2       3 
-{ "ConvertToY",       BUILTIN_FUNC_PREFIX, "c[matrix]s[bits]i[quality]b", ConvertToPlanarGeneric::CreateConvertToY, (void*)1 }, // user_data == 1 -> any bit depth sources
-
+/*
+Parameter variants: 444, subsampled YUV, Y only
+                      0      1         2             3                  4            5       6         7       8       9
+"ConvertToYUV444",   "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[param1]f[param2]f[param3]f[bits]i[quality]b"
+                      0      1         2             3                   4            5                  6         7          8     9       10
+"ConvertToYUV411",   "c[interlaced]b[matrix]s[ChromaInPlacement]s[chromaresample]s[ChromaOutPlacement]s[param1]f[param2]f[param3]f[bits]i[quality]b"
+                      0   1        2       3 
+"ConvertToY",        "c[matrix]s[bits]i[quality]b"
 */
 AVSValue ConvertToPlanarGeneric::Create(AVSValue& args, const char* filter, bool strip_alpha_legacy_8bit, bool to_yuva, IScriptEnvironment* env) {
   bool converted = false;
@@ -1712,7 +1815,9 @@ AVSValue ConvertToPlanarGeneric::Create(AVSValue& args, const char* filter, bool
   const bool to_y = strcmp(filter, "ConvertToY") == 0;
   const bool to_420 = strcmp(filter, "ConvertToYUV420") == 0;
   const bool to_422 = strcmp(filter, "ConvertToYUV422") == 0;
-  const bool to_411 = strcmp(filter, "ConvertToYV411") == 0;
+  const bool to_411 = strcmp(filter, "ConvertToYUV411") == 0;
+  const bool to_440 = strcmp(filter, "ConvertToYUV440") == 0;
+  const bool to_410 = strcmp(filter, "ConvertToYUV410") == 0;
   const bool to_444 = strcmp(filter, "ConvertToYUV444") == 0;
 
   if (vi.IsYUY2()) {
@@ -1729,7 +1834,8 @@ AVSValue ConvertToPlanarGeneric::Create(AVSValue& args, const char* filter, bool
     bits_arg = args[2];
     quality_arg = args[3];
   }
-  else if (to_420 || to_422) {
+  else if (to_420 || to_422 || to_411 || to_440 || to_410) {
+    // parameter index shift
     matrix_arg = args[2];
     bits_arg = args[9];
     quality_arg = args[10];
@@ -1757,6 +1863,17 @@ AVSValue ConvertToPlanarGeneric::Create(AVSValue& args, const char* filter, bool
   }
 
   if (vi.IsRGB()) { // packed or planar source
+    // Compatibility note:
+    // packed RGB32/64 behave differently from other alpha-aware formats (PlanarRGBA, YUVA*,
+    // YA) for the non-A-suffixed target names.
+    // PlanarRGBA/YUVA*/YA sources have their alpha preserved by ConvertToY/ConvertToYUVxxx
+    // even without the "A" suffix.
+    // But following a classic Avisynth behavior, packed RGB32/64's alpha is only kept when we
+    // explicitly ask for it via an A-suffixed target, to YUVA.
+    // Plain ConvertToY/ConvertToYUVxxx on a packed RGB32/64 source always drops alpha.
+    // This asymmetry is intentional, so use ConvertToPlanarRGBA first if you want a packed RGB
+    // source's alpha to survive a non A-suffixed conversion.
+    // (to_yuva also true for to_ya)
     const bool keep_packedrgb_alpha = to_yuva && (vi.IsRGB32() || vi.IsRGB64());
     // 3.7.6: We convert ALL packed RGB formats to planar RGB!
     // The only case where a RGB32->YV24 is a bit slower is: SSE2-only but no SSSE3 capable CPU.
@@ -1800,54 +1917,50 @@ AVSValue ConvertToPlanarGeneric::Create(AVSValue& args, const char* filter, bool
   else if (!vi.IsPlanar())
     env->ThrowError("%s: Can only convert from Planar YUV.", filter);
 
-  // YV411 has no 8+ bits variant.
-  // A bit depth changing YV411->YUV4xx conversion must be reversed: first convert th format keeping 8 bits,
-  // then do the bit-depth conversion.
-  if (needConvertFinalBitdepth && !vi.IsYV411()) {
-    // plain Invoke and no "new ConvertBits()": this detects and keeps source and target ranges
-    AVSValue new_args[2] = { clip, target_bits_per_pixel };
-    clip = env->Invoke("ConvertBits", AVSValue(new_args, 2)).AsClip();
-    vi = clip->GetVideoInfo();
-    needConvertFinalBitdepth = false;
-  }
-
   bits_per_pixel = vi.BitsPerComponent(); // rgb conversion or standalone ConvertBits() would alter it.
 
   int pixel_type = VideoInfo::CS_UNKNOWN;
   AVSValue outplacement = AVSValue(); // only for ConvertToYUV420 and ConvertToYUV422
 
-  bool hasAlpha = vi.NumComponents() == 4 && !strip_alpha_legacy_8bit;
-  bool shouldStripAlpha = vi.NumComponents() == 4 && strip_alpha_legacy_8bit;
-  bool shouldAddAlpha = vi.NumComponents() != 4 && to_yuva;
+  const bool vi_has_alpha = vi.IsYUVA() || vi.IsPlanarRGBA(); // IsYUVA includes Y+A
+  bool hasAlpha = vi_has_alpha && !strip_alpha_legacy_8bit;
+  bool shouldStripAlpha = vi_has_alpha && strip_alpha_legacy_8bit;
+  bool shouldAddAlpha = !vi_has_alpha && to_yuva;
   bool targethasAlpha = hasAlpha || shouldAddAlpha;
 
   int ChromaLocation_In = -1; // invalid. Chromalocation_e::AVS_CHROMALOCATION_UNUSED
   int ChromaLocation_Out = -1; // left as invalid for 444, and Y
 
-  if (vi.IsYV411()) {
-    // ChromaInPlacement parameter exists, (default none/-1) + input frame properties; 'left'-ish _ChromaLocation is allowed, checked later
+  if (vi.Is411() || vi.Is420() || vi.Is422() || vi.Is440() || vi.Is410()) {
+    // ChromaInPlacement parameter is valid + input frame properties.
+    // 4:4:0/4:1:0/4:1:1 have no standard siting convention; we default to
+    // the top-left equivalents (zero offset pixel sample) like ffmpeg's swscale.
+    // 'top' for 440, 'top_left' for 410, 'left' for 411
+    // Other formats get 'left' as well.
     auto frame0 = clip->GetFrame(0, env);
     const AVSMap* props = env->getFramePropsRO(frame0);
-    chromaloc_parse_merge_with_props(vi, args[3].AsString(nullptr), props, /* ref*/ChromaLocation_In, -1 /*default none chromaloc */, env);
-  }
-  else if (vi.Is420() || vi.Is422()) {
-    // ChromaInPlacement parameter is valid + input frame properties
-    auto frame0 = clip->GetFrame(0, env);
-    const AVSMap* props = env->getFramePropsRO(frame0);
-    chromaloc_parse_merge_with_props(vi, args[3].AsString(nullptr), props, /* ref*/ChromaLocation_In, ChromaLocation_e::AVS_CHROMA_LEFT /*default*/, env);
+    const int chromaloc_default = vi.Is440() ? ChromaLocation_e::AVS_CHROMA_TOP
+      : vi.Is410() ? ChromaLocation_e::AVS_CHROMA_TOP_LEFT
+      : ChromaLocation_e::AVS_CHROMA_LEFT;
+    chromaloc_parse_merge_with_props(vi, args[3].AsString(nullptr), props, /* ref*/ChromaLocation_In, chromaloc_default, env);
   }
 
   AVSValue param1;
   AVSValue param2;
   AVSValue param3;
-  if (to_420 || to_422) {
-    // ChromaOutPlacement parameter is valid
-    chromaloc_parse_merge_with_props(vi, args[5].AsString(nullptr), nullptr, /* ref*/ChromaLocation_Out, ChromaLocation_e::AVS_CHROMA_LEFT /*default*/, env);
+  if (to_420 || to_422 || to_411 || to_440 || to_410) {
+    // ChromaOutPlacement parameter is valid.
+    // See the matching ChromaLocation_In default comment above:
+    // 440 -> 'top', 410 -> 'top_left', 411 -> 'left'
+    const int chromaloc_out_default = to_440 ? ChromaLocation_e::AVS_CHROMA_TOP
+      : to_410 ? ChromaLocation_e::AVS_CHROMA_TOP_LEFT
+      : ChromaLocation_e::AVS_CHROMA_LEFT;
+    chromaloc_parse_merge_with_props(vi, args[5].AsString(nullptr), nullptr, /* ref*/ChromaLocation_Out, chromaloc_out_default, env);
     param1 = args[6];
     param2 = args[7];
     param3 = args[8];
   }
-  else if (to_444 || to_411) {
+  else if (to_444) {
     // No ChromaOutPlacement parameter, indexes skip back accordingly
     param1 = args[5];
     param2 = args[6];
@@ -1856,111 +1969,75 @@ AVSValue ConvertToPlanarGeneric::Create(AVSValue& args, const char* filter, bool
 
   // FIXME: no-op or almost no-op shortcuts won't exist even at 420-420 conversion if YUV-YUV matrix conversion is added
 
+  // possible shortcut: source and target match their subsampling, chroma placement and bit depth
+  // to_444: ChromaLocation_In/Out are both -1, so the placement check is OK as well
+  if (((to_420 && vi.Is420()) || (to_422 && vi.Is422()) || (to_411 && vi.Is411())
+    || (to_440 && vi.Is440()) || (to_410 && vi.Is410())
+    || (to_444 && vi.Is444()))
+    && ChromaLocation_In == ChromaLocation_Out
+    && !needConvertFinalBitdepth)
+  {
+    if (shouldStripAlpha)
+      return new RemoveAlphaPlane(clip, env);
+    if (shouldAddAlpha) {
+      // create with default alpha
+      clip = new AddAlphaPlane(clip, nullptr, 0.0f, false, env);
+      vi = clip->GetVideoInfo();
+    }
+    return clip;
+  }
+
+  // Build pixel_type from bit-arithmetic: CS_GENERIC_xxx | CS_Sample_Bits_N
+  int pixel_type_base = VideoInfo::CS_UNKNOWN;
   if (to_y) {
-    if (vi.IsY()) {
-      // After RGB->Y conversion or input as Y
+    if (vi.IsY() && !targethasAlpha) {
+      // After RGB->Y conversion or input as Y, and no alpha requested/to keep: nothing to do
       return clip;
     }
-    // planar YUV original, GetFrame will return Y
-    switch (bits_per_pixel)
-    {
-    case 8: pixel_type =  VideoInfo::CS_Y8; break;
-    case 10: pixel_type = VideoInfo::CS_Y10; break;
-    case 12: pixel_type = VideoInfo::CS_Y12; break;
-    case 14: pixel_type = VideoInfo::CS_Y14; break;
-    case 16: pixel_type = VideoInfo::CS_Y16; break;
-    case 32: pixel_type = VideoInfo::CS_Y32; break;
-    }
+    // planar YUV/Y/YA original, GetFrame will return Y or Y+A
+    pixel_type_base = targethasAlpha ? VideoInfo::CS_GENERIC_YA : VideoInfo::CS_GENERIC_Y;
   }
   else if (to_420) {
-    if (vi.Is420()) {
-      // possible shortcut
-      if (ChromaLocation_In == ChromaLocation_Out)
-      {
-        if (shouldStripAlpha)
-          return new RemoveAlphaPlane(clip, env);
-        if (shouldAddAlpha) {
-          // create with default alpha
-          clip = new AddAlphaPlane(clip, nullptr, 0.0f, false, env);
-          vi = clip->GetVideoInfo();
-        }
-        return clip;
-      }
-    }
-
     outplacement = args[5];
-    switch (vi.BitsPerComponent())
-    {
-    case 8 : pixel_type = targethasAlpha ? VideoInfo::CS_YUVA420 : VideoInfo::CS_YV12; break;
-    case 10: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA420P10 : VideoInfo::CS_YUV420P10; break;
-    case 12: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA420P12 : VideoInfo::CS_YUV420P12; break;
-    case 14: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA420P14 : VideoInfo::CS_YUV420P14; break;
-    case 16: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA420P16 : VideoInfo::CS_YUV420P16; break;
-    case 32: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA420PS  : VideoInfo::CS_YUV420PS; break;
-    }
+    pixel_type_base = targethasAlpha ? VideoInfo::CS_GENERIC_YUVA420 : VideoInfo::CS_GENERIC_YUV420;
   }
   else if (to_422) {
-    if (vi.Is422()) {
-      // possible shortcut
-      if (ChromaLocation_In == ChromaLocation_Out)
-      {
-        if (shouldStripAlpha)
-          return new RemoveAlphaPlane(clip, env);
-        if (shouldAddAlpha) {
-          // create with default alpha
-          clip = new AddAlphaPlane(clip, nullptr, 0.0f, false, env);
-          vi = clip->GetVideoInfo();
-        }
-        return clip;
-      }
-    }
-
     outplacement = args[5];
-    switch (bits_per_pixel)
-    {
-    case 8 : pixel_type = targethasAlpha ? VideoInfo::CS_YUVA422 : VideoInfo::CS_YV16; break;
-    case 10: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA422P10 : VideoInfo::CS_YUV422P10; break;
-    case 12: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA422P12 : VideoInfo::CS_YUV422P12; break;
-    case 14: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA422P14 : VideoInfo::CS_YUV422P14; break;
-    case 16: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA422P16 : VideoInfo::CS_YUV422P16; break;
-    case 32: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA422PS  : VideoInfo::CS_YUV422PS; break;
-    }
+    pixel_type_base = targethasAlpha ? VideoInfo::CS_GENERIC_YUVA422 : VideoInfo::CS_GENERIC_YUV422;
   }
   else if (to_444) {
-    if (vi.Is444()) {
-      if (shouldStripAlpha)
-        return new RemoveAlphaPlane(clip, env);
-      if (shouldAddAlpha) {
-        // create with default alpha
-        clip = new AddAlphaPlane(clip, nullptr, 0.0f, false, env);
-        vi = clip->GetVideoInfo();
-      }
-      return clip;
-    }
-
-    switch (bits_per_pixel)
-    {
-    case 8 : pixel_type = targethasAlpha ? VideoInfo::CS_YUVA444 : VideoInfo::CS_YV24; break;
-    case 10: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA444P10 : VideoInfo::CS_YUV444P10; break;
-    case 12: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA444P12 : VideoInfo::CS_YUV444P12; break;
-    case 14: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA444P14 : VideoInfo::CS_YUV444P14; break;
-    case 16: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA444P16 : VideoInfo::CS_YUV444P16; break;
-    case 32: pixel_type = targethasAlpha ? VideoInfo::CS_YUVA444PS  : VideoInfo::CS_YUV444PS; break;
-    }
+    // No ChromaOutPlacement parameter for 4:4:4, outplacement stays undefined.
+    pixel_type_base = targethasAlpha ? VideoInfo::CS_GENERIC_YUVA444 : VideoInfo::CS_GENERIC_YUV444;
   }
   else if (to_411) {
-    if (target_bits_per_pixel != 8)
-      env->ThrowError("%s: only bits=8 supported for YV411", filter);
-    if (vi.IsYV411()) return clip;
-    if(vi.ComponentSize()!=1)
-      env->ThrowError("%s: 8 bit input only", filter);
-
-    pixel_type = VideoInfo::CS_YV411;
+    outplacement = args[5];
+    pixel_type_base = targethasAlpha ? VideoInfo::CS_GENERIC_YUVA411 : VideoInfo::CS_GENERIC_YUV411;
+  }
+  else if (to_440) {
+    outplacement = args[5];
+    pixel_type_base = targethasAlpha ? VideoInfo::CS_GENERIC_YUVA440 : VideoInfo::CS_GENERIC_YUV440;
+  }
+  else if (to_410) {
+    outplacement = args[5];
+    pixel_type_base = targethasAlpha ? VideoInfo::CS_GENERIC_YUVA410 : VideoInfo::CS_GENERIC_YUV410;
   }
   else env->ThrowError("Convert: unknown filter '%s'.", filter);
 
-  if (pixel_type == VideoInfo::CS_UNKNOWN)
+  int new_bitdepth_bits = -1;
+  switch (bits_per_pixel)
+  {
+  case 8: new_bitdepth_bits = VideoInfo::CS_Sample_Bits_8; break;
+  case 10: new_bitdepth_bits = VideoInfo::CS_Sample_Bits_10; break;
+  case 12: new_bitdepth_bits = VideoInfo::CS_Sample_Bits_12; break;
+  case 14: new_bitdepth_bits = VideoInfo::CS_Sample_Bits_14; break;
+  case 16: new_bitdepth_bits = VideoInfo::CS_Sample_Bits_16; break;
+  case 32: new_bitdepth_bits = VideoInfo::CS_Sample_Bits_32; break;
+  }
+
+  if (new_bitdepth_bits == -1)
     env->ThrowError("%s: unsupported bit depth", filter);
+
+  pixel_type = pixel_type_base | new_bitdepth_bits;
 
   if (converted)
     clip = env->Invoke("Cache", AVSValue(clip)).AsClip();
@@ -1976,7 +2053,9 @@ AVSValue ConvertToPlanarGeneric::Create(AVSValue& args, const char* filter, bool
     ChromaLocation_Out,
     env);
 
-  // If still not converted, do it now (YV411->YUVxxx 8+ bits)
+  // If still not converted, do it now.
+  // YUV sources always come to here,
+  // RGB sources: ConvertRGBToYUV444 may have already done it and set bitdepthConverted==true above
   if (needConvertFinalBitdepth) {
     // plain Invoke and no "new ConvertBits()": this detects and keeps source and target ranges
     AVSValue new_args[2] = { clip, target_bits_per_pixel };
@@ -2007,6 +2086,18 @@ AVSValue __cdecl ConvertToPlanarGeneric::CreateYUV420(AVSValue args, void* user_
     return Create(new_args_val, "ConvertToYUV420", only_8bit, to_yuva, env);
   }
   return Create(args, "ConvertToYUV420", only_8bit, to_yuva, env);
+}
+
+AVSValue __cdecl ConvertToPlanarGeneric::CreateYUV440(AVSValue args, void* user_data, IScriptEnvironment* env) {
+  const bool only_8bit = false; // no such option
+  bool to_yuva = reinterpret_cast<intptr_t>(user_data) == 2;
+  return Create(args, "ConvertToYUV440", only_8bit, to_yuva, env);
+}
+
+AVSValue __cdecl ConvertToPlanarGeneric::CreateYUV410(AVSValue args, void* user_data, IScriptEnvironment* env) {
+  const bool only_8bit = false; // no such option
+  bool to_yuva = reinterpret_cast<intptr_t>(user_data) == 2;
+  return Create(args, "ConvertToYUV410", only_8bit, to_yuva, env);
 }
 
 AVSValue __cdecl ConvertToPlanarGeneric::CreateYUV422(AVSValue args, void* user_data, IScriptEnvironment* env) {
@@ -2050,21 +2141,24 @@ AVSValue __cdecl ConvertToPlanarGeneric::CreateYUV444(AVSValue args, void* user_
   return Create(args, "ConvertToYUV444", only_8bit, to_yuva, env);
 }
 
-AVSValue __cdecl ConvertToPlanarGeneric::CreateYV411(AVSValue args, void* user_data, IScriptEnvironment* env) {
+AVSValue __cdecl ConvertToPlanarGeneric::CreateYUV411(AVSValue args, void* user_data, IScriptEnvironment* env) {
   bool only_8bit = reinterpret_cast<intptr_t>(user_data) == 0;
   bool to_yuva = reinterpret_cast<intptr_t>(user_data) == 2;
-  // parameter index skip back by 1 compared to 420/422, no ChromaOutPlacement parameter, bits is at index 8 instead of 9
-  if (args[8].Defined() && args[8].AsInt() != 8)
-    env->ThrowError("ConvertToYV411: only 8 bit output supported, "
-      "no high bit depth YUV411 format exists.");
-  AVSValue new_args[10] = {
-    args[0], args[1], args[2], args[3], args[4],
-    args[5], args[6], args[7],
-    AVSValue(8),
-    args[9]
-  };
-  AVSValue new_args_val(new_args, 10);
-  return Create(new_args_val, "ConvertToYV411", only_8bit, to_yuva, env);
+  if (only_8bit) {
+    // "ConvertToYV411" syntax
+    if (args[9].Defined() && args[9].AsInt() != 8)
+      env->ThrowError("ConvertToYV411: only 8 bit output supported. "
+        "Use ConvertToYUV411 for higher bit depth.");
+    AVSValue new_args[11] = {
+      args[0], args[1], args[2], args[3], args[4],
+      args[5], args[6], args[7], args[8],
+      AVSValue(8), // bits forced to 8
+      args[10]
+    };
+    AVSValue new_args_val(new_args, 11); // named, lives until end of scope
+    return Create(new_args_val, "ConvertToYUV411", only_8bit, to_yuva, env);
+  }
+  return Create(args, "ConvertToYUV411", only_8bit, to_yuva, env);
 }
 
 AVSValue __cdecl ConvertToPlanarGeneric::CreateConvertToYUY2(AVSValue args, void*, IScriptEnvironment* env)

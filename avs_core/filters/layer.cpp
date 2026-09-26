@@ -563,7 +563,7 @@ Invert::Invert(PClip _child, const char* _channels, IScriptEnvironment* env)
       break;
     case 'A':
     case 'a':
-      doA = (vi.NumComponents() > 3);
+      doA = vi.IsYUVA() || vi.IsPlanarRGBA(); // includes Y+Alpha (2 components)
       break;
     case 'Y':
     case 'y':
@@ -571,11 +571,11 @@ Invert::Invert(PClip _child, const char* _channels, IScriptEnvironment* env)
       break;
     case 'U':
     case 'u':
-      doU = (vi.NumComponents() > 1);
+      doU = (vi.NumComponents() > 1) && !vi.IsYA(); // Y+Alpha has no chroma
       break;
     case 'V':
     case 'v':
-      doV = (vi.NumComponents() > 1);
+      doV = (vi.NumComponents() > 1) && !vi.IsYA(); // Y+Alpha has no chroma
       break;
     default:
       break;
@@ -939,8 +939,9 @@ ShowChannel::ShowChannel(PClip _child, const char* pixel_type, int _channel, ISc
   int orig_channel = channel;
 
   // A channel
+  // IsYUVA() is also true for YA()
   if ((channel == 3) && !vi.IsRGB32() && !vi.IsRGB64() && !vi.IsPlanarRGBA() && !vi.IsYUVA())
-    env->ThrowError("ShowAlpha: RGB32, RGB64, Planar RGBA or YUVA data only");
+    env->ThrowError("ShowAlpha: RGB32, RGB64, Planar RGBA, YUVA or YA data only");
 
   // R, G, B channel
   if ((channel >= 0) && (channel <= 2) && !vi.IsRGB())
@@ -950,8 +951,8 @@ ShowChannel::ShowChannel(PClip _child, const char* pixel_type, int _channel, ISc
   if ((channel >= 4) && (channel <= 6)) {
     if (!vi.IsYUV() && !vi.IsYUVA())
       env->ThrowError("Show%s: plane is valid only with YUV(A) source", ShowText[channel]);
-    if (channel != 4 && vi.IsY())
-      env->ThrowError("Show%s: invalid plane for greyscale source", ShowText[channel]);
+    if (channel != 4 && (vi.IsY() || vi.IsYA()))
+      env->ThrowError("Show%s: invalid plane for greyscale or Y+Alpha source", ShowText[channel]);
     channel -= 4; // map to 0,1,2
   }
 
@@ -1065,9 +1066,23 @@ ShowChannel::ShowChannel(PClip _child, const char* pixel_type, int _channel, ISc
         env->ThrowError("Show%s: width must be mod 2 for 4:2:2 target", ShowText[orig_channel]);
       }
     }
-    if (vi.IsYV411()) {
+    if (vi.Is411()) {
       if (vi.width & 3) {
         env->ThrowError("Show%s: width must be mod 4 for 4:1:1 target", ShowText[orig_channel]);
+      }
+    }
+    if (vi.Is440()) {
+      // 4:4:0 has no horizontal chroma subsampling, so no width constraint here.
+      if (vi.height & 1) {
+        env->ThrowError("Show%s: height must be mod 2 for 4:4:0 target", ShowText[orig_channel]);
+      }
+    }
+    if (vi.Is410()) {
+      if (vi.width & 3) {
+        env->ThrowError("Show%s: width must be mod 4 for 4:1:0 target", ShowText[orig_channel]);
+      }
+      if (vi.height & 3) {
+        env->ThrowError("Show%s: height must be mod 4 for 4:1:0 target", ShowText[orig_channel]);
       }
     }
 
@@ -2651,7 +2666,9 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     else {
       // not Lighten, Darken, or mulovr — process planes individually.
       // Add (Subtract is pre-inverted Add), Fast, Mul will follow
-      const int maxPlanes = std::min(vi.NumComponents(), 3); // intentionally do not process alpha plane
+      // intentionally do not process alpha plane here (handled elsewhere)
+      // YA is using only PLANAR_Y (index 0)
+      const int maxPlanes = vi.IsYA() ? 1 : std::min(vi.NumComponents(), 3);
       const int planesYUV[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
       for (int channel = 0; channel < maxPlanes; channel++)
       {
