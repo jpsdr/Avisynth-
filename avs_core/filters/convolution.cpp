@@ -354,7 +354,7 @@ GeneralConvolution::GeneralConvolution(PClip _child, double _divisor, float _nBi
   bool _autoscale, bool _luma, bool _chroma, bool _alpha, IScriptEnvironment* _env)
   : GenericVideoFilter(_child), divisor(_divisor), nBias((int)_nBias), fBias(_nBias), autoscale(_autoscale), luma(_luma), chroma(_chroma), alpha(_alpha)
 {
-  if (vi.Is420() || vi.Is422() || vi.IsYV411()) {
+  if (vi.Is420() || vi.Is422() || vi.Is411() || vi.Is440() || vi.Is410()) {
     if (luma && chroma)
       _env->ThrowError("GeneralConvolution: both luma and chroma cannot be set for subsampled video formats");
   }
@@ -579,9 +579,10 @@ PVideoFrame __stdcall GeneralConvolution::GetFrame(int n, IScriptEnvironment* en
   const int *matrix = iMatrix.data();
   const float *matrixf = fMatrix.data();
 
-  int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-  int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
-  int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
+  int planes_yuva[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+  int planes_ya[2]   = { PLANAR_Y, PLANAR_A };
+  int planes_r[4]    = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+  int *planes = vi.IsYA() ? planes_ya : (vi.IsYUV() || vi.IsYUVA()) ? planes_yuva : planes_r;
   for (int p = 0; p < vi.NumComponents(); ++p) {
     const int plane = planes[p];
     if ((plane == PLANAR_Y && !luma) ||

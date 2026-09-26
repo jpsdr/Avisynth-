@@ -4405,7 +4405,7 @@ PVideoFrame ScriptEnvironment::NewVideoFrameOnDevice(const VideoInfo& vi, int al
     case VideoInfo::CS_YUV420PS:
     case VideoInfo::CS_YUV422PS:
     case VideoInfo::CS_YUV444PS:
-    case VideoInfo::CS_Y32:
+    case VideoInfo::CS_YS:
         // 16 bit/sample packed RGB
     case VideoInfo::CS_BGR48:
     case VideoInfo::CS_BGR64:
@@ -4442,6 +4442,54 @@ PVideoFrame ScriptEnvironment::NewVideoFrameOnDevice(const VideoInfo& vi, int al
     case VideoInfo::CS_YUVA420PS:
     case VideoInfo::CS_YUVA422PS:
     case VideoInfo::CS_YUVA444PS:
+        // planar 4:4:0
+    case VideoInfo::CS_YUV440:
+    case VideoInfo::CS_YUV440P10:
+    case VideoInfo::CS_YUV440P12:
+    case VideoInfo::CS_YUV440P14:
+    case VideoInfo::CS_YUV440P16:
+    case VideoInfo::CS_YUV440PS:
+        // planar 4:4:0:A
+    case VideoInfo::CS_YUVA440:
+    case VideoInfo::CS_YUVA440P10:
+    case VideoInfo::CS_YUVA440P12:
+    case VideoInfo::CS_YUVA440P14:
+    case VideoInfo::CS_YUVA440P16:
+    case VideoInfo::CS_YUVA440PS:
+        // planar 4:1:1
+    case VideoInfo::CS_YUV411P10:
+    case VideoInfo::CS_YUV411P12:
+    case VideoInfo::CS_YUV411P14:
+    case VideoInfo::CS_YUV411P16:
+    case VideoInfo::CS_YUV411PS:
+        // planar 4:1:1:A
+    case VideoInfo::CS_YUVA411:
+    case VideoInfo::CS_YUVA411P10:
+    case VideoInfo::CS_YUVA411P12:
+    case VideoInfo::CS_YUVA411P14:
+    case VideoInfo::CS_YUVA411P16:
+    case VideoInfo::CS_YUVA411PS:
+        // planar 4:1:0
+    case VideoInfo::CS_YUV410:
+    case VideoInfo::CS_YUV410P10:
+    case VideoInfo::CS_YUV410P12:
+    case VideoInfo::CS_YUV410P14:
+    case VideoInfo::CS_YUV410P16:
+    case VideoInfo::CS_YUV410PS:
+        // planar 4:1:0:A
+    case VideoInfo::CS_YUVA410:
+    case VideoInfo::CS_YUVA410P10:
+    case VideoInfo::CS_YUVA410P12:
+    case VideoInfo::CS_YUVA410P14:
+    case VideoInfo::CS_YUVA410P16:
+    case VideoInfo::CS_YUVA410PS:
+        // Y+α 4:0:0:A
+    case VideoInfo::CS_YA8:
+    case VideoInfo::CS_YA10:
+    case VideoInfo::CS_YA12:
+    case VideoInfo::CS_YA14:
+    case VideoInfo::CS_YA16:
+    case VideoInfo::CS_YAS:
         break;
     default:
       ThrowError("Filter Error: Filter attempted to create VideoFrame with invalid pixel_type.");
@@ -4450,7 +4498,13 @@ PVideoFrame ScriptEnvironment::NewVideoFrameOnDevice(const VideoInfo& vi, int al
   PVideoFrame retval;
 
   if (vi.IsPlanar() && (vi.NumComponents() > 1)) {
-    if (vi.IsYUV() || vi.IsYUVA()) {
+    if (vi.IsYA()) {
+      // NumComponents == 2, special Y+A, 
+      // no chroma plane: row_sizeUV/heightUV are passed as 0
+      // => offsetU==offsetV==offsetA, U/V pointers are still valid, but since rowsize is 0
+      // they will never be used (let's hope so).
+      retval = NewPlanarVideoFrame(vi.RowSize(PLANAR_Y), vi.height, 0, 0, align, !vi.IsVPlaneFirst(), true /*alpha*/, vi.pixel_type, device);
+    } else if (vi.IsYUV() || vi.IsYUVA()) {
       // Planar requires different math ;)
       const int xmod  = 1 << vi.GetPlaneWidthSubsampling(PLANAR_U);
       const int xmask = xmod - 1;
@@ -4519,8 +4573,8 @@ bool ScriptEnvironment::MakeWritable(PVideoFrame* pvf) {
     const int height = vf->GetHeight();
 
     bool alpha = 0 != vf->GetPitch(PLANAR_A);
-    if (vf->GetPitch(PLANAR_U)) {  // we have no videoinfo, so we assume that it is Planar if it has a U plane.
-      const int row_sizeUV = vf->GetRowSize(PLANAR_U); // for Planar RGB this returns row_sizeUV which is the same for all planes
+    if (vf->GetPitch(PLANAR_U) || alpha) {  // we have no videoinfo, so we assume that it is Planar if it has a U or (Y+)Alpha plane.
+      const int row_sizeUV = vf->GetRowSize(PLANAR_U); // for Planar RGB this returns row_sizeUV which is the same for all planes; 0 for Y+Alpha (no chroma)
       const int heightUV = vf->GetHeight(PLANAR_U);
       dst = NewPlanarVideoFrame(row_size, height, row_sizeUV, heightUV, frame_align, false /* always V first on internal images */, alpha, vf->pixel_type, device);
     }

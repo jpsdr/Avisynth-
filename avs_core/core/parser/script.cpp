@@ -367,6 +367,12 @@ extern const AVSFunction Script_functions[] = {
   /*
   { "IsArrayOf", BUILTIN_FUNC_PREFIX, ".s", IsArrayOf },
   */
+
+  { "Is440",  BUILTIN_FUNC_PREFIX, "c", Is440 },
+  { "IsYA",   BUILTIN_FUNC_PREFIX, "c", IsYA },
+  { "Is410",  BUILTIN_FUNC_PREFIX, "c", Is410 },
+  { "Is411",  BUILTIN_FUNC_PREFIX, "c", Is411 },
+
   { 0 }
 };
 
@@ -1554,6 +1560,7 @@ static const std::map<int, std::string> pixel_format_table =
   {VideoInfo::CS_YUV422PS , "YUV422PS"},
   {VideoInfo::CS_YUV444PS , "YUV444PS"},
   {VideoInfo::CS_Y32      , "Y32"},
+  {VideoInfo::CS_YS       , "YS"},
 
   {VideoInfo::CS_BGR48    , "RGB48"},
   {VideoInfo::CS_BGR64    , "RGB64"},
@@ -1590,6 +1597,54 @@ static const std::map<int, std::string> pixel_format_table =
   {VideoInfo::CS_RGBAP14   , "RGBAP14"},
   {VideoInfo::CS_RGBAP16   , "RGBAP16"},
   {VideoInfo::CS_RGBAPS    , "RGBAPS"},
+
+  {VideoInfo::CS_YUV440    , "YUV440"},
+  {VideoInfo::CS_YUV440P10 , "YUV440P10"},
+  {VideoInfo::CS_YUV440P12 , "YUV440P12"},
+  {VideoInfo::CS_YUV440P14 , "YUV440P14"},
+  {VideoInfo::CS_YUV440P16 , "YUV440P16"},
+  {VideoInfo::CS_YUV440PS  , "YUV440PS"},
+
+  {VideoInfo::CS_YUVA440    , "YUVA440"},
+  {VideoInfo::CS_YUVA440P10 , "YUVA440P10"},
+  {VideoInfo::CS_YUVA440P12 , "YUVA440P12"},
+  {VideoInfo::CS_YUVA440P14 , "YUVA440P14"},
+  {VideoInfo::CS_YUVA440P16 , "YUVA440P16"},
+  {VideoInfo::CS_YUVA440PS  , "YUVA440PS"},
+
+  {VideoInfo::CS_YUV411P10 , "YUV411P10"},
+  {VideoInfo::CS_YUV411P12 , "YUV411P12"},
+  {VideoInfo::CS_YUV411P14 , "YUV411P14"},
+  {VideoInfo::CS_YUV411P16 , "YUV411P16"},
+  {VideoInfo::CS_YUV411PS  , "YUV411PS"},
+
+  {VideoInfo::CS_YUVA411    , "YUVA411"},
+  {VideoInfo::CS_YUVA411P10 , "YUVA411P10"},
+  {VideoInfo::CS_YUVA411P12 , "YUVA411P12"},
+  {VideoInfo::CS_YUVA411P14 , "YUVA411P14"},
+  {VideoInfo::CS_YUVA411P16 , "YUVA411P16"},
+  {VideoInfo::CS_YUVA411PS  , "YUVA411PS"},
+
+  {VideoInfo::CS_YUV410    , "YUV9"},
+  {VideoInfo::CS_YUV410P10 , "YUV410P10"},
+  {VideoInfo::CS_YUV410P12 , "YUV410P12"},
+  {VideoInfo::CS_YUV410P14 , "YUV410P14"},
+  {VideoInfo::CS_YUV410P16 , "YUV410P16"},
+  {VideoInfo::CS_YUV410PS  , "YUV410PS"},
+
+  {VideoInfo::CS_YUVA410    , "YUVA410"},
+  {VideoInfo::CS_YUVA410P10 , "YUVA410P10"},
+  {VideoInfo::CS_YUVA410P12 , "YUVA410P12"},
+  {VideoInfo::CS_YUVA410P14 , "YUVA410P14"},
+  {VideoInfo::CS_YUVA410P16 , "YUVA410P16"},
+  {VideoInfo::CS_YUVA410PS  , "YUVA410PS"},
+
+  {VideoInfo::CS_YA8,  "YA8"},
+  {VideoInfo::CS_YA10, "YA10"},
+  {VideoInfo::CS_YA12, "YA12"},
+  {VideoInfo::CS_YA14, "YA14"},
+  {VideoInfo::CS_YA16, "YA16"},
+  {VideoInfo::CS_YAS,  "YAS"}
 };
 
 static const std::multimap<int, std::string> pixel_format_table_ex =
@@ -1598,6 +1653,7 @@ static const std::multimap<int, std::string> pixel_format_table_ex =
   {VideoInfo::CS_YV16 , "YUV422"},
   {VideoInfo::CS_YV12 , "YUV420"},
   {VideoInfo::CS_YV411, "YUV411"},
+  {VideoInfo::CS_YUV410, "YUV410"},
   {VideoInfo::CS_RGBP , "RGBP8"},
   {VideoInfo::CS_RGBAP, "RGBAP8"},
   {VideoInfo::CS_YV24 , "YUV444P8"},
@@ -1607,6 +1663,28 @@ static const std::multimap<int, std::string> pixel_format_table_ex =
   {VideoInfo::CS_YUVA420, "YUVA420P8"},
   {VideoInfo::CS_YUVA422, "YUVA422P8"},
   {VideoInfo::CS_YUVA444, "YUVA444P8"},
+  {VideoInfo::CS_YUV440 , "YUV440P8"},
+  {VideoInfo::CS_YUVA440, "YUVA440P8"},
+  {VideoInfo::CS_YUVA411, "YUVA411P8"},
+  {VideoInfo::CS_YUV410,  "YUV410P8"},
+  {VideoInfo::CS_YUVA410, "YUVA410P8"},
+  {VideoInfo::CS_Y32,  "YS"},
+  {VideoInfo::CS_YS,   "YF32"},
+  {VideoInfo::CS_YAS,  "YAF32"},
+  {VideoInfo::CS_YUV420PS,  "YUV420PF32"},
+  {VideoInfo::CS_YUV422PS,  "YUV422PF32"},
+  {VideoInfo::CS_YUV444PS,  "YUV444PF32"},
+  {VideoInfo::CS_RGBPS   ,  "RGBPF32"},
+  {VideoInfo::CS_YUVA420PS, "YUVA420PF32"},
+  {VideoInfo::CS_YUVA422PS, "YUVA422PF32"},
+  {VideoInfo::CS_YUVA444PS, "YUVA444PF32"},
+  {VideoInfo::CS_RGBAPS   , "RGBAPF32"},
+  {VideoInfo::CS_YUV440PS , "YUV440PF32"},
+  {VideoInfo::CS_YUVA440PS, "YUVA440PF32"},
+  {VideoInfo::CS_YUV411PS , "YUV411PF32"},
+  {VideoInfo::CS_YUVA411PS, "YUVA411PF32"},
+  {VideoInfo::CS_YUV410PS , "YUV410PF32"},
+  {VideoInfo::CS_YUVA410PS, "YUVA410PF32"}
 };
 
 const char *GetPixelTypeName(const int pixel_type)
@@ -2477,11 +2555,12 @@ AVSValue IsFloatUvZeroBased(AVSValue args, void*, IScriptEnvironment*)
 AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
 {
   //  { "BuildPixelType", BUILTIN_FUNC_PREFIX, "[family]s[bits]i[chroma]i[compat]b[oldnames]b[sample_clip]c", BuildPixelType }, // 180517-
-  // family: YUV, YUVA, RGB, RGBA, Y
+  // family: YUV, YUVA, RGB, RGBA, Y, YA
   // bits: 8, 10, 12, 14, 16, 32
-  // chroma: for YUV(A) 420,422,444,411. Ignored for RGB(A) and Y
+  // chroma: for YUV(A) 420,422,444,411,440,410. Ignored for RGB(A), Y and YA
   // compat (default false): returns packed rgb formats for 8/16 bits (RGB default: planar RGB)
-  // oldnames (default false): returns YV12/YV16/YV24 instead of YUV420P8/YUV422P8/YUV444P8
+  // oldnames (default false): returns YV12/YV16/YV24/YV411/YUV9 instead of
+  // YUV420P8/YUV422P8/YUV444P8/YUV411P8/YUV410P8 (no legacy short name for YUV440)
   // sample_clip: when supported, its format is overridden by specified parameters (e.g. only change bits=10)
 
   const bool hasTemplate = args[5].Defined();
@@ -2495,8 +2574,10 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
   if (!args[0].Defined() && hasTemplate) {
     // no family parameter: use template
     VideoInfo const &vi = args[5].AsClip()->GetVideoInfo();
-    if (vi.IsY())
+    if (vi.IsY()) // Must be checked before IsYUV
       family = "Y";
+    else if (vi.IsYA()) // Must be checked before IsYUVA
+      family = "YA";
     else if (vi.IsPlanar()) {
       if (vi.IsYUV())
         family = "YUV";
@@ -2526,8 +2607,9 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
   const bool isRGB = family == "RGB";
   const bool isRGBA = family == "RGBA";
   const bool isY = family == "Y";
+  const bool isYA = family == "YA";
 
-  if(!isYUV && !isYUVA && !isRGB && !isRGBA && !isY)
+  if(!isYUV && !isYUVA && !isRGB && !isRGBA && !isY && !isYA)
     env->ThrowError("BuildPixelType error: wrong 'family'.", family.c_str());
 
   int bits;
@@ -2553,6 +2635,8 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
       else if (hs == 1 && vs == 0) chroma = 422;
       else if (hs == 1 && vs == 1) chroma = 420;
       else if (hs == 2 && vs == 0) chroma = 411;
+      else if (hs == 0 && vs == 1) chroma = 440;
+      else if (hs == 2 && vs == 2) chroma = 410;
       else
         env->ThrowError("BuildPixelType error: sample_clip has invalid chroma subsampling.");
     }
@@ -2564,8 +2648,8 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
     chroma = 444; // n/a
   }
 
-  if(chroma != 444 && chroma != 422 && chroma != 420 && chroma != 411)
-    env->ThrowError("BuildPixelType error: 'chroma' must be 444, 422, 420 or 411.");
+  if(chroma != 444 && chroma != 422 && chroma != 420 && chroma != 411 && chroma != 440 && chroma != 410)
+    env->ThrowError("BuildPixelType error: 'chroma' must be 444, 422, 420, 411, 440 or 410.");
 
   // packed RGB compatibility formats only for RGB(A)
   const bool compat = isRGB || isRGBA ? args[3].AsBool(false) : false;
@@ -2575,9 +2659,6 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
 
   if(compat && bits != 8 && bits != 16)
     env->ThrowError("BuildPixelType error: 'compat'=true requires bits=8 or 16 for RGB(A).");
-
-  if(chroma == 411 && bits != 8)
-    env->ThrowError("BuildPixelType error: 411 is supported only for 8 bits.");
 
   if (compat) {
     if (isRGB && bits == 8)
@@ -2591,7 +2672,7 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
 
   std::string format;
 
-  if (isYUV || isYUVA || isY)
+  if (isYUV || isYUVA || isY || isYA)
     format = family;
   else if (isRGB)
     format = "RGBP";
@@ -2607,12 +2688,16 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
       format += "420";
     else if (chroma == 411)
       format += "411";
+    else if (chroma == 440)
+      format += "440";
+    else if (chroma == 410)
+      format += "410";
 
     format = format + "P";
   }
 
   if (bits == 32)
-      format += (isY ? "32" : "S"); // no "YS", only "Y32"
+    format += (isY ? "32" : "S"); // no "YS", only "Y32", though the alias exists
   else
     format = format + std::to_string(bits);
 
@@ -2620,10 +2705,10 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
     if (format == "YUV420" || format == "YUV420P8") format = "YV12";
     else if (format == "YUV422" || format == "YUV422P8") format = "YV16";
     else if (format == "YUV444" || format == "YUV444P8") format = "YV24";
+    else if (format == "YUV411" || format == "YUV411P8") format = "YV411";
+    else if (format == "YUV410" || format == "YUV410P8") format = "YUV9";
+    // no legacy short name for YUV440
   }
-
-  // 411 has no alternative naming
-  if (format == "YUV411") format = "YV411";
 
   return env->SaveString(format.c_str());
 }
@@ -3012,3 +3097,7 @@ AVSValue ArraySort(AVSValue args, void* user_data, IScriptEnvironment* env)
   return AVSValue(new_val.data(), size);
 }
 
+AVSValue Is440(AVSValue args, void*, IScriptEnvironment*) {  return VI(args[0]).Is440(); }
+AVSValue IsYA(AVSValue args, void*, IScriptEnvironment*)  {  return VI(args[0]).IsYA(); }
+AVSValue Is410(AVSValue args, void*, IScriptEnvironment*) {  return VI(args[0]).Is410(); }
+AVSValue Is411(AVSValue args, void*, IScriptEnvironment*) {  return VI(args[0]).Is411(); }

@@ -1088,7 +1088,7 @@ STDMETHODIMP_(LONG) CAVIStreamSynth::Info(AVISTREAMINFOW *psi, LONG lSize) {
       else // all 8+ bit planar RGB(A) is converted to RGB64
         vi_final.pixel_type = VideoInfo::CS_BGR64;
     }
-    // silent mapping of 12/14 bit YUV formats to 16 bit
+    // silent mapping of 12/14/32F bit YUV formats to 16 bit
     if (vi->pixel_type == VideoInfo::CS_YUV420P12 || vi->pixel_type == VideoInfo::CS_YUV420P14 || vi->pixel_type == VideoInfo::CS_YUV420PS)
       vi_final.pixel_type = VideoInfo::CS_YUV420P16;
     else if (vi->pixel_type == VideoInfo::CS_YUV422P12 || vi->pixel_type == VideoInfo::CS_YUV422P14 || vi->pixel_type == VideoInfo::CS_YUV422PS)
@@ -1097,6 +1097,13 @@ STDMETHODIMP_(LONG) CAVIStreamSynth::Info(AVISTREAMINFOW *psi, LONG lSize) {
       vi_final.pixel_type = VideoInfo::CS_YUV444P16;
     else if (vi->pixel_type == VideoInfo::CS_YUVA444P10 || vi->pixel_type == VideoInfo::CS_YUVA444P12 || vi->pixel_type == VideoInfo::CS_YUVA444P14 || vi->pixel_type == VideoInfo::CS_YUVA444PS)
       vi_final.pixel_type = VideoInfo::CS_YUVA444P16;
+    // Silent mapping of >8 bit YUV 4:1:1 / 4:1:0 / 4:4:0 formats to 8-bit
+    else if (vi->BitsPerComponent() > 8 && vi->Is411())
+      vi_final.pixel_type = VideoInfo::CS_YUV411;
+    else if (vi->BitsPerComponent() > 8 && vi->Is410())
+      vi_final.pixel_type = VideoInfo::CS_YUV410; // aka YUV9
+    else if (vi->BitsPerComponent() > 8 && vi->Is440())
+      vi_final.pixel_type = VideoInfo::CS_YUV440;
     // -- pixel_type change end
 
     const int image_size = parent->ImageSize(&vi_final);
@@ -1161,6 +1168,12 @@ STDMETHODIMP_(LONG) CAVIStreamSynth::Info(AVISTREAMINFOW *psi, LONG lSize) {
       asi.fccHandler = MAKEFOURCC('G','4',0,14);
     else if (vi_final.pixel_type == VideoInfo::CS_RGBAP16)
       asi.fccHandler = MAKEFOURCC('G','4',0,16);
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV410)
+      asi.fccHandler = MAKEFOURCC('Y', 'V', 'U', '9');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV440)
+      asi.fccHandler = MAKEFOURCC('I', '4', '4', '0'); // no V-first FourCC exists for 4:4:0; ReadFrame() writes U-then-V for this tag
+    else if (vi_final.pixel_type == VideoInfo::CS_YA8)
+      asi.fccHandler = MAKEFOURCC('Y', '2', 0, 8); // ffmpeg AV_PIX_FMT_YA8, packed Y,A interleaved
     else {
       // fixme: YUVA420P8, grey 10+ bits such as Y16 are not covered
       _ASSERT(FALSE);
@@ -1212,6 +1225,14 @@ void CAVIStreamSynth::ReadFrame(void* lpBuffer, int n) {
   {
     // silent mapping of 12/14bit/float YUV420/422 formats to 16 bits
     AVSValue new_args[2] = { parent->filter_graph, 16 };
+    PClip newClip = parent->env->Invoke("ConvertBits", AVSValue(new_args, 2)).AsClip();
+    frame = newClip->GetFrame(n, parent->env);
+    vi = newClip->GetVideoInfo();
+  }
+  else if ((vi.Is411() || vi.Is410() || vi.Is440()) && vi.BitsPerComponent() > 8) {
+    // silent mapping of >8 bit YUV 4:1:1 / 4:1:0 / 4:4:0 formats to 8 bits.
+    // Check also: fccHandler/ImageSize downgrade to YV411/YUV410P8/YUV440P8 already done in GetStreamInfo()
+    AVSValue new_args[2] = { parent->filter_graph, 8 };
     PClip newClip = parent->env->Invoke("ConvertBits", AVSValue(new_args, 2)).AsClip();
     frame = newClip->GetFrame(n, parent->env);
     vi = newClip->GetVideoInfo();
@@ -1282,6 +1303,15 @@ void CAVIStreamSynth::ReadFrame(void* lpBuffer, int n) {
     return;
   }
 
+  // Y2[0][8] packed Y,A interleaved (8 bit Y+Alpha)
+  if (vi.pixel_type == VideoInfo::CS_YA8) {
+    planar_ya8_to_packed_ya8((BYTE *)lpBuffer,
+      frame->GetReadPtr(PLANAR_Y), frame->GetPitch(PLANAR_Y),
+      frame->GetReadPtr(PLANAR_A), frame->GetPitch(PLANAR_A),
+      vi.width, vi.height);
+    return;
+  }
+
   const int pitch    = frame->GetPitch();
   const int row_size = frame->GetRowSize();
   const int height   = frame->GetHeight();
@@ -1317,6 +1347,12 @@ void CAVIStreamSynth::ReadFrame(void* lpBuffer, int n) {
       // (PLANAR_G)
       plane1 = PLANAR_B;
       plane2 = PLANAR_R;
+    }
+    else if (vi.pixel_type == VideoInfo::CS_YUV440) {
+      // No V-first FourCC exists for 4:4:0
+      // exported 'I440' (U-then-V, see GetStreamInfo/ReadFormat).
+      plane1 = PLANAR_U;
+      plane2 = PLANAR_V;
     }
     else {
       if (vi.BitsPerComponent() == 8) {
@@ -1472,6 +1508,14 @@ HRESULT CAVIStreamSynth::Read2(LONG lStart, LONG lSamples, LPVOID lpBuffer, LONG
     vi_final.pixel_type = VideoInfo::CS_YUV444P16;
   else if (vi->pixel_type == VideoInfo::CS_YUVA444P10 || vi->pixel_type == VideoInfo::CS_YUVA444P12 || vi->pixel_type == VideoInfo::CS_YUVA444P14 || vi->pixel_type == VideoInfo::CS_YUVA444PS)
     vi_final.pixel_type = VideoInfo::CS_YUVA444P16;
+  // Silent mapping of >8 bit YUV 4:1:1 / 4:1:0 / 4:4:0 formats to 8-bit
+  // See also ReadFrame() and GetStreamInfo()
+  else if (vi->BitsPerComponent() > 8 && vi->Is411())
+    vi_final.pixel_type = VideoInfo::CS_YUV411;
+  else if (vi->BitsPerComponent() > 8 && vi->Is410())
+    vi_final.pixel_type = VideoInfo::CS_YUV410;
+  else if (vi->BitsPerComponent() > 8 && vi->Is440())
+    vi_final.pixel_type = VideoInfo::CS_YUV440;
   // -- pixel_type change end
 
   if (fAudio) {
@@ -1655,6 +1699,14 @@ STDMETHODIMP CAVIStreamSynth::ReadFormat(LONG lPos, LPVOID lpFormat, LONG *lpcbF
       vi_final.pixel_type = VideoInfo::CS_YUV444P16;
     else if (vi->pixel_type == VideoInfo::CS_YUVA444P10 || vi->pixel_type == VideoInfo::CS_YUVA444P12 || vi->pixel_type == VideoInfo::CS_YUVA444P14 || vi->pixel_type == VideoInfo::CS_YUVA444PS)
       vi_final.pixel_type = VideoInfo::CS_YUVA444P16;
+    // Silent mapping of >8 bit YUV 4:1:1 / 4:1:0 / 4:4:0 formats to 8-bit
+    // See also ReadFrame()/Read2()/GetStreamInfo()
+    else if (vi->BitsPerComponent() > 8 && vi->Is411())
+      vi_final.pixel_type = VideoInfo::CS_YUV411;
+    else if (vi->BitsPerComponent() > 8 && vi->Is410())
+      vi_final.pixel_type = VideoInfo::CS_YUV410;
+    else if (vi->BitsPerComponent() > 8 && vi->Is440())
+      vi_final.pixel_type = VideoInfo::CS_YUV440;
     // -- pixel_type change end
 
     BITMAPINFOHEADER bi;
@@ -1727,6 +1779,12 @@ STDMETHODIMP CAVIStreamSynth::ReadFormat(LONG lPos, LPVOID lpFormat, LONG *lpcbF
       bi.biCompression = MAKEFOURCC('G','4',0,14);
     else if (vi_final.pixel_type == VideoInfo::CS_RGBAP16)
       bi.biCompression = MAKEFOURCC('G','4',0,16);
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV410)
+      bi.biCompression = MAKEFOURCC('Y', 'V', 'U', '9');
+    else if (vi_final.pixel_type == VideoInfo::CS_YUV440)
+      bi.biCompression = MAKEFOURCC('I', '4', '4', '0'); // no V-first FourCC exists for 4:4:0
+    else if (vi_final.pixel_type == VideoInfo::CS_YA8)
+      bi.biCompression = MAKEFOURCC('Y', '2', 0, 8); // ffmpeg AV_PIX_FMT_YA8, packed Y,A interleaved
     else {
       _ASSERT(FALSE);
     }

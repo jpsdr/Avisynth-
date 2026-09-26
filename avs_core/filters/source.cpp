@@ -152,21 +152,24 @@ static PVideoFrame CreateBlankFrame(const VideoInfo& vi, int color, int mode, co
     if (color_is_array) {
           // works from colors or colors_f: as-is
           // color order in the array: RGBA or YUVA
-      int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-      int planes_r[4] = { PLANAR_R, PLANAR_G, PLANAR_B, PLANAR_A };
-      int *planes = isyuvlike ? planes_y : planes_r;
+      int planes_y[4]  = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+      int planes_ya[2] = { PLANAR_Y, PLANAR_A };
+      int planes_r[4]  = { PLANAR_R, PLANAR_G, PLANAR_B, PLANAR_A };
+      int *planes = vi.IsYA() ? planes_ya : isyuvlike ? planes_y : planes_r;
 
-      for (int p = 0; p < vi.NumComponents(); p++)
+      // colors[]/colors_f[] are always indexed by logical Y=0,U=1,V=2,A=3 position
+      for (int k = 0; k < vi.NumComponents(); k++)
       {
-        int plane = planes[p];
+        const int plane = planes[k];
+        const int color_index = vi.IsYA() ? (k == 0 ? 0 : 3) : k; // index into colors[]/colors_f[]
         BYTE *dstp = frame->GetWritePtr(plane);
         int rowsize = frame->GetRowSize(plane);
         int pitch = frame->GetPitch(plane);
         int height = frame->GetHeight(plane);
         switch (pixelsize) {
-        case 1: fill_plane<uint8_t>(dstp, height, rowsize, pitch, clamp(colors[p], 0, 0xFF)); break;
-        case 2: fill_plane<uint16_t>(dstp, height, rowsize, pitch, clamp(colors[p], 0, (1 << vi.BitsPerComponent()) - 1)); break;
-        case 4: fill_plane<float>(dstp, height, rowsize, pitch, colors_f[p]); break;
+        case 1: fill_plane<uint8_t>(dstp, height, rowsize, pitch, clamp(colors[color_index], 0, 0xFF)); break;
+        case 2: fill_plane<uint16_t>(dstp, height, rowsize, pitch, clamp(colors[color_index], 0, (1 << vi.BitsPerComponent()) - 1)); break;
+        case 4: fill_plane<float>(dstp, height, rowsize, pitch, colors_f[color_index]); break;
         }
       }
     }
@@ -175,9 +178,10 @@ static PVideoFrame CreateBlankFrame(const VideoInfo& vi, int color, int mode, co
 
       int val_i = 0;
 
-      int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-      int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
-      int *planes = isyuvlike ? planes_y : planes_r;
+      int planes_y[4]  = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+      int planes_ya[2] = { PLANAR_Y, PLANAR_A };
+      int planes_r[4]  = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+      int *planes = vi.IsYA() ? planes_ya : isyuvlike ? planes_y : planes_r;
 
       for (int p = 0; p < vi.NumComponents(); p++)
       {
@@ -371,10 +375,8 @@ static AVSValue __cdecl Create_BlankClip(AVSValue args, void*, IScriptEnvironmen
       int pixel_type = GetPixelTypeFromName(args[4].AsString());
       if(pixel_type == VideoInfo::CS_UNKNOWN)
       {
-          env->ThrowError("BlankClip: pixel_type must be \"RGB32\", \"RGB24\", \"YV12\", \"YV24\", \"YV16\", \"Y8\", \n"\
-              "\"YUV420P?\",\"YUV422P?\",\"YUV444P?\",\"Y?\",\n"\
-              "\"RGB48\",\"RGB64\",\"RGBP\",\"RGBP?\",\n"\
-              "\"YV411\" or \"YUY2\"");
+          env->ThrowError("BlankClip: invalid pixel_type \"%s\" (e.g. \"YV12\", \"YUV422P10\", \"RGB32\", \"RGBPS\")",
+              args[4].AsString());
       }
       vi.pixel_type = pixel_type;
   }
@@ -461,19 +463,26 @@ static AVSValue __cdecl Create_BlankClip(AVSValue args, void*, IScriptEnvironmen
       if (!args[13].IsArray())
         env->ThrowError("BlankClip: colors must be an array");
       int color_count = args[13].ArraySize();
-      if (color_count < vi.NumComponents())
-        env->ThrowError("BlankClip: 'colors' size %d is less than component count %d", color_count, vi.NumComponents());
+      // colors[]/colors_f[] are indexed by logical Y=0,U=1,V=2,A=3 position
+      // matching the color order: Y,U,V,A or R,G,B,A convention
+      // Y+Alpha accepts the 4 element form (with dummy U/V) besides a 2 element [Y,A] form
+      // as a shorthand.
+      const bool ya_tight_form = vi.IsYA() && color_count == 2;
+      const int required_color_count = vi.IsYA() ? (ya_tight_form ? 2 : 4) : vi.NumComponents();
+      if (color_count < required_color_count)
+        env->ThrowError("BlankClip: 'colors' size %d is less than required size %d", color_count, required_color_count);
       int pixelsize = vi.ComponentSize();
       int bits_per_pixel = vi.BitsPerComponent();
       for (int i = 0; i < color_count; i++) {
         const float c = args[13][i].AsFloatf(0.0);
+        const int target_index = ya_tight_form ? (i == 0 ? 0 : 3) : i;
         if (pixelsize == 4)
-          colors_f[i] = c;
+          colors_f[target_index] = c;
         else {
           const int color = (int)(c + 0.5f);
           if (color >= (1 << bits_per_pixel) || color < 0)
             env->ThrowError("BlankClip: invalid color value (%d) for %d-bit video format", color, bits_per_pixel);
-          colors[i] = color;
+          colors[target_index] = color;
         }
       }
       color_is_array = true;
@@ -1095,7 +1104,11 @@ static void GetYUVBT601fromRGB(double R, double G, double B, double& dY, double&
 // Note: due to integer rounding, boundary positions may differ by +/-1 luma pixel
 // compared to a 4:4:4 or RGB rendering of the same width, which is unavoidable
 // when 7 bars do not divide evenly into the frame width.
-template<typename pixel_t, bool is420, bool is422, bool is411>
+
+
+enum class ColorBarsFormat { YUV444, YUV422, YUV420, YUV411, YUV440, YUV410 };
+
+template<typename pixel_t, ColorBarsFormat fmt>
 static void draw_colorbars_yuv(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8, int pitchY, int pitchUV, int w, int h, int bits_per_pixel)
 {
   pixel_t* pY = reinterpret_cast<pixel_t*>(pY8);
@@ -1169,12 +1182,20 @@ static void draw_colorbars_yuv(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8, int pit
   // For 444, chromaX == lumaX directly.
   auto write_luma = [&](int x, pixel_t yval) {
     XP_LAMBDA_CAPTURE_FIX(pitchY);
-    if constexpr (is420)
+    if constexpr (fmt == ColorBarsFormat::YUV420)
       pY[x * 2 + 0] = pY[x * 2 + 1] = pY[x * 2 + pitchY] = pY[x * 2 + 1 + pitchY] = yval;
-    else if constexpr (is422)
+    else if constexpr (fmt == ColorBarsFormat::YUV422)
       pY[x * 2 + 0] = pY[x * 2 + 1] = yval;
-    else if constexpr (is411)
+    else if constexpr (fmt == ColorBarsFormat::YUV411)
       pY[x * 4 + 0] = pY[x * 4 + 1] = pY[x * 4 + 2] = pY[x * 4 + 3] = yval;
+    else if constexpr (fmt == ColorBarsFormat::YUV440)
+      // HxV:1x2
+      pY[x] = pY[x + pitchY] = yval;
+    else if constexpr (fmt == ColorBarsFormat::YUV410)
+      // HxV:4x4
+      for (int dy = 0; dy < 4; ++dy)
+        for (int dx = 0; dx < 4; ++dx)
+          pY[x * 4 + dx + dy * pitchY] = yval;
     else // 444
       pY[x] = yval;
     };
@@ -1189,9 +1210,24 @@ static void draw_colorbars_yuv(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8, int pit
   // We iterate in chroma coordinates; write_luma expands to luma coordinates.
   int wUV = w;
   int hUV = h;
-  if constexpr (is420 || is422) wUV >>= 1;
-  if constexpr (is411)          wUV >>= 2;
-  if constexpr (is420)          hUV >>= 1;
+  if constexpr (fmt == ColorBarsFormat::YUV420 || fmt == ColorBarsFormat::YUV422)
+    wUV >>= 1;
+  else if constexpr (fmt == ColorBarsFormat::YUV411 || fmt == ColorBarsFormat::YUV410)
+    wUV >>= 2;
+  if constexpr (fmt == ColorBarsFormat::YUV420 || fmt == ColorBarsFormat::YUV440)
+    hUV >>= 1;
+  else if constexpr (fmt == ColorBarsFormat::YUV410)
+    hUV >>= 2;
+
+  auto advance_rows = [&] {
+    if constexpr (fmt == ColorBarsFormat::YUV410)
+      pY += pitchY * 4;
+    else if constexpr (fmt == ColorBarsFormat::YUV420 || fmt == ColorBarsFormat::YUV440)
+      pY += pitchY * 2;
+    else
+      pY += pitchY;
+    pU += pitchUV; pV += pitchUV;
+    };
 
   int y = 0;
 
@@ -1201,11 +1237,7 @@ static void draw_colorbars_yuv(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8, int pit
     for (int i = 0; i < 7; ++i)
       for (; x < (wUV * (i + 1) + 3) / 7; ++x)
         write_yuv(x, ttt[i]);
-    if constexpr (is420)
-      pY += pitchY * 2;
-    else
-      pY += pitchY;
-    pU += pitchUV; pV += pitchUV;
+    advance_rows();
   }
 
   // Middle band (2/3 to 3/4)
@@ -1214,11 +1246,7 @@ static void draw_colorbars_yuv(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8, int pit
     for (int i = 0; i < 7; ++i)
       for (; x < (wUV * (i + 1) + 3) / 7; ++x)
         write_yuv(x, ttq[i]);
-    if constexpr (is420)
-      pY += pitchY * 2;
-    else
-      pY += pitchY;
-    pU += pitchUV; pV += pitchUV;
+    advance_rows();
   }
 
   // Bottom quarter
@@ -1232,11 +1260,7 @@ static void draw_colorbars_yuv(uint8_t* pY8, uint8_t* pU8, uint8_t* pV8, int pit
         write_yuv(x, bq[j]);
     for (; x < wUV; ++x)
       write_yuv(x, bq[7]);
-    if constexpr (is420)
-      pY += pitchY * 2;
-    else
-      pY += pitchY;
-    pU += pitchUV; pV += pitchUV;
+    advance_rows();
   }
 }
 
@@ -2310,9 +2334,17 @@ public:
       if (w & 1)
         env->ThrowError("ColorBars: for 4:2:2 width must be even!");
     }
-    else if (vi.IsYV411()) { // 4:1:1
+    else if (vi.Is411()) { // 4:1:1
       if (w & 3)
         env->ThrowError("ColorBars: for 4:1:1 width must be divisible by 4!");
+    }
+    else if (vi.Is440()) { // 4:4:0
+      if (h & 1)
+        env->ThrowError("ColorBars: for 4:4:0 height must be even!");
+    }
+    else if (vi.Is410()) { // 4:1:0
+      if ((w & 3) || (h & 3))
+        env->ThrowError("ColorBars: for 4:1:0 both width and height must be divisible by 4!");
     }
     else if (vi.Is444()) { // 4:4:4
       // no special check
@@ -2466,7 +2498,7 @@ public:
         std::vector<uint8_t> tempV((w >> 1) * h);
 
         // Use the unified YUV drawing function to generate planar data
-        draw_colorbars_yuv<uint8_t, false, true, false>(
+        draw_colorbars_yuv<uint8_t, ColorBarsFormat::YUV422>(
           tempY.data(), tempU.data(), tempV.data(),
           w, w >> 1, w, h, 8
         );
@@ -2493,11 +2525,11 @@ public:
         const int pitchY = frame->GetPitch(PLANAR_Y);
         const int pitchUV = frame->GetPitch(PLANAR_U);
         if (bits_per_pixel == 8)
-          draw_colorbars_yuv<uint8_t, false, false, false>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
+          draw_colorbars_yuv<uint8_t, ColorBarsFormat::YUV444>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
         else if (bits_per_pixel <= 16)
-          draw_colorbars_yuv<uint16_t, false, false, false>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
+          draw_colorbars_yuv<uint16_t, ColorBarsFormat::YUV444>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
         else
-          draw_colorbars_yuv<float, false, false, false>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
+          draw_colorbars_yuv<float, ColorBarsFormat::YUV444>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
       }
       else if (vi.Is420()) {
         BYTE* pY = (BYTE*)frame->GetWritePtr(PLANAR_Y);
@@ -2506,11 +2538,11 @@ public:
         const int pitchY = frame->GetPitch(PLANAR_Y);
         const int pitchUV = frame->GetPitch(PLANAR_U);
         if (bits_per_pixel == 8)
-          draw_colorbars_yuv<uint8_t, true, false, false>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
+          draw_colorbars_yuv<uint8_t, ColorBarsFormat::YUV420>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
         else if (bits_per_pixel <= 16)
-          draw_colorbars_yuv<uint16_t, true, false, false>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
+          draw_colorbars_yuv<uint16_t, ColorBarsFormat::YUV420>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
         else
-          draw_colorbars_yuv<float, true, false, false>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
+          draw_colorbars_yuv<float, ColorBarsFormat::YUV420>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
       }
       else if (vi.Is422()) {
         BYTE* pY = (BYTE*)frame->GetWritePtr(PLANAR_Y);
@@ -2519,20 +2551,50 @@ public:
         const int pitchY = frame->GetPitch(PLANAR_Y);
         const int pitchUV = frame->GetPitch(PLANAR_U);
         if (bits_per_pixel == 8)
-          draw_colorbars_yuv<uint8_t, false, true, false>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
+          draw_colorbars_yuv<uint8_t, ColorBarsFormat::YUV422>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
         else if (bits_per_pixel <= 16)
-          draw_colorbars_yuv<uint16_t, false, true, false>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
+          draw_colorbars_yuv<uint16_t, ColorBarsFormat::YUV422>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
         else
-          draw_colorbars_yuv<float, false, true, false>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
+          draw_colorbars_yuv<float, ColorBarsFormat::YUV422>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
       }
-      else if (vi.IsYV411()) {
+      else if (vi.Is411()) {
         BYTE* pY = (BYTE*)frame->GetWritePtr(PLANAR_Y);
         BYTE* pU = (BYTE*)frame->GetWritePtr(PLANAR_U);
         BYTE* pV = (BYTE*)frame->GetWritePtr(PLANAR_V);
         const int pitchY = frame->GetPitch(PLANAR_Y);
         const int pitchUV = frame->GetPitch(PLANAR_U);
-        // YV411 is 8-bit only
-        draw_colorbars_yuv<uint8_t, false, false, true>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
+        if (bits_per_pixel == 8)
+          draw_colorbars_yuv<uint8_t, ColorBarsFormat::YUV411>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
+        else if (bits_per_pixel <= 16)
+          draw_colorbars_yuv<uint16_t, ColorBarsFormat::YUV411>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
+        else
+          draw_colorbars_yuv<float, ColorBarsFormat::YUV411>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
+      }
+      else if (vi.Is440()) {
+        BYTE* pY = (BYTE*)frame->GetWritePtr(PLANAR_Y);
+        BYTE* pU = (BYTE*)frame->GetWritePtr(PLANAR_U);
+        BYTE* pV = (BYTE*)frame->GetWritePtr(PLANAR_V);
+        const int pitchY = frame->GetPitch(PLANAR_Y);
+        const int pitchUV = frame->GetPitch(PLANAR_U);
+        if (bits_per_pixel == 8)
+          draw_colorbars_yuv<uint8_t, ColorBarsFormat::YUV440>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
+        else if (bits_per_pixel <= 16)
+          draw_colorbars_yuv<uint16_t, ColorBarsFormat::YUV440>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
+        else
+          draw_colorbars_yuv<float, ColorBarsFormat::YUV440>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
+      }
+      else if (vi.Is410()) {
+        BYTE* pY = (BYTE*)frame->GetWritePtr(PLANAR_Y);
+        BYTE* pU = (BYTE*)frame->GetWritePtr(PLANAR_U);
+        BYTE* pV = (BYTE*)frame->GetWritePtr(PLANAR_V);
+        const int pitchY = frame->GetPitch(PLANAR_Y);
+        const int pitchUV = frame->GetPitch(PLANAR_U);
+        if (bits_per_pixel == 8)
+          draw_colorbars_yuv<uint8_t, ColorBarsFormat::YUV410>(pY, pU, pV, pitchY, pitchUV, w, h, 8);
+        else if (bits_per_pixel <= 16)
+          draw_colorbars_yuv<uint16_t, ColorBarsFormat::YUV410>(pY, pU, pV, pitchY, pitchUV, w, h, bits_per_pixel);
+        else
+          draw_colorbars_yuv<float, ColorBarsFormat::YUV410>(pY, pU, pV, pitchY, pitchUV, w, h, 32);
       }
     } // "ColorBars" pattern generation
     else {

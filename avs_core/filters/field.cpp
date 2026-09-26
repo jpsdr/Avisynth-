@@ -116,8 +116,10 @@ SeparateColumns::SeparateColumns(PClip _child, int _interval, IScriptEnvironment
     env->ThrowError("SeparateColumns: YUV420 output width must be even.");
   if (vi.Is422() && vi.width & 1)
     env->ThrowError("SeparateColumns: YUV422 output width must be even.");
-  if (vi.IsYV411() && vi.width & 3)
-    env->ThrowError("SeparateColumns: YV411 output width must be mod 4.");
+  if (vi.Is411() && vi.width & 3)
+    env->ThrowError("SeparateColumns: YUV411 output width must be mod 4.");
+  if (vi.Is410() && vi.width & 3)
+    env->ThrowError("SeparateColumns: YUV410 output width must be mod 4.");
 }
 
 
@@ -130,9 +132,10 @@ PVideoFrame SeparateColumns::GetFrame(int n, IScriptEnvironment* env)
   PVideoFrame dst = env->NewVideoFrameP(vi, &src);
 
   if (vi.IsPlanar()) {
-    int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-    int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
-    int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
+    int planes_yuva[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+    int planes_ya[2]   = { PLANAR_Y, PLANAR_A };
+    int planes_r[4]    = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+    int *planes = vi.IsYA() ? planes_ya : (vi.IsYUV() || vi.IsYUVA()) ? planes_yuva : planes_r;
     for (int p = 0; p < vi.NumComponents(); ++p) {
       int plane = planes[p];
       const int srcpitch = src->GetPitch(plane);
@@ -319,9 +322,10 @@ PVideoFrame WeaveColumns::GetFrame(int n, IScriptEnvironment* env)
      env->copyFrameProps(src, dst);
 
     if (vi.IsPlanar()) {
-      int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-      int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
-      int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
+      int planes_yuva[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+      int planes_ya[2]   = { PLANAR_Y, PLANAR_A };
+      int planes_r[4]    = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+      int *planes = vi.IsYA() ? planes_ya : (vi.IsYUV() || vi.IsYUVA()) ? planes_yuva : planes_r;
       for (int p = 0; p < vi.NumComponents(); ++p) {
         int plane = planes[p];
         BYTE *_dstp = dst->GetWritePtr(plane);
@@ -506,6 +510,10 @@ SeparateRows::SeparateRows(PClip _child, int _interval, IScriptEnvironment* env)
 
   if (vi.Is420() && vi.height & 1)
     env->ThrowError("SeparateRows: YUV420 output height must be even.");
+  if (vi.Is440() && vi.height & 1)
+    env->ThrowError("SeparateRows: YUV440 output height must be even.");
+  if (vi.Is410() && vi.height & 3)
+    env->ThrowError("SeparateRows: YUV410 output height must be mod 4.");
 }
 
 
@@ -524,7 +532,16 @@ PVideoFrame SeparateRows::GetFrame(int n, IScriptEnvironment* env)
     const int Yoffset  = Ypitch  * m;
     const int UVoffset = UVpitch * m;
 
-    if (vi.NumComponents() == 4) {
+    // IsYA() must be checked before IsYUVA(), latter is also true for YA
+    if (vi.IsYA()) {
+      // dummy 0 offset/pitch for the unused U/V
+      int Aoffset = frame->GetPitch(PLANAR_A) * m;
+
+      return env->SubframePlanarA(frame, Yoffset, Ypitch * interval,
+        frame->GetRowSize(plane0), vi.height,
+        0, 0, 0, Aoffset);
+    }
+    else if (vi.IsYUVA() || vi.IsPlanarRGBA()) {
       int Aoffset = frame->GetPitch(PLANAR_A) * m;
 
       return env->SubframePlanarA(frame, Yoffset, Ypitch * interval,
@@ -597,9 +614,10 @@ PVideoFrame WeaveRows::GetFrame(int n, IScriptEnvironment* env)
     }
   }
   else {
-    int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-    int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
-    int *planes = (vi.IsYUV() || vi.IsYUVA()) ? planes_y : planes_r;
+    int planes_yuva[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+    int planes_ya[2]   = { PLANAR_Y, PLANAR_A };
+    int planes_r[4]    = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+    int *planes = vi.IsYA() ? planes_ya : (vi.IsYUV() || vi.IsYUVA()) ? planes_yuva : planes_r;
     bool isYUY2 = vi.IsYUY2();
     int dstpitch[4];
     BYTE *dstp[4];
@@ -650,8 +668,10 @@ SeparateFields::SeparateFields(PClip _child, IScriptEnvironment* env)
 {
   if (vi.height & 1)
     env->ThrowError("SeparateFields: height must be even");
-  if (vi.Is420() && vi.height & 3)
-    env->ThrowError("SeparateFields: YUV420 height must be multiple of 4");
+  if ((vi.Is420() || vi.Is440()) && vi.height & 3)
+    env->ThrowError("SeparateFields: YUV420/YUV440 height must be multiple of 4");
+  if (vi.Is410() && vi.height & 7)
+    env->ThrowError("SeparateFields: YUV410 height must be multiple of 8");
   vi.height >>= 1;
   vi.MulDivFPS(2, 1);
   vi.num_frames *= 2;
@@ -687,7 +707,15 @@ PVideoFrame SeparateFields::GetFrame(int n, IScriptEnvironment* env)
     const int UVoffset = !topfield ? UVpitch : 0;
     const int Yoffset = !topfield ? Ypitch : 0;
 
-    if (vi.NumComponents() == 4) {
+    // IsYA() must be checked before IsYUVA(), latter is also true for YA
+    if (vi.IsYA()) {
+      // dummy 0 offset/pitch for the unused U/V
+      int Aoffset = !topfield ? frame->GetPitch(PLANAR_A) : 0;
+
+      return env->SubframePlanarA(frame, Yoffset, frame->GetPitch() * 2, frame->GetRowSize(), frame->GetHeight() >> 1,
+        0, 0, 0, Aoffset);
+    }
+    else if (vi.IsYUVA() || vi.IsPlanarRGBA()) {
       int Aoffset = !topfield ? frame->GetPitch(PLANAR_A) : 0;
 
       return env->SubframePlanarA(frame, Yoffset, frame->GetPitch() * 2, frame->GetRowSize(), frame->GetHeight() >> 1,
