@@ -651,7 +651,7 @@ int VideoFrame::CheckMemory() const {
 #ifdef _DEBUG
   if (vfb->data && vfb->device->device_type == DEV_TYPE_CPU) {
     // check buffer overrun
-    int *pInt = (int *)(vfb->data + vfb->data_size);
+    int *pInt = (int *)(vfb->data + VFBHelper::GetMargin(vfb) + vfb->data_size);
     if (pInt[0] != 0xDEADBEEF ||
       pInt[1] != 0xDEADBEEF ||
       pInt[2] != 0xDEADBEEF ||
@@ -1348,7 +1348,7 @@ static const AVS_Linkage avs_linkage = {    // struct AVS_Linkage {
   &VideoInfo::Is411,                        //   bool    (VideoInfo::*Is411)()  const;
 
   // a single { nullptr } initializes the whole placeholder array
-  { nullptr },                              // void          (VideoInfo::* reserved2[64 - 31])(); // Reserve pointer space for Avisynth+
+  { nullptr },                              // void          (VideoInfo::* reserved2[64 - 35])(); // Reserve pointer space for Avisynth+
 
 /**********************************************************************/
   // AviSynth Neo additions

@@ -9,10 +9,68 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20260828 3.7.5.rXXXX (pre 3.7.6)
+20260928 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
-- Fix #514: Layer op="mul" ignored the overlay's alpha mask when not using full opacity. 
-  (regression since r4589 test).
+- Fix #519: C API filters running as ``MT_NICE_FILTER``: concurrent calls on the same filter instance
+  shared the wrapper's error fields. Thus there was a possibility that errors could be lost or reported
+  for the wrong frame, or vice versa, raised for a frame that was otherwise O.K. 
+  Now each call gets its own copy of the filter info.
+- Fix #495 (debug builds only): VideoFrame::CheckMemory() ignored the allocation margin and
+  reported a buffer overrun for every frame.
+- Fix #495 POSIX debug builds failed to compile (now forwards the error to stderr).
+- Fix #523: C++ API (AVS_Linkage), interface V13 regression (r4721 test build):
+  - new V13 VideoInfo entries were added but without shrinking the reserved area (GetNeoEnv moved by 4 pointers)
+  - Plugins built with the V13 header called the new VideoInfo functions through null entries 
+    when used against older runtimes. Now the linkage call macros also check the entry for null
+
+20260928 3.7.5.r4721 (pre 3.7.6)
+--------------------------------
+- ConvertBits: source range (_ColorRange) is now detected per frame when "fulls" is not given, instead
+  of being fixed once from frame 0 at filter creation. Fixes #516: the frame#0 request during filter
+  creation could hide an error message/exception raised by an upstream filter.
+  - Use case: e.g. spliced clips with different _ColorRange flags; ConvertBits no longer calls GetFrame(0)
+    during script evaluation.
+  - "fulld" omitted: mirrors each frame's source range; "fulld" given: output range is pinned.
+  - "fulls" given explicitly: classic fixed-range behavior.
+  - Same bit depth with "fulls"/"fulld" omitted (e.g. ConvertBits(16) on a 16-bit clip) still returns
+    the clip unchanged.
+  - Internal ConvertBits calls (ConvertToRGB/YUV "bits", VfW export bit-depth mapping) benefit as well.
+  - Fix (could be reached only from this new per-frame mode): same-bit-depth limited->limited integer
+    conversion (C/SSE4.1/AVX2) computed an invalid shift and misread 8-bit data; 32-bit float
+    same-range conversion added rounding noise. Both are now plain pixel copies.
+- New formats: YUV(A) 4:4:0 and 4:1:0 (8-32 bits), 4:1:1 over 8 bits, Y+alpha (YA, 8-32 bits).
+  - ConvertToYUV(A)440, ConvertToYUV(A)410, ConvertToYUV(A)411 (all bit depths), ConvertToYA.
+  - Internal filters support the new formats (Is411() replaces the 8-bit-only IsYV411() checks);
+    Layer, Overlay, Text/Subtitle: 4:1:0 and 4:4:0 support; Text/Subtitle: 4:1:1 "left" placement.
+  - Overlay: YA support; YUVA/YA "output" keeps (or adds) alpha instead of dropping it.
+  - ColorBars: 4:1:0 and 4:4:0 support. ImageReader: 8-bit YUV440 and YUV410.
+  - AviSource: YVU9, I410, I411, I440 input (410/440 new, alternative 411 FourCC).
+  - VfW export: YUV410 as YVU9, YUV440 as I440; 8-bit YA as Y2[0][8] (interleaved Y,A like ffmpeg's YA8);
+    high bit depth 411/410/440 silently down-converted to 8 bits.
+  - BuildPixelType: 440/410/YA support.
+  - Added "YUV410"/"YUVA410" to the allowed 8-bit format strings, and FFmpeg-style alternate names for
+    32-bit float formats (e.g. YUV420PF32, RGBPF32, YF32, YAF32).
+- Fix #518: "Mask" on RGB32 clips narrower than 4 pixels: the SSE2/AVX2 code wrote 16 bytes starting
+  before the row (memory corruption before the frame buffer).
+- Fix #520: Possible access violation on script environment destruction when a frame held another frame
+  as a frame property depending on internal frame registry ordering.
+- Bump interface version to v13 (new video format constants).
+- Fix: ConvertBits: ordered dither on packed RGB48/RGB64 with dither_bits 1-7 (bit-depth gap over 8)
+  failed with "truerange specified for non-planar source". The packed->planar conversion used for
+  dithering now happens before the automatic pre-conversion step, so the whole dither chain runs planar.
+- rstdoc: add BuildPixelType page; update filter docs for YA; document ConvertBits per-frame range
+  handling and its dither helper conversions; document AcquireGlobalLock/ReleaseGlobalLock better (#444).
+- Fix test version regressions (3.7.6 not yet released):
+  - Overlay: masked blend (greymask=false, native non-4:4:4) read the chroma mask at luma resolution
+    (access violation).
+  - AVX-512 horizontal resampler (16-bit output): up to the last 31 pixels of a row were left unwritten
+    for certain widths (seen in 410->444 chroma upscaling).
+  - Fix #514: Layer op="mul" ignored the overlay's alpha mask when not using full opacity. 
+    (regression since r4589 test).
+- Fix: TurnLeft/TurnRight: the mod alignment check for sources with different horizontal and vertical
+  chroma subsampling (4:2:2, 4:1:1, and the new 4:4:0) tested the source dimensions instead of the
+  post-turn ones (e.g. 4:2:2 needs a mod-2 source height, which becomes the width), so invalid clips
+  passed and wrong error messages were shown. Pre-existing bug.
 
 20260827 3.7.5.r4669 (pre 3.7.6)
 --------------------------------

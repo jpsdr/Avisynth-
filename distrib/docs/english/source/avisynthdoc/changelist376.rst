@@ -372,6 +372,9 @@ Bugfixes
 - Fix #509: "ConvertBits" automatic preconversion for large ``dither_bits`` gaps (e.g.
   16-bit source with ``dither_bits=1``) silently dropped the dithering, falling back to
   a plain bit-depth expansion.
+- Fix: "ConvertBits" ordered dither on packed RGB48/RGB64 with ``dither_bits`` 1-7 (bit-depth gap
+  over 8) failed with "truerange specified for non-planar source". The packed->planar conversion
+  used for dithering now happens before the automatic preconversion, so the whole dither chain runs planar.
 - Fix #510: "Layer" "Mul" raw multiply product was rounded down incorrectly, so
   near-max products came out one unit too low (e.g. 255*255 -> 254).
 - Fix #511: "ConvertYUV444ToRGB"/"ConvertRGBToYUV444" left the synthesized alpha plane
@@ -379,10 +382,26 @@ Bugfixes
 - Fix #512: "Overlay" masked "add"/"subtract"/"darken"/"lighten"/"difference"/"exclusion"/
   "softlight"/"hardlight" a fully-opaque mask did not reproduce the same result as omitting the mask.
   As a side effect, also added finer opacity-granularity over 8 bits at integer formats.
+- Fix #518: "Mask" on RGB32 clips narrower than 4 pixels: the SSE2/AVX2 code wrote 16 bytes starting
+  before the row (memory corruption before the frame buffer).
+- Fix #520: Possible access violation on script environment destruction when a frame held another frame
+  as a frame property depending on internal frame registry ordering.
+- Fix #519: C API filters running as ``MT_NICE_FILTER``: concurrent calls on the same filter instance
+  shared the wrapper's error fields. Thus there was a possibility that errors could be lost or reported
+  for the wrong frame, or vice versa, raised for a frame that was otherwise O.K. 
+  Now each call gets its own copy of the filter info.
+- Fix #495 (debug builds only): ``VideoFrame::CheckMemory()`` ignored the allocation margin and
+  reported a buffer overrun for every frame.
+- Fix #495 POSIX debug builds failed to compile (now forwards the error to ``stderr``).
+- Fix #523: C++ API (``AVS_Linkage``), V13 test build regression: the new V13 ``VideoInfo`` entries
+  shifted ``GetNeoEnv`` (plugins using ``PNeoEnv`` crashed); the original layout is restored.
+  The linkage call macros now also check entries for null, so plugins built with the V13 header
+  fall back to defaults instead of crashing on older runtimes.
 - Fix: ``ArrayIns``/``ArraySet``/``ArrayDel``: bounds check the index parameter(s)
   (preventing Access Violation).
 - Fix: "TurnLeft"/"TurnRight": for asymmetrically H/V-subsampled sources (4:2:2, 4:1:1, 4:4:0),
-  the mod-alignment check (before-after dimension rules)
+  the mod-alignment check tested the source dimensions instead of the post-turn ones (e.g. 4:2:2
+  needs a mod-2 source height, which becomes the width), so invalid clips passed.
 
 
 Optimizations
@@ -493,7 +512,7 @@ Documentation
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
 
-$Date: 2026/08/27 14:15:00 $
+$Date: 2026/08/28 09:07:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus
