@@ -455,6 +455,9 @@ Bugfixes
 - Fix: "TurnLeft"/"TurnRight": for asymmetrically H/V-subsampled sources (4:2:2, 4:1:1, 4:4:0),
   the mod-alignment check tested the source dimensions instead of the post-turn ones (e.g. 4:2:2
   needs a mod-2 source height, which becomes the width), so invalid clips passed.
+- Fix: "Expr" crash on AVX2 CPUs when ``round``, ``floor``, ``ceil`` or ``trunc`` came before 
+  a relative pixel load (e.g. ``x[1,0]``) in the expression; wrong results when before ``asin``, ``acos``, ``atan``.
+  Existed since 3.7.1 (round/floor/ceil/trunc added).
 
 
 Optimizations
@@ -573,7 +576,7 @@ Documentation
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
 
-$Date: 2026/10/02 21:29:00 $
+$Date: 2026/10/05 10:00:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus

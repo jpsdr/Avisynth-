@@ -9,8 +9,14 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20261002 3.7.5.rXXXX (pre 3.7.6)
+20261005 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
+- Fix: Expr: crash or wrong output when round, floor, ceil or trunc came before a relative pixel
+  load (e.g. x[1,0]) or asin/acos/atan. The SIMD path selection (narrowing down) loop stopped at the
+  first rounding op, so later ops were not checked. A relative pixel load then ran on the AVX2 JIT,
+  which does not implement it (crash on AVX2 CPUs). Functions asin/acos/atan ran on the SSE2/AVX2
+  JIT, which does not implement them (wrong output).
+  Bug existed since round/floor/ceil/trunc were added in 3.7.1.
 - Fix: TemporalSoften scenechange threshold now is calculated from the full frame width. It was rounded
   down to mod 32, a leftover from the 2002 ISSE SAD code which skipped the right-edge bytes; current
   SAD routines sum the whole row, so for non-mod32 widths scene changes were detected slightly too easily.
