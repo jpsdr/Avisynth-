@@ -80,9 +80,9 @@ AdjustFocusV::AdjustFocusV(double _amount, PClip _child)
 template<typename pixel_t>
 static void af_vertical_c(BYTE* line_buf8, BYTE* dstp8, const int height, const int pitch8, const int width, const int half_amount, int bits_per_pixel) {
   typedef typename std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t;
-  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2]
-  weight_t center_weight = half_amount*2;    // *2: 16 bit scaled arithmetic, but the converted amount parameter scaled is only 15 bits
-  weight_t outer_weight = 32768-half_amount; // (1-1/2^_amount)/2  32768 = 0.5
+  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2], same arithmetic as the SIMD paths
+  weight_t center_weight = af_center_weight_int(half_amount);
+  weight_t outer_weight = af_outer_weight_int(half_amount);
   int max_pixel_value = (1 << bits_per_pixel) - 1;
 
   pixel_t * dstp = reinterpret_cast<pixel_t *>(dstp8);
@@ -140,32 +140,23 @@ static void af_vertical_process(BYTE* line_buf, BYTE* dstp, size_t height, size_
     //pitch of aligned frames is always >= 32 so we'll just process some garbage if width is not mod32
     af_vertical_avx2(line_buf, dstp, (int)height, (int)pitch, (int)width, half_amount);
   }
-  else
-  if (sizeof(pixel_t) == 1 && (env->GetCPUFlags() & CPUF_SSE2) && width >= 16) {
+  else if (sizeof(pixel_t) == 1 && (env->GetCPUFlags() & CPUF_SSSE3) && width >= 16) {
     //pitch of aligned frames is always >= 16 so we'll just process some garbage if width is not mod16
+    af_vertical_ssse3(line_buf, dstp, (int)height, (int)pitch, (int)width, half_amount);
+  }
+  else if (sizeof(pixel_t) == 1 && (env->GetCPUFlags() & CPUF_SSE2) && width >= 16) {
     af_vertical_sse2(line_buf, dstp, (int)height, (int)pitch, (int)width, half_amount);
   }
   else if (sizeof(pixel_t) == 2 && (env->GetCPUFlags() & CPUF_AVX2) && row_size >= 32) {
-    af_vertical_uint16_t_avx2(line_buf, dstp, (int)height, (int)pitch, (int)row_size, half_amount);
+    af_vertical_uint16_t_avx2(line_buf, dstp, (int)height, (int)pitch, (int)row_size, half_amount, bits_per_pixel);
   }
   else if (sizeof(pixel_t) == 2 && (env->GetCPUFlags() & CPUF_SSE4_1) && row_size >= 16) {
-    af_vertical_uint16_t_sse41(line_buf, dstp, (int)height, (int)pitch, (int)row_size, half_amount);
+    af_vertical_uint16_t_sse41(line_buf, dstp, (int)height, (int)pitch, (int)row_size, half_amount, bits_per_pixel);
   }
   else if (sizeof(pixel_t) == 2 && (env->GetCPUFlags() & CPUF_SSE2) && row_size >= 16) {
-    af_vertical_uint16_t_sse2(line_buf, dstp, (int)height, (int)pitch, (int)row_size, half_amount);
+    af_vertical_uint16_t_sse2(line_buf, dstp, (int)height, (int)pitch, (int)row_size, half_amount, bits_per_pixel);
   }
   else
-#ifdef X86_32
-  if (sizeof(pixel_t) == 1 && (env->GetCPUFlags() & CPUF_MMX) && width >= 8)
-  {
-    size_t mod8_width = width / 8 * 8;
-    af_vertical_mmx(line_buf, dstp, height, pitch, mod8_width, half_amount);
-    if (mod8_width != width) {
-      //yes, this is bad for caching. MMX shouldn't be used these days anyway
-      af_vertical_c<uint8_t>(line_buf, dstp + mod8_width, height, pitch, width - mod8_width, half_amount, bits_per_pixel);
-    }
-  } else
-#endif
 #endif
   {
     af_vertical_c<pixel_t>(line_buf, dstp, (int)height, (int)pitch, (int)width, half_amount, bits_per_pixel);
@@ -210,7 +201,7 @@ PVideoFrame __stdcall AdjustFocusV::GetFrame(int n, IScriptEnvironment* env)
       const int planesRGB[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A};
       // IsYA() must be checked before IsYUVA(): IsYUVA() is also true for YA
       const int *planes = vi.IsYA() ? planesYA : vi.IsYUV() || vi.IsYUVA() ? planesYUV : planesRGB;
-      const int cplanes_to_filter = vi.IsYA() ? 1 : 3;
+      const int cplanes_to_filter = (vi.IsY() || vi.IsYA()) ? 1 : 3; // greyscale: Y only
 
       for (int cplane = 0; cplane < cplanes_to_filter; cplane++) {
             int plane = planes[cplane];
@@ -282,9 +273,9 @@ static AVS_FORCEINLINE void af_horizontal_rgb32_process_line_c(pixel_t b_left, p
 template<typename pixel_t>
 static void af_horizontal_rgb32_64_c(BYTE* dstp8, size_t height, size_t pitch8, size_t width, int half_amount) {
   typedef typename std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t;
-  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2]
-  weight_t center_weight = half_amount*2;    // *2: 16 bit scaled arithmetic, but the converted amount parameter scaled is only 15 bits
-  weight_t outer_weight = 32768-half_amount; // (1-1/2^_amount)/2  32768 = 0.5
+  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2], same arithmetic as the SIMD paths
+  weight_t center_weight = af_center_weight_int(half_amount);
+  weight_t outer_weight = af_outer_weight_int(half_amount);
 
   pixel_t* dstp = reinterpret_cast<pixel_t *>(dstp8);
   size_t pitch = pitch8 / sizeof(pixel_t);
@@ -307,8 +298,8 @@ static void af_horizontal_rgb32_64_c(BYTE* dstp8, size_t height, size_t pitch8, 
 // -------------------------------------
 
 static void af_horizontal_yuy2_c(BYTE* p, int height, int pitch, int width, int amount) {
-  const int center_weight = amount*2;
-  const int outer_weight = 32768-amount;
+  const int center_weight = af_center_weight_int(amount); // same arithmetic as the SIMD paths
+  const int outer_weight = af_outer_weight_int(amount);
   for (int y0 = height; y0>0; --y0)
   {
     BYTE yy = p[0];
@@ -344,9 +335,9 @@ static void af_horizontal_yuy2_c(BYTE* p, int height, int pitch, int width, int 
 template<typename pixel_t>
 static void af_horizontal_rgb24_48_c(BYTE* dstp8, int height, int pitch8, int width, int half_amount) {
   typedef typename std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t;
-  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2]
-  weight_t center_weight = half_amount*2;    // *2: 16 bit scaled arithmetic, but the converted amount parameter scaled is only 15 bits
-  weight_t outer_weight = 32768-half_amount; // (1-1/2^_amount)/2  32768 = 0.5
+  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2], same arithmetic as the SIMD paths
+  weight_t center_weight = af_center_weight_int(half_amount);
+  weight_t outer_weight = af_outer_weight_int(half_amount);
 
   pixel_t *dstp = reinterpret_cast<pixel_t *>(dstp8);
   int pitch = pitch8 / sizeof(pixel_t);
@@ -425,8 +416,8 @@ static void af_horizontal_planar_c(BYTE* dstp8, size_t height, size_t pitch8, si
 {
     pixel_t* dstp = reinterpret_cast<pixel_t *>(dstp8);
     size_t pitch = pitch8 / sizeof(pixel_t);
-    int center_weight = int(half_amount*2);
-    int outer_weight = int(32768-half_amount);
+    int center_weight = af_center_weight_int(half_amount); // same arithmetic as the SIMD paths
+    int outer_weight = af_outer_weight_int(half_amount);
     pixel_t left;
     for (size_t y = height; y>0; --y) {
         left = dstp[0];
@@ -469,20 +460,20 @@ PVideoFrame __stdcall AdjustFocusH::GetFrame(int n, IScriptEnvironment* env)
   PVideoFrame src = child->GetFrame(n, env);
   PVideoFrame dst = env->NewVideoFrameP(vi, &src);
 
-  const int planesYUVA[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A};
-  const int planesYA[2]   = { PLANAR_Y, PLANAR_A};
-  const int planesRGB[4]  = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A};
-  const int *planes = vi.IsYA() ? planesYA : vi.IsYUV() || vi.IsYUVA() ? planesYUVA : planesRGB;
+  const int planesYUVA[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+  const int planesYA[2] = { PLANAR_Y, PLANAR_A };
+  const int planesRGB[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+  const int* planes = vi.IsYA() ? planesYA : vi.IsYUV() || vi.IsYUVA() ? planesYUVA : planesRGB;
 
   int pixelsize = vi.ComponentSize();
 
   if (vi.IsPlanar()) {
-    copy_frame(src, dst, env, planes, vi.NumComponents() ); //planar processing is always in-place
+    copy_frame(src, dst, env, planes, vi.NumComponents()); //planar processing is always in-place
     int bits_per_pixel = vi.BitsPerComponent();
     // Only the non-alpha planes get the blur/sharpen
     // alpha was already copied by copy_frame above
-    const int cplanes_to_filter = vi.IsYA() ? 1 : 3;
-    for(int cplane=0;cplane<cplanes_to_filter;cplane++) {
+    const int cplanes_to_filter = (vi.IsY() || vi.IsYA()) ? 1 : 3; // greyscale: Y only
+    for (int cplane = 0; cplane < cplanes_to_filter; cplane++) {
       int plane = planes[cplane];
       int row_size = dst->GetRowSize(plane);
       BYTE* q = dst->GetWritePtr(plane);
@@ -492,60 +483,54 @@ PVideoFrame __stdcall AdjustFocusH::GetFrame(int n, IScriptEnvironment* env)
       if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_AVX2) && row_size > 32) {
         af_horizontal_planar_avx2(q, height, pitch, row_size, half_amount);
       }
-      else
-        if (pixelsize==1 && (env->GetCPUFlags() & CPUF_SSE2) && row_size > 16) {
+      else if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_SSSE3) && row_size > 16) {
+        af_horizontal_planar_ssse3(q, height, pitch, row_size, half_amount);
+      }
+      else if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_SSE2) && row_size > 16) {
         af_horizontal_planar_sse2(q, height, pitch, row_size, half_amount);
-      } else
-#ifdef X86_32
-        if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_MMX) && row_size > 8) {
-          af_horizontal_planar_mmx(q,height,pitch,row_size,half_amount);
-        } else
+      }
+      else if (pixelsize == 2 && (env->GetCPUFlags() & CPUF_AVX2) && row_size > 32) {
+        af_horizontal_planar_uint16_t_avx2(q, height, pitch, row_size, half_amount, bits_per_pixel);
+      }
+      else if (pixelsize == 2 && (env->GetCPUFlags() & CPUF_SSE4_1) && row_size > 16) {
+        af_horizontal_planar_uint16_t_sse41(q, height, pitch, row_size, half_amount, bits_per_pixel);
+      }
+      else if (pixelsize == 2 && (env->GetCPUFlags() & CPUF_SSE2) && row_size > 16) {
+        af_horizontal_planar_uint16_t_sse2(q, height, pitch, row_size, half_amount, bits_per_pixel);
+      }
+      else if (pixelsize == 4 && (env->GetCPUFlags() & CPUF_SSE2) && row_size > 16) {
+        af_horizontal_planar_float_sse2(q, height, pitch, row_size, (float)amountd);
+      }
+      else
 #endif
-        if (pixelsize == 2 && (env->GetCPUFlags() & CPUF_AVX2) && row_size > 32) {
-          af_horizontal_planar_uint16_t_avx2(q, height, pitch, row_size, half_amount, bits_per_pixel);
+      {
+        switch (pixelsize) {
+        case 1: af_horizontal_planar_c<uint8_t>(q, height, pitch, row_size, half_amount, bits_per_pixel); break;
+        case 2: af_horizontal_planar_c<uint16_t>(q, height, pitch, row_size, half_amount, bits_per_pixel); break;
+        default: // 4: float
+          af_horizontal_planar_float_c(q, height, pitch, row_size, (float)amountd); break;
         }
-        else if (pixelsize == 2 && (env->GetCPUFlags() & CPUF_SSE4_1) && row_size > 16) {
-          af_horizontal_planar_uint16_t_sse41(q, height, pitch, row_size, half_amount, bits_per_pixel);
-        }
-        else if (pixelsize == 2 && (env->GetCPUFlags() & CPUF_SSE2) && row_size > 16) {
-          af_horizontal_planar_uint16_t_sse2(q, height, pitch, row_size, half_amount, bits_per_pixel);
-        }
-        else if (pixelsize == 4 && (env->GetCPUFlags() & CPUF_SSE2) && row_size > 16) {
-          af_horizontal_planar_float_sse2(q, height, pitch, row_size, (float)amountd);
-        }
-        else
-#endif
-        {
-          switch (pixelsize) {
-          case 1: af_horizontal_planar_c<uint8_t>(q, height, pitch, row_size, half_amount, bits_per_pixel); break;
-          case 2: af_horizontal_planar_c<uint16_t>(q, height, pitch, row_size, half_amount, bits_per_pixel); break;
-          default: // 4: float
-            af_horizontal_planar_float_c(q, height, pitch, row_size, (float)amountd); break;
-          }
-        }
+      }
     }
-  } else {
+  }
+  else {
     if (vi.IsYUY2()) {
       BYTE* q = dst->GetWritePtr();
       const int pitch = dst->GetPitch();
 #ifdef INTEL_INTRINSICS
-      if ((env->GetCPUFlags() & CPUF_SSE2) && vi.width>8) {
+      if ((env->GetCPUFlags() & CPUF_SSE2) && vi.width > 8) {
         af_horizontal_yuy2_sse2(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
-      } else
-#ifdef X86_32
-      if ((env->GetCPUFlags() & CPUF_MMX) && vi.width>8) {
-        af_horizontal_yuy2_mmx(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
-      } else
-#endif
+      }
+      else
 #endif
       {
         copy_frame(src, dst, env, planesYUVA, 1); //in-place
-        af_horizontal_yuy2_c(q,vi.height,pitch,vi.width,half_amount);
+        af_horizontal_yuy2_c(q, vi.height, pitch, vi.width, half_amount);
       }
     }
     else if (vi.IsRGB32() || vi.IsRGB64()) {
 #ifdef INTEL_INTRINSICS
-      if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_SSE2) && vi.width>4) {
+      if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_SSE2) && vi.width > 4) {
         //this one is NOT in-place
         af_horizontal_rgb32_sse2(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
       }
@@ -558,23 +543,18 @@ PVideoFrame __stdcall AdjustFocusH::GetFrame(int n, IScriptEnvironment* env)
         af_horizontal_rgb64_sse2(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount); // really width
       }
       else
-#ifdef X86_32
-      if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_MMX) && vi.width > 2)
-      { //so as this one
-        af_horizontal_rgb32_mmx(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
-      } else
-#endif
 #endif
       {
         copy_frame(src, dst, env, planesYUVA, 1);
-        if(pixelsize==1)
+        if (pixelsize == 1)
           af_horizontal_rgb32_64_c<uint8_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
         else
           af_horizontal_rgb32_64_c<uint16_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
       }
-    } else if (vi.IsRGB24() || vi.IsRGB48()) {
+    }
+    else if (vi.IsRGB24() || vi.IsRGB48()) {
       copy_frame(src, dst, env, planesYUVA, 1);
-      if(pixelsize==1)
+      if (pixelsize == 1)
         af_horizontal_rgb24_48_c<uint8_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
       else
         af_horizontal_rgb24_48_c<uint16_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
@@ -593,7 +573,8 @@ AVSValue __cdecl Create_Sharpen(AVSValue args, void*, IScriptEnvironment* env)
 {
   const double amountH = args[1].AsFloat(), amountV = args[2].AsDblDef(amountH);
 
-  if (amountH < -1.5849625 || amountH > 1.0 || amountV < -1.5849625 || amountV > 1.0) // log2(3)
+  if (std::isnan(amountH) || std::isnan(amountV) ||
+      amountH < -1.5849625 || amountH > 1.0 || amountV < -1.5849625 || amountV > 1.0) // log2(3)
     env->ThrowError("Sharpen: arguments must be in the range -1.58 to 1.0");
 
   if (fabs(amountH) < 0.00002201361136) { // log2(1+1/65536)
@@ -618,7 +599,8 @@ AVSValue __cdecl Create_Blur(AVSValue args, void*, IScriptEnvironment* env)
 {
   const double amountH = args[1].AsFloat(), amountV = args[2].AsDblDef(amountH);
 
-  if (amountH < -1.0 || amountH > 1.5849625 || amountV < -1.0 || amountV > 1.5849625) // log2(3)
+  if (std::isnan(amountH) || std::isnan(amountV) ||
+      amountH < -1.0 || amountH > 1.5849625 || amountV < -1.0 || amountV > 1.5849625) // log2(3)
     env->ThrowError("Blur: arguments must be in the range -1.0 to 1.58");
 
   if (fabs(amountH) < 0.00002201361136) { // log2(1+1/65536)
@@ -686,7 +668,10 @@ TemporalSoften::TemporalSoften( PClip _child, unsigned radius, unsigned luma_thr
     factor = 1; // bitdepth independent. sad normalizes
   else
     factor = vi.BytesFromPixels(1) / pixelsize; // /pixelsize: correction for packed 16 bit rgb
-  scenechange *= ((vi.width/32)*32)*vi.height*factor; // why /*32?
+  // 3.7.6: removed (width/32)*32. The original (2002) ISSE SAD summed only the first
+  // (rowsize/32)*32 bytes of each row
+  // Current SAD routines include the leftover columns since ages.
+  scenechange *= (int64_t)vi.width * vi.height * factor; // 64 bit: exceeds int32 e.g. at 8K
 
 
   int c = 0;
@@ -695,14 +680,14 @@ TemporalSoften::TemporalSoften( PClip _child, unsigned radius, unsigned luma_thr
       planes[c].planeId = PLANAR_Y;
       planes[c++].threshold = luma_thresh;
     }
-    if (chroma_thresh>0) {
+    if (chroma_thresh>0 && vi.NumComponents() >= 3) { // Y/YA: no chroma planes
       planes[c].planeId = PLANAR_V;
       planes[c++].threshold =chroma_thresh;
       planes[c].planeId = PLANAR_U;
       planes[c++].threshold = chroma_thresh;
     }
   } else if (vi.IsYUY2()) {
-    planes[c].planeId=0;
+    planes[c].planeId= DEFAULT_PLANE; // 0
     planes[c++].threshold=luma_thresh|(chroma_thresh<<8);
   } else if (vi.IsRGB()) {  // For RGB We use Luma.
     if (vi.IsPlanar()) {
@@ -714,11 +699,11 @@ TemporalSoften::TemporalSoften( PClip _child, unsigned radius, unsigned luma_thr
       planes[c++].threshold = luma_thresh;
     }
     else { // packed RGB
-      planes[c].planeId = 0;
+      planes[c].planeId = DEFAULT_PLANE; // 0
       planes[c++].threshold = luma_thresh;
     }
   }
-  planes[c].planeId=0;
+  plane_count = c;
 }
 
 //offset is the initial value of x. Used when C routine processes only parts of frames after SSE/MMX paths do their job.
@@ -741,7 +726,7 @@ static void accumulate_line_c(BYTE* _c_plane, const BYTE** planeP, int planes, i
 
   float average_multiplier = 0.0f;
   if constexpr(sizeof(pixel_t) == 2) {
-    // Match the 16-bit SSE paths' float reciprocal and default nearest rounding.
+    // Match the 16-bit SIMD paths: float reciprocal, round half up.
     average_multiplier = 1.0f / static_cast<float>(planes + 1);
   }
 
@@ -768,7 +753,7 @@ static void accumulate_line_c(BYTE* _c_plane, const BYTE** planeP, int planes, i
     if (std::is_floating_point<pixel_t>::value)
       c_plane[x] = (pixel_t)(sum / (planes + 1)); // float: simple average
     else if constexpr(sizeof(pixel_t) == 2)
-      c_plane[x] = (pixel_t)std::nearbyintf(static_cast<float>(sum) * average_multiplier);
+      c_plane[x] = (pixel_t)(int)(static_cast<float>(sum) * average_multiplier + 0.5f); // half up, match SIMD paths
     else
       c_plane[x] = (pixel_t)(((bigsum_t)sum * div + 16384) >> 15); // div = 32768/(planes+1) for integer arithmetic
   }
@@ -824,6 +809,36 @@ static void accumulate_line(BYTE* c_plane, const BYTE** planeP, int planes, size
   // threshold == 255: simple average
   bool maxThreshold = (threshold == 255);
 #ifdef INTEL_INTRINSICS
+  const BYTE* planeP_rest[16]; // AVX2: offset plane pointers for the rest of the row
+  if ((pixelsize <= 2) && (env->GetCPUFlags() & CPUF_AVX2) && rowsize >= 32) {
+    // AVX2 for the mod32 width
+    const size_t rowsize_mod32 = rowsize / 32 * 32;
+    const int thresh16 = threshold << (bits_per_pixel - 8); // for 10-16 bits
+    if (pixelsize == 1) {
+      if (maxThreshold)
+        accumulate_line_avx2<true>(c_plane, planeP, planes, rowsize_mod32, threshold | (threshold << 8), div);
+      else
+        accumulate_line_avx2<false>(c_plane, planeP, planes, rowsize_mod32, threshold | (threshold << 8), div);
+    }
+    else {
+      if (maxThreshold) {
+        if (bits_per_pixel < 16) accumulate_line_16_avx2<true, true>(c_plane, planeP, planes, rowsize_mod32, thresh16, bits_per_pixel);
+        else accumulate_line_16_avx2<true, false>(c_plane, planeP, planes, rowsize_mod32, thresh16, bits_per_pixel);
+      }
+      else {
+        if (bits_per_pixel < 16) accumulate_line_16_avx2<false, true>(c_plane, planeP, planes, rowsize_mod32, thresh16, bits_per_pixel);
+        else accumulate_line_16_avx2<false, false>(c_plane, planeP, planes, rowsize_mod32, thresh16, bits_per_pixel);
+      }
+    }
+    if (rowsize_mod32 == rowsize)
+      return;
+    // The rest <32 bytes falls through SSSE3/SSE4.1/C with modded pointers and sizes
+    c_plane += rowsize_mod32;
+    for (int i = 0; i < planes; i++)
+      planeP_rest[i] = planeP[i] + rowsize_mod32;
+    planeP = planeP_rest;
+    rowsize -= rowsize_mod32;
+  }
   if ((pixelsize == 2) && (env->GetCPUFlags() & CPUF_SSE4) && rowsize >= 16) {
     // <maxThreshold, lessThan16bit>
     if(maxThreshold) {
@@ -936,11 +951,11 @@ static int64_t calculate_sad(const BYTE* cur_ptr, const BYTE* other_ptr, int cur
 #ifdef INTEL_INTRINSICS
   // todo: sse for float
   if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_SSE2) && rowsize >= 16) {
-    return (int64_t)calculate_sad_sse2<false>(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height);
+    return calculate_sad_8_or_16_sse2<uint8_t, false>(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height);
   }
 #ifdef X86_32
   if ((pixelsize ==1 ) && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && rowsize >= 8) {
-    return (int64_t)calculate_sad_isse(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height);
+    return calculate_sad_isse<false>(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height);
   }
 #endif
   // sse2 uint16_t
@@ -960,11 +975,12 @@ static int64_t calculate_sad(const BYTE* cur_ptr, const BYTE* other_ptr, int cur
 PVideoFrame TemporalSoften::GetFrame(int n, IScriptEnvironment* env)
 {
   int radius = (kernel-1) / 2;
-  int c = 0;
 
   // Just skip if silly settings
 
-  if ((!luma_threshold && !chroma_threshold) || !radius)
+  // returns the frame unchanged when nothing is left to process
+  // (e.g. Y/YA + luma_threshold = 0 --> empty plane list)
+  if ((!luma_threshold && !chroma_threshold) || !radius || plane_count == 0)
   {
     PVideoFrame ret = child->GetFrame(n, env); // P.F.
     return ret;
@@ -991,7 +1007,7 @@ PVideoFrame TemporalSoften::GetFrame(int n, IScriptEnvironment* env)
   PVideoFrame CenterFrame = frames[radius];
   env->MakeWritable(&CenterFrame);
 
-  do {
+  for (int c = 0; c < plane_count; c++) {
     const BYTE* planeP[16];
     const BYTE* planeP2[16];
     int planePitch[16];
@@ -1021,7 +1037,7 @@ PVideoFrame TemporalSoften::GetFrame(int n, IScriptEnvironment* env)
       bool skiprest = false;
       for (int i = radius-1; i>=0; i--) { // Check frames backwards
         if ((!skiprest) && (!planeDisabled[i])) {
-          int sad = (int)calculate_sad(c_plane, planeP[i], pitch, planePitch[i], CenterFrame->GetRowSize(planes[c].planeId), h, pixelsize, bits_per_pixel, env);
+          int64_t sad = calculate_sad(c_plane, planeP[i], pitch, planePitch[i], CenterFrame->GetRowSize(planes[c].planeId), h, pixelsize, bits_per_pixel, env);
           if (sad < scenechange) {
             planePitch2[d2] = planePitch[i];
             planeP2[d2++] = planeP[i];
@@ -1036,7 +1052,7 @@ PVideoFrame TemporalSoften::GetFrame(int n, IScriptEnvironment* env)
       skiprest = false;
       for (int i = radius; i < 2*radius; i++) { // Check forward frames
         if ((!skiprest)  && (!planeDisabled[i])) {   // Disable this frame on next plane (so that Y can affect UV)
-          int sad = (int)calculate_sad(c_plane, planeP[i], pitch, planePitch[i], CenterFrame->GetRowSize(planes[c].planeId), h, pixelsize, bits_per_pixel, env);
+          int64_t sad = calculate_sad(c_plane, planeP[i], pitch, planePitch[i], CenterFrame->GetRowSize(planes[c].planeId), h, pixelsize, bits_per_pixel, env);
           if (sad < scenechange) {
             planePitch2[d2] = planePitch[i];
             planeP2[d2++] = planeP[i];
@@ -1081,8 +1097,7 @@ PVideoFrame TemporalSoften::GetFrame(int n, IScriptEnvironment* env)
       }
     } else { // Just maintain the plane
     }
-    c++;
-  } while (planes[c].planeId);
+  }
 
   //  PVideoFrame result = frames[radius]; // we are using CenterFrame instead
   //  return result;

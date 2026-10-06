@@ -120,7 +120,7 @@ AVSValue __cdecl SwapUV::CreateSwapUV(AVSValue args, void* , IScriptEnvironment*
 SwapUV::SwapUV(PClip _child, IScriptEnvironment* env) : GenericVideoFilter(_child)
 {
   if (!vi.IsYUV() && !vi.IsYUVA())
-    env->ThrowError("SwapUV: YUV or YUVA data only!");
+    env->ThrowError("SwapUV: Y, YA, YUV or YUVA data only!");
 }
 
 PVideoFrame __stdcall SwapUV::GetFrame(int n, IScriptEnvironment* env)
@@ -247,7 +247,7 @@ SwapUVToY::SwapUVToY(PClip _child, int _mode, IScriptEnvironment* env)
       env->ThrowError("PlaneToY: Clip has no Alpha channel!");
 
   if (!vi.IsYUV() && !vi.IsYUVA() && YUVmode )
-    env->ThrowError("PlaneToY: clip is not YUV!");
+    env->ThrowError("PlaneToY: clip is not Y, YA, YUV or YUVA!");
 
   // IsRGB() covers both packed (RGB24/32/48/64) and planar RGB/RGBA.
   if (!vi.IsRGB() && RGBmode)
@@ -255,6 +255,10 @@ SwapUVToY::SwapUVToY(PClip _child, int _mode, IScriptEnvironment* env)
 
   if (vi.NumComponents() == 1 && mode != YToY8)
     env->ThrowError("PlaneToY: channel cannot be extracted from a greyscale clip!");
+
+  // YA: only Y and A are valid
+  if (vi.IsYA() && mode != YToY8 && mode != AToY8)
+    env->ThrowError("PlaneToY: channel cannot be extracted from a YA clip!");
 
   if(YUVmode && (mode!=YToY8)){
     vi.height >>= vi.GetPlaneHeightSubsampling(PLANAR_U);
@@ -517,11 +521,13 @@ AVSValue __cdecl SwapYToUV::CreateYToYUVA(AVSValue args, void* , IScriptEnvironm
 SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScriptEnvironment* env)
   : GenericVideoFilter(_child), clip(_clip), clipY(_clipY), clipA(_clipA)
 {
+  // with alpha clip: clipU must be Y, YA or YUVA (IsYUVA includes YA); YUV and YUY2 are rejected
   if(!(vi.IsYUVA() || vi.IsY()) && clipA)
-    env->ThrowError("YToUV: Only Y or YUVA data accepted when alpha clip is provided"); // Y, YUV and YUY2
+    env->ThrowError("YToUV: Only Y, YA or YUVA data accepted when alpha clip is provided");
+  // IsYUV includes Y and YUY2, IsYUVA includes YA: rejects RGB only
   if (!vi.IsYUV() && !vi.IsYUVA())
   {
-    env->ThrowError("YToUV: Only YUV or YUVA data accepted"); // Y, YUV and YUY2
+    env->ThrowError("YToUV: Only Y, YA, YUV or YUVA data accepted");
   }
 
   const VideoInfo& vi2 = clip->GetVideoInfo();
@@ -536,7 +542,7 @@ SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScr
   if (!clipY) {
     if (vi.IsYUY2())
       vi.width *= 2;
-    else if (vi.IsY()) {
+    else if (vi.IsY() || vi.IsYA()) { // only the Y plane is used
       switch(vi.BitsPerComponent()) {
       case 8: vi.pixel_type = VideoInfo::CS_YV24; break;
       case 10: vi.pixel_type = VideoInfo::CS_YUV444P10; break;
@@ -568,8 +574,6 @@ SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScr
   }
 
   if (clipA) {
-    if(vi.IsYUY2())
-      env->ThrowError("YToUV: YUY2 not supported with alpha clip");
     const VideoInfo& vi4 = clipA->GetVideoInfo();
     if (vi4.width != vi3.width || vi4.height != vi3.height) // Y width == A width
       env->ThrowError("YToUV: different Y and A clip dimensions");
@@ -588,13 +592,17 @@ SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScr
   case 32: vi.pixel_type = clipA ? VideoInfo::CS_YUVA420PS : VideoInfo::CS_YUV420PS; break;
   }
 
+  // subsampling factor: Y/U size
+  const int sub_w = vi3.width / vi.width;
+  const int sub_h = vi3.height / vi.height;
+
   if (vi3.width == vi.width) // Y width == U width -> subsampling 1:1
     vi.pixel_type |= VideoInfo::CS_Sub_Width_1;
   else if (vi3.width == vi.width * 2) // Y width == U width*2 -> horiz. subsampling 2
-    vi.width *= 2; // YV12 subsampling CS_Sub_Width_2 is o.k.
+    vi.width *= 2; // 4:2:0 subsampling CS_Sub_Width_2 is o.k.
   else if (vi3.width == vi.width * 4) { // Y width == U width*4 -> horiz. subsampling 4
     vi.pixel_type |= VideoInfo::CS_Sub_Width_4;
-    vi.width *= 4; // final clip width is 3x of the U channel width
+    vi.width *= 4; // final clip width is 4x of the U channel width
   }
   else
     env->ThrowError("YToUV: Video width ratio does not match any internal colorspace.");
@@ -602,13 +610,20 @@ SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScr
   if (vi3.height == vi.height)
     vi.pixel_type |= VideoInfo::CS_Sub_Height_1;
   else if (vi3.height == vi.height * 2)
-    vi.height *= 2;
+    vi.height *= 2; // 4:2:0 subsampling CS_Sub_Height_2 is o.k.
   else if (vi3.height == vi.height * 4) {
     vi.pixel_type |= VideoInfo::CS_Sub_Height_4;
     vi.height *= 4;
   }
   else
     env->ThrowError("YToUV: Video height ratio does not match any internal colorspace.");
+
+  // Check valid pairs:
+  // 1x1 (444), 2x1 (422), 2x2 (420), 4x1 (411), 1x2 (440), 4x4 (410)
+  // To prevent "Filter attempted to create VideoFrame with invalid pixel_type"
+  const bool valid_wh_pair = sub_h == 1 || (sub_h == 2 && sub_w <= 2) || (sub_h == 4 && sub_w == 4);
+  if (!valid_wh_pair)
+    env->ThrowError("YToUV: Video width and height ratio (%dx%d) does not match any internal colorspace.", sub_w, sub_h);
 }
 
 template <bool has_clipY>
@@ -799,14 +814,21 @@ CombinePlanes::CombinePlanes(PClip _child, PClip _clip2, PClip _clip3, PClip _cl
       // special case. Figure out RGB(A) or YUV(A) or Y
       bool allIsYUV = true;
       bool allIsRGB = true;
+      bool hasY = false, hasA = false;
       for (int i = 0; i < target_plane_count; i++) {
         char ch = toupper(_target_planes_str[i]);
         if (ch == 'R' || ch == 'G' || ch == 'B') allIsYUV = false;
         if (ch == 'Y' || ch == 'U' || ch == 'V') allIsRGB = false;
+        if (ch == 'Y') hasY = true;
+        if (ch == 'A') hasA = true;
       }
+      // exactly Y and A: Y+alpha
+      const bool isYA = target_plane_count == 2 && hasY && hasA;
       if (allIsYUV || allIsRGB) {
         int new_pixel_type;
-        if (allIsRGB)
+        if (isYA)
+          new_pixel_type = VideoInfo::CS_GENERIC_YA;
+        else if (allIsRGB)
           new_pixel_type = target_plane_count == 4 ? VideoInfo::CS_GENERIC_RGBAP : VideoInfo::CS_GENERIC_RGBP;
         else // if (allIsYUV)
           new_pixel_type = target_plane_count == 4 ? VideoInfo::CS_GENERIC_YUVA444 : VideoInfo::CS_GENERIC_YUV444;
@@ -840,7 +862,8 @@ CombinePlanes::CombinePlanes(PClip _child, PClip _clip2, PClip _clip3, PClip _cl
 
   // if source plane is given, use it otherwise assume these
   const char * rgb_source_planes_str_def = "RGBA";
-  const char * yuv_source_planes_str_def = allIsGrey ? "YYYY" : "YUVA";
+  // YA target: plane #1 is alpha
+  const char * yuv_source_planes_str_def = allIsGrey ? "YYYY" : vi_default.IsYA() ? "YA" : "YUVA";
 
   int last_clip_index = 0;
   for (int i = 0; i < target_plane_count; i++) {
@@ -912,12 +935,61 @@ CombinePlanes::CombinePlanes(PClip _child, PClip _clip2, PClip _clip3, PClip _cl
       case 'V': current_source_plane = PLANAR_V; break;
       }
       source_planes[i] = current_source_plane;
+      // Detect the possible origin of the chroma siting information for the target U/V planes.
+      // The source planes must be the U or V planes of a subsampled YUV clip with the same subsampling
+      // as the target.
+      // Source clip index is saved for later use, for copying its _ChromaLocation property to target.
+      if ((current_target_plane == PLANAR_U || current_target_plane == PLANAR_V) &&
+        (current_source_plane == PLANAR_U || current_source_plane == PLANAR_V) &&
+        IsSubsampledYUV(src_vi) && IsSubsampledYUV(vi_default) && // YUY2 was already converted to planar YV16
+        src_vi.GetPlaneWidthSubsampling(PLANAR_U) == vi_default.GetPlaneWidthSubsampling(PLANAR_U) &&
+        src_vi.GetPlaneHeightSubsampling(PLANAR_U) == vi_default.GetPlaneHeightSubsampling(PLANAR_U))
+        chroma_source_clip[current_target_plane == PLANAR_U ? 0 : 1] = last_clip_index;
       // check dimensions
       int source_plane_width = src_vi.width >> src_vi.GetPlaneWidthSubsampling(current_source_plane);
       int source_plane_height = src_vi.height >> src_vi.GetPlaneHeightSubsampling(current_source_plane);
       if(source_plane_width != target_plane_width || source_plane_height != target_plane_height)
         env->ThrowError("CombinePlanes: source and target plane dimensions are different");
     }
+  }
+
+  // Case: target U or V is not listed in 'planes'.
+  // We keep the first clip's U/V plane as siting source,
+  // if it has the same chroma subsampling as the target.
+  const VideoInfo& vi_first = clips[0]->GetVideoInfo();
+  if (IsSubsampledYUV(vi_default) && IsSubsampledYUV(vi_first) &&
+    vi_first.GetPlaneWidthSubsampling(PLANAR_U) == vi_default.GetPlaneWidthSubsampling(PLANAR_U) &&
+    vi_first.GetPlaneHeightSubsampling(PLANAR_U) == vi_default.GetPlaneHeightSubsampling(PLANAR_U)) {
+    bool listedU = false, listedV = false;
+    for (int i = 0; i < target_plane_count; i++) {
+      if (target_planes[i] == PLANAR_U) listedU = true;
+      if (target_planes[i] == PLANAR_V) listedV = true;
+    }
+    if (!listedU) chroma_source_clip[0] = 0;
+    if (!listedV) chroma_source_clip[1] = 0;
+  }
+
+  // Decide is Subframe-magic zero-copy shortcut can be used.
+  // (subframe: framebuffer is kept, but target frame plane pointers are shuffled from the source's ones)
+  // It can be used only if the target has the source's dimensions and U/V geometry, and the source has
+  // alpha when the target has.
+  // The pitch conditions are checked per frame.
+  {
+    // planes #1 and #2: U and V (YUV) or B and R (planar RGB); not present in Y and YA
+    const bool targetHasPlanes12 = vi_default.NumComponents() >= 3;
+    const bool sourceHasPlanes12 = vi_first.NumComponents() >= 3;
+    const bool targetHasA = vi_default.IsYUVA() || vi_default.IsPlanarRGBA(); // IsYUVA() includes YA
+    const bool sourceHasA = vi_first.IsYUVA() || vi_first.IsPlanarRGBA();
+    // planes #1/#2 subsampling; 0 for RGB, and for Y/YA (no such planes, safe to call)
+    auto chromaSubsamplingW = [](const VideoInfo& v) { return (v.IsRGB() || v.NumComponents() < 3) ? 0 : v.GetPlaneWidthSubsampling(PLANAR_U); };
+    auto chromaSubsamplingH = [](const VideoInfo& v) { return (v.IsRGB() || v.NumComponents() < 3) ? 0 : v.GetPlaneHeightSubsampling(PLANAR_U); };
+    subframe_possible = !clips[1] &&
+      vi_default.NumComponents() <= vi_first.NumComponents() &&
+      vi_default.width == vi_first.width && vi_default.height == vi_first.height &&
+      (!targetHasPlanes12 || (sourceHasPlanes12 &&
+        chromaSubsamplingW(vi_default) == chromaSubsamplingW(vi_first) &&
+        chromaSubsamplingH(vi_default) == chromaSubsamplingH(vi_first))) &&
+      (!targetHasA || sourceHasA);
   }
 }
 
@@ -926,16 +998,69 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
 
   VideoInfo vi_src = clips[0]->GetVideoInfo();
 
+  // Frame properties come from the first clip; _ChromaLocation follows the U/V source clips:
+  // - target not subsampled (Y, YA, 4:4:4, RGB): removed
+  // - U/V from a U/V plane of a same-subsampled clip: that clip's value (or removed if none)
+  // - U and V sources disagree: removed
+  // - unlisted U/V plane: taken from the first clip
+  // - no sited U/V source (e.g. from Y planes): first clip's value kept
+  const bool targetHasSiting = IsSubsampledYUV(vi) || vi.IsYUY2();
+
+  const int clipU = chroma_source_clip[0]; // indexes, -1 if none
+  const int clipV = chroma_source_clip[1];
+
+  // _ChromaLocation of the U and V source frames, noted when the frames are fetched anyway.
+  // Values are kept instead of frame references: an extra reference would make
+  // the reused source frames non-writable (see the IsWritable() shortcuts below).
+  bool notedU = false, notedV = false;
+  bool hasChromaLocationSpecifiedByU = false;
+  bool hasChromaLocationSpecifiedByV = false;
+  int ChromaLocationSpecifiedByU = 0;
+  int ChromaLocationSpecifiedByV = 0;
+
+  auto readChromaLocation = [&](const PVideoFrame& f, bool& has, int& loc) {
+    const AVSMap* props = env->getFramePropsRO(f);
+    has = env->propNumElements(props, "_ChromaLocation") > 0;
+    if (has)
+      loc = (int)env->propGetIntSaturated(props, "_ChromaLocation", 0, nullptr);
+  };
+  auto noteChromaLocation = [&](int clip_index, const PVideoFrame& frame) {
+    if (!targetHasSiting || !frame)
+      return;
+    if (clip_index == clipU && !notedU) { readChromaLocation(frame, /*ref*/hasChromaLocationSpecifiedByU, /*ref*/ChromaLocationSpecifiedByU); notedU = true; }
+    if (clip_index == clipV && !notedV) { readChromaLocation(frame, /*ref*/hasChromaLocationSpecifiedByV, /*ref*/ChromaLocationSpecifiedByV); notedV = true; }
+  };
+
+  // useful lambda to set or remove _ChromaLocation in the target frame's properties
+  auto fixProps = [&](PVideoFrame& frame) {
+    if (!targetHasSiting) {
+      env->propDeleteKey(env->getFramePropsRW(frame), "_ChromaLocation");
+      return;
+    }
+    if (clipU < 0 && clipV < 0)
+      return; // no siting info in the U/V sources: keep the first clip's
+    // values were noted right after the frames' GetFrame (every path fetches all clips it uses)
+    const bool disagree = clipU >= 0 && clipV >= 0 && (hasChromaLocationSpecifiedByU != hasChromaLocationSpecifiedByV || (hasChromaLocationSpecifiedByU && ChromaLocationSpecifiedByU != ChromaLocationSpecifiedByV));
+    const bool hasChromaLocationSpecified = clipU >= 0 ? hasChromaLocationSpecifiedByU : hasChromaLocationSpecifiedByV;
+    const int actualChromaLocation = clipU >= 0 ? ChromaLocationSpecifiedByU : ChromaLocationSpecifiedByV;
+    AVSMap* props = env->getFramePropsRW(frame);
+    if (disagree || !hasChromaLocationSpecified)
+      env->propDeleteKey(props, "_ChromaLocation");
+    else
+      env->propSetInt(props, "_ChromaLocation", actualChromaLocation, AVSPropAppendMode::PROPAPPENDMODE_REPLACE);
+  };
+
   // check if fast Subframe magic can replace BitBlt
-  if (!clips[1] && vi.NumComponents() <= vi_src.NumComponents()) // YUV<->RGB, YUVA<->RGBA YUV->Y
+  if (subframe_possible) // single clip; YUV<->RGB, YUVA<->RGBA, YUV->Y, plane shuffles
   {
     // we have only one clip, plane shuffle is valid if target has less plane that defined in source
     PVideoFrame src = clips[0]->GetFrame(n, env);
+    noteChromaLocation(0, src); // clip index 0: source clip
 
-    int planes_y[4]  = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
-    int planes_r[4]  = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+    int planes_y[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+    int planes_r[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
     int planes_ya[2] = { PLANAR_Y, PLANAR_A };
-    int *planes = vi_src.IsYA() ? planes_ya : (vi_src.IsYUV() || vi_src.IsYUVA()) ? planes_y : planes_r;
+    int* planes = vi_src.IsYA() ? planes_ya : (vi_src.IsYUV() || vi_src.IsYUVA()) ? planes_y : planes_r;
 
     int Offsets[4] = {};
     int Pitches[4] = {}, NewPitches[4] = {};
@@ -988,33 +1113,44 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
       //  3010       2010        1010       10      new offsets inside
     }
 
-    PVideoFrame dst;
-    if (vi.NumComponents() == 4) {
-      dst = env->SubframePlanarA(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight(),
-        RelOffsets[1], RelOffsets[2], NewPitches[1], RelOffsets[3]);
-    }
-    else if (vi.NumComponents() == 3) {
-      dst = env->SubframePlanar(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight(),
-        RelOffsets[1], RelOffsets[2], NewPitches[1]);
-    }
-    else if (vi.IsYA()) {
-      // dummy 0 offset/pitch for the unused U/V args.
-      dst = env->SubframePlanarA(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight(),
-        0, 0, 0, RelOffsets[3]);
-    }
-    else {
-      dst = env->Subframe(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight());
-    }
+    // planes #1/#2 (U/V or B/R) share one pitch, alpha gets the Y pitch: if the chosen source planes do not
+    // match that, fall through to the copying paths below.
+    const bool targetHasPlanes12 = vi.NumComponents() >= 3; // U/V or B/R
+    const bool targetHasA = vi.IsYUVA() || vi.IsPlanarRGBA();
+    if ((!targetHasPlanes12 || NewPitches[1] == NewPitches[2]) && (!targetHasA || NewPitches[3] == NewPitches[0]))
+    {
+      PVideoFrame dst;
+      if (vi.NumComponents() == 4) {
+        dst = env->SubframePlanarA(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight(),
+          RelOffsets[1], RelOffsets[2], NewPitches[1], RelOffsets[3]);
+      }
+      else if (vi.NumComponents() == 3) {
+        dst = env->SubframePlanar(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight(),
+          RelOffsets[1], RelOffsets[2], NewPitches[1]);
+      }
+      else if (vi.IsYA()) {
+        // dummy 0 offset/pitch for the unused U/V args.
+        dst = env->SubframePlanarA(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight(),
+          0, 0, 0, RelOffsets[3]);
+      }
+      else {
+        dst = env->Subframe(src, RelOffsets[0], NewPitches[0], NewRowSizes[0], src->GetHeight());
+      }
 
-    // RGB(A)<->YUV(A) color space conversion can't be caught by Subframe...()
-    dst->AmendPixelType(vi.pixel_type);
+      // RGB(A)<->YUV(A) color space conversion can't be caught by Subframe...()
+      dst->AmendPixelType(vi.pixel_type);
+      fixProps(dst); // safe to modify props after a subframe
 
-    return dst;
+      return dst;
+    }
   }
+  // end of SubFrame optimization
 
   // check if first clip could be used as the target clip
   PVideoFrame src = clips[0]->GetFrame(n, env);
   PVideoFrame src1 = clips[1] ? clips[1]->GetFrame(n, env) : nullptr;
+  noteChromaLocation(0, src);
+  noteChromaLocation(1, src1); // handles nullptr frame
 
   // case 1: when Y is kept from the original clip and other planes may be merged
   if (vi_src.IsSameColorspace(vi) && target_planes[0] == source_planes[0]) {
@@ -1040,7 +1176,10 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
           if (i == 1)
             src_other = src1; // already requested
           else
+          {
             src_other = clips[i]->GetFrame(n, env); // last defined clip is used for the others
+            noteChromaLocation(i, src_other);
+          }
         }
 
         if (src_other) {
@@ -1051,6 +1190,7 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
         }
       }
 
+      fixProps(src);
       return src;
     }
   }
@@ -1068,7 +1208,9 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
     // clip #0 format does not match with the output, maybe it is a single plane
     // let's try with the second (clip #1) if it can be used
     // Optimization trick is intentionally not extended to Y+A (IsYA(), NumComponents()==2)
-    if (clips[1]->GetVideoInfo().IsSameColorspace(vi) &&
+    // All target planes must be listed: target_planes[] is filled only up to planecount, and an
+    // unlisted plane must not keep clip #1's content (it is the first clip's, see below).
+    if (clips[1]->GetVideoInfo().IsSameColorspace(vi) && planecount == vi.NumComponents() &&
       // the rest plane IDs are matching between source and target
       vi.NumComponents() >= 3 && target_planes[1] == source_planes[1] && target_planes[2] == source_planes[2] &&
       (vi.NumComponents() < 4 || (vi.NumComponents() == 4 && target_planes[3] == source_planes[3])))
@@ -1087,6 +1229,7 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
           src->GetReadPtr(source_plane), src->GetPitch(source_plane), src->GetRowSize(source_plane), src->GetHeight(source_plane));
 
         env->copyFrameProps(src, src1);
+        fixProps(src1);
 
         return src1;
       }
@@ -1096,13 +1239,84 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
   PVideoFrame dst = env->NewVideoFrame(vi);
   bool propCopied = false;
 
+  // Target planes not listed in 'planes': copy from the first clip, like the in-place paths
+  // (Subframe, writable first frame) keep them, matched by plane slot (Y/G, U/B, V/R, A).
+  // If the first clip has no plane of the same size at that slot, it is filled with a neutral value.
+  {
+    const int planes_yuv[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A };
+    const int planes_rgb[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A };
+    const int planes_ya[2] = { PLANAR_Y, PLANAR_A };
+    const int* all_planes = vi.IsYA() ? planes_ya : vi.IsRGB() ? planes_rgb : planes_yuv;
+    auto slotOf = [](int plane) {
+      switch (plane) {
+      case PLANAR_Y: case PLANAR_G: return 0;
+      case PLANAR_U: case PLANAR_B: return 1;
+      case PLANAR_V: case PLANAR_R: return 2;
+      default: return 3; // PLANAR_A
+      }
+    };
+    // the plane of format v at a slot, 0 if it has none
+    auto planeAtSlot = [](const VideoInfo& v, int slot) -> int {
+      const bool hasA = v.IsYUVA() || v.IsPlanarRGBA(); // IsYUVA() includes YA
+      if (slot == 3) return hasA ? PLANAR_A : 0;
+      if (v.IsRGB()) return slot == 0 ? PLANAR_G : slot == 1 ? PLANAR_B : PLANAR_R;
+      if (slot == 0) return PLANAR_Y;
+      if (v.IsY() || v.IsYA()) return 0;
+      return slot == 1 ? PLANAR_U : PLANAR_V;
+    };
+    for (int k = 0; k < vi.NumComponents(); k++) {
+      const int plane = all_planes[k];
+      bool listed = false;
+      for (int i = 0; i < planecount; i++)
+        if (target_planes[i] == plane) listed = true;
+      if (listed)
+        continue;
+      // unlisted! Either copy from the first clip or fill with neutral value
+      BYTE* dstp = dst->GetWritePtr(plane);
+      const int dst_pitch = dst->GetPitch(plane);
+      const int rowsize = dst->GetRowSize(plane);
+      const int height = dst->GetHeight(plane);
+      // Same family: the slot gives the same plane. YUV <-> RGB: it gives the plane the
+      // Subframe path takes (e.g. B from U), so the result does not depend on the path taken.
+      const int src_plane = planeAtSlot(vi_src, slotOf(plane));
+      if (src_plane && src->GetRowSize(src_plane) == rowsize && src->GetHeight(src_plane) == height) {
+        env->BitBlt(dstp, dst_pitch, src->GetReadPtr(src_plane), src->GetPitch(src_plane), rowsize, height);
+        continue;
+      }
+      const bool isChroma = plane == PLANAR_U || plane == PLANAR_V;
+      const bool isAlpha = plane == PLANAR_A;
+      // neutral: half for U/V, opaque for A, black for the rest (Y,R,G,B).
+      // Black is per-frame _ColorRange dependent. (0 or 16d)
+      bool fullRange;
+      {
+        const AVSMap* props = env->getFramePropsRO(src);
+        if (env->propNumElements(props, "_ColorRange") > 0)
+          fullRange = env->propGetIntSaturated(props, "_ColorRange", 0, nullptr) == ColorRange_Compat_e::AVS_COLORRANGE_FULL;
+        else
+          fullRange = vi.IsRGB(); // YUV default false, RGB true
+      }
+      if (pixelsize == 1)
+        fill_plane<uint8_t>(dstp, height, rowsize, dst_pitch,
+          (uint8_t)(isChroma ? 128 : isAlpha ? 255 : fullRange ? 0 : 16));
+      else if (pixelsize == 2)
+        fill_plane<uint16_t>(dstp, height, rowsize, dst_pitch,
+          (uint16_t)(isChroma ? (1 << (bits_per_pixel - 1)) : isAlpha ? ((1 << bits_per_pixel) - 1) : fullRange ? 0 : (16 << (bits_per_pixel - 8))));
+      else
+        fill_plane<float>(dstp, height, rowsize, dst_pitch,
+          isChroma ? 0.0f : isAlpha ? 1.0f : fullRange ? 0.0f : 16.0f / 255);
+    }
+  }
+
   for (int i = 0; i < planecount; i++) {
     if (clips[i]) { // source clips can be less than defined planes
       if (i > 0) { // clip #0 was already requested
         if (i == 1) // clip #1 was already requested
           src = src1;
         else
+        {
           src = clips[i]->GetFrame(n, env); // last defined clip is used for the others
+          noteChromaLocation(i, src);
+        }
       }
   
       if (!propCopied) {
@@ -1118,5 +1332,6 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
       src->GetReadPtr(source_plane), src->GetPitch(source_plane), src->GetRowSize(source_plane), src->GetHeight(source_plane));
   }
 
+  fixProps(dst);
   return dst;
 }

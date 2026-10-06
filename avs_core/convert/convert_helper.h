@@ -38,114 +38,58 @@
 #include <avisynth.h>
 #include <string>
 #include <cstring>
+#include "frame_prop_enums.h"
 
-// ITU-T H.265 (Table E.1)
-typedef enum ColorRange_e {
-  AVS_RANGE_LIMITED = 0,  // video_full_range_flag = 0, studio swing, e.g. 16-235 for 8-bit luma
-  AVS_RANGE_FULL = 1,  // video_full_range_flag = 1, full swing, e.g. 0-255 for 8-bit luma
-} ColorRange_e;
 
-// Old constants borrowed from VapourSynth, which transitioned to the ITU-T H.265 standard (Table E.1)
-// Just the opposite as the standard.
-typedef enum ColorRange_Compat_e {
-  AVS_COLORRANGE_FULL = 0,
-  AVS_COLORRANGE_LIMITED = 1
-} ColorRange_Compat_e;
+// Helper struct and offset calculator for resamplers.
+// Chroma sample position of a subsampled chroma plane, in luma pixel units, relative to the
+// top-left luma sample of the xs*ys luma block the chroma sample belongs to.
+// x, y: progressive; ty, by: top and bottom field (in field luma rows), for interlaced use.
+struct ChromaSitingOffsets { float x, y, ty, by; };
 
-typedef enum ChromaLocation_e {
-  AVS_CHROMA_UNUSED = -1,
-  AVS_CHROMA_LEFT = 0,
-  AVS_CHROMA_CENTER = 1,
-  AVS_CHROMA_TOP_LEFT = 2,
-  AVS_CHROMA_TOP = 3,
-  AVS_CHROMA_BOTTOM_LEFT = 4,
-  AVS_CHROMA_BOTTOM = 5,
-  AVS_CHROMA_DV = 6 // Special to Avisynth
-} ChromaLocation_e;
+// Siting is defined per axis (as in H.273 / ffmpeg's chroma location positions):
+// - horizontal: co-sited (0) for left, top_left, bottom_left
+//               centered ((xs-1)/2) for center, top, bottom
+// - vertical:   top (0) for top_left, top
+//               centered ((ys-1)/2) for left, center
+//               bottom (ys-1) for bottom_left, bottom
+// On a non-subsampled axis (s=1) all of them give 0, so e.g. 4:4:0 'left' equals 'center'
+// and 4:1:1 'top' equals 'center'.
+// "dv" (DV-PAL 4:2:0, Avisynth special): Cb and Cr on alternate lines, both horizontally
+// co-sited: U = bottom_left, V = top_left (Cr on the top row, see e.g. libvpx y4minput.c
+// '420paldv'). Field positions are not split for it.
+// Returns false for an unknown chromaloc.
+bool GetChromaSitingOffsets(int chromaloc, bool planeV, int xs, int ys, ChromaSitingOffsets& o);
 
-typedef enum FieldBased_e {
-  AVS_FIELD_PROGRESSIVE = 0,
-  AVS_FIELD_BOTTOM = 1,
-  AVS_FIELD_TOP = 2
-} FieldBased_e;
+// True if both chroma locations give the same siting for both chroma planes of an xs*ys
+// subsampled format (e.g. 'top' and 'center' for 4:2:2).
+bool IsSameChromaSiting(int chromaloc1, int chromaloc2, int xs, int ys);
 
-// https://www.itu.int/rec/T-REC-H.265-202108-I
-/* ITU-T H.265 Table E.5 */
-typedef enum Matrix_e {
-  AVS_MATRIX_RGB = 0, /* The identity matrix. Typically used for RGB, may also be used for XYZ */
-  AVS_MATRIX_BT709 = 1, /* ITU-R Rec. BT.709-5 */
-  AVS_MATRIX_UNSPECIFIED = 2, /* Image characteristics are unknown or are determined by the application */
-  AVS_MATRIX_BT470_M = 4, // instead of AVS_MATRIX_FCC
-  // FCC Title 47 Code of Federal Regulations (2003) 73.682 (a) (20)
-  // Rec. ITU-R BT.470-6 System M (historical)
-  AVS_MATRIX_BT470_BG = 5, /* Equivalent to 6. */
-  // ITU-R Rec. BT.470-6 System B, G (historical)
-  // Rec. ITU-R BT.601-7 625
-  // Rec. ITU-R BT.1358-0 625 (historical)
-  // Rec. ITU-R BT.1700-0 625 PAL and 625 SECAM
-  AVS_MATRIX_ST170_M = 6,  /* Equivalent to 5. */
-  // Rec. ITU-R BT.601-7 525
-  // Rec. ITU-R BT.1358-1 525 or 625 (historical)
-  // Rec. ITU-R BT.1700-0 NTSC
-  // SMPTE ST 170 (2004)
-  // SMPTE 170M (2004)
-  AVS_MATRIX_ST240_M = 7, // SMPTE ST 240 (1999, historical)
-  AVS_MATRIX_YCGCO = 8,
-  AVS_MATRIX_BT2020_NCL = 9, 
-  // Rec. ITU-R BT.2020 non-constant luminance system
-  // Rec. ITU-R BT.2100-2 Y'CbCr
-  AVS_MATRIX_BT2020_CL = 10, /* Rec. ITU-R BT.2020 constant luminance system */
-  AVS_MATRIX_CHROMATICITY_DERIVED_NCL = 12, /* Chromaticity derived non-constant luminance system */
-  AVS_MATRIX_CHROMATICITY_DERIVED_CL = 13, /* Chromaticity derived constant luminance system */
-  AVS_MATRIX_ICTCP = 14, // REC_2100_ICTCP, Rec. ITU-R BT.2100-2 ICTCP
-  AVS_MATRIX_AVERAGE = 9999, // Avisynth compatibility
-} Matrix_e;
+// ChromaInPlacement/ChromaOutPlacement name of a ChromaLocation_e value,
+// nullptr for AVS_CHROMA_UNUSED or an unknown value.
+const char* GetChromaLocationName(int chromaloc);
 
-// Pre-Avisynth 3.7.1 matrix constants, with implicite PC/limited range
-typedef enum Old_Avs_Matrix_e {
-  AVS_OLD_MATRIX_Rec601 = 0, 
-  AVS_OLD_MATRIX_Rec709 = 1,
-  AVS_OLD_MATRIX_PC_601 = 2,
-  AVS_OLD_MATRIX_PC_709 = 3,
-  AVS_OLD_MATRIX_AVERAGE = 4,
-  AVS_OLD_MATRIX_Rec2020 = 5,
-  AVS_OLD_MATRIX_PC_2020 = 6
-} Old_Avs_Matrix_e;
+// True for chroma subsampled planar YUV(A): 4:2:0, 4:2:2, 4:1:1, 4:4:0, 4:1:0.
+bool IsSubsampledYUV(const VideoInfo& vi);
 
-// transfer characteristics ITU-T H.265 Table E.4
-typedef enum Transfer_e {
-  AVS_TRANSFER_BT709 = 1,
-  AVS_TRANSFER_UNSPECIFIED = 2,
-  AVS_TRANSFER_BT470_M = 4,
-  AVS_TRANSFER_BT470_BG = 5,
-  AVS_TRANSFER_BT601 = 6,  /* Equivalent to 1. */
-  AVS_TRANSFER_ST240_M = 7,
-  AVS_TRANSFER_LINEAR = 8,
-  AVS_TRANSFER_LOG_100 = 9,
-  AVS_TRANSFER_LOG_316 = 10,
-  AVS_TRANSFER_IEC_61966_2_4 = 11,
-  AVS_TRANSFER_IEC_61966_2_1 = 13,
-  AVS_TRANSFER_BT2020_10 = 14, /* Equivalent to 1. */
-  AVS_TRANSFER_BT2020_12 = 15, /* Equivalent to 1. */
-  AVS_TRANSFER_ST2084 = 16,
-  AVS_TRANSFER_ARIB_B67 = 18
-} Transfer_e;
+// Frame 0's _ChromaLocation of a subsampled YUV clip (planar or YUY2). Returns false if the
+// clip is not subsampled YUV, or has no (or an invalid) such frame prop.
+bool GetChromaLocationFromProps(PClip clip, IScriptEnvironment* env, int& out_chromaloc);
 
-// color primaries ITU-T H.265 Table E.3
-typedef enum Primaries_e {
-  AVS_PRIMARIES_BT709 = 1,
-  AVS_PRIMARIES_UNSPECIFIED = 2,
-  AVS_PRIMARIES_BT470_M = 4,
-  AVS_PRIMARIES_BT470_BG = 5,
-  AVS_PRIMARIES_ST170_M = 6,
-  AVS_PRIMARIES_ST240_M = 7,  /* Equivalent to 6. */
-  AVS_PRIMARIES_FILM = 8,
-  AVS_PRIMARIES_BT2020 = 9,
-  AVS_PRIMARIES_ST428 = 10,
-  AVS_PRIMARIES_ST431_2 = 11,
-  AVS_PRIMARIES_ST432_1 = 12,
-  AVS_PRIMARIES_EBU3213_E = 22
-} Primaries_e;
+// Per-format default chroma location (ConvertToYUV4xx's):
+// - 'top' for 4:4:0 (1x2)
+// - 'top_left' for 4:1:0 (no standard siting, ffmpeg parity) (4x4)
+// - 'left' otherwise (incl. non-subsampled formats)
+int GetDefaultChromaLocation(const VideoInfo& vi);
+
+// Unified helper for ConvertToXXX, Overlay, Layer, SubTitle, etc.
+// Resolves a filter's chroma placement parameter for `clip` based on ConvertToYUV4xx method.
+// - explicit name (any ConvertToYUV4xx placement name; nullptr, empty or "auto" works like not given)
+// - Frame 0's _ChromaLocation (subsampled formats only)
+// - GetDefaultChromaLocation. An invalid frame prop value gives the default.
+// *out_defined (optional): false if the clip is not subsampled and no name was given, i.e.
+// the result is only a fallback.
+int ResolveChromaLocation(PClip clip, const char* placement_name, IScriptEnvironment* env, bool* out_defined = nullptr);
 
 void matrix_parse_merge_with_props(bool rgb_in, bool rgb_out, const char* matrix_name, const AVSMap* props, int& _Matrix, int& _ColorRange, int& ColorRange_Out, IScriptEnvironment* env);
 void matrix_parse_merge_with_props_def(bool rgb_in, bool rgb_out, const char* matrix_name, const AVSMap* props, int& _Matrix, int& _ColorRange, int& ColorRange_Out, int _Matrix_Default, int _ColorRange_Default, IScriptEnvironment* env);

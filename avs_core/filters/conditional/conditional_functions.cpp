@@ -229,20 +229,16 @@ AVSValue AveragePlane::AvgPlane(AVSValue clip, void* , int plane, int offset, IS
 
   double sum = 0.0;
 
-
-  int total_pixels = width*height;
-  bool sum_in_32bits;
-  if (pixelsize == 4)
-    sum_in_32bits = false;
-  else // worst case
-    sum_in_32bits = ((int64_t)total_pixels * (pixelsize == 1 ? 255 : 65535)) <= std::numeric_limits<int>::max();
-
 #ifdef INTEL_INTRINSICS
-  if ((pixelsize==1) && sum_in_32bits && (env->GetCPUFlags() & CPUF_SSE2) && width >= 16) {
+  // SIMD: int64 internally, no 32 bit limit
+  if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_SSE2) && width >= 16) {
     sum = get_sum_of_pixels_sse2(srcp, height, width, pitch);
   } else
+  if ((pixelsize==2) && (env->GetCPUFlags() & CPUF_SSE2) && width >= 8) {
+    sum = get_sum_of_pixels_uint16_sse2(srcp, height, width, pitch);
+  } else
 #ifdef X86_32
-  if ((pixelsize==1) && sum_in_32bits && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && width >= 8) {
+  if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && width >= 8) {
     sum = get_sum_of_pixels_isse(srcp, height, width, pitch);
   } else
 #endif
@@ -375,16 +371,6 @@ AVSValue ComparePlane::CmpPlane(AVSValue clip, AVSValue clip2, void* , int plane
   if (height != height2 || width != width2)
     env->ThrowError("Plane Difference: Images are not the same size!");
 
-#ifdef X86_32
-  int bits_per_pixel = vi.BitsPerComponent();
-  int total_pixels = width*height;
-  bool sum_in_32bits;
-  if (pixelsize == 4)
-    sum_in_32bits = false;
-  else // worst case check
-    sum_in_32bits = ((int64_t)total_pixels * ((1 << bits_per_pixel) - 1)) <= std::numeric_limits<int>::max();
-#endif
-
   double sad = 0.0;
 
   // for c: width, for sse: rowsize
@@ -397,8 +383,8 @@ AVSValue ComparePlane::CmpPlane(AVSValue clip, AVSValue clip2, void* , int plane
       sad = (double)calculate_sad_8_or_16_sse2<uint8_t,true>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
     } else
 #ifdef X86_32
-      if ((pixelsize==1) && sum_in_32bits && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && width >= 8) {
-        sad = get_sad_rgb_isse(srcp, srcp2, height, rowsize, pitch, pitch2);
+      if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && rowsize >= 8) {
+        sad = (double)calculate_sad_isse<true>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
       } else
 #endif
 #endif
@@ -417,8 +403,8 @@ AVSValue ComparePlane::CmpPlane(AVSValue clip, AVSValue clip2, void* , int plane
       sad = (double)calculate_sad_8_or_16_sse2<uint8_t,false>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
     } else
 #ifdef X86_32
-      if ((pixelsize==1) && sum_in_32bits && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && width >= 8) {
-        sad = get_sad_isse(srcp, srcp2, height, rowsize, pitch, pitch2);
+      if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && rowsize >= 8) {
+        sad = (double)calculate_sad_isse<false>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
       } else
 #endif
 #endif
@@ -483,16 +469,6 @@ AVSValue ComparePlane::CmpPlaneSame(AVSValue clip, void* , int offset, int plane
   if (width == 0 || height == 0)
     env->ThrowError("Plane Difference: No chroma planes in greyscale clip!");
 
-#ifdef X86_32
-  int bits_per_pixel = vi.BitsPerComponent();
-  int total_pixels = width * height;
-  bool sum_in_32bits;
-  if (pixelsize == 4)
-    sum_in_32bits = false;
-  else // worst case check
-    sum_in_32bits = ((int64_t)total_pixels * ((1 << bits_per_pixel) - 1)) <= std::numeric_limits<int>::max();
-#endif
-
   double sad = 0;
   // for c: width, for sse: rowsize
   if (vi.IsRGB32() || vi.IsRGB64()) {
@@ -504,8 +480,8 @@ AVSValue ComparePlane::CmpPlaneSame(AVSValue clip, void* , int offset, int plane
       sad = (double)calculate_sad_8_or_16_sse2<uint8_t,true>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
     } else
 #ifdef X86_32
-      if ((pixelsize==1) && sum_in_32bits && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && width >= 8) {
-        sad = get_sad_rgb_isse(srcp, srcp2, height, rowsize, pitch, pitch2);
+      if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && rowsize >= 8) {
+        sad = (double)calculate_sad_isse<true>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
       } else
 #endif
 #endif
@@ -523,8 +499,8 @@ AVSValue ComparePlane::CmpPlaneSame(AVSValue clip, void* , int offset, int plane
       sad = (double)calculate_sad_8_or_16_sse2<uint8_t,false>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
     } else
 #ifdef X86_32
-      if ((pixelsize==1) && sum_in_32bits && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && width >= 8) {
-        sad = get_sad_isse(srcp, srcp2, height, width, pitch, pitch2);
+      if ((pixelsize==1) && (env->GetCPUFlags() & CPUF_INTEGER_SSE) && rowsize >= 8) {
+        sad = (double)calculate_sad_isse<false>(srcp, srcp2, pitch, pitch2, rowsize, height); // in focus, no overflow
       } else
 #endif
 #endif
