@@ -149,6 +149,9 @@ private:
   char planes[4];
   int source_planes[4];
   int target_planes[4];
+  // For the target U and V planes: index of U/V plane _ChromaLocation source clip (after validity check), -1 if none.
+  int chroma_source_clip[2] = { -1, -1 };
+  bool subframe_possible = false;
 };
 
 #endif  // __Planeswap_H__

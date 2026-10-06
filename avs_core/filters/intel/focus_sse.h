@@ -39,22 +39,18 @@
 #include <avs/types.h>
 #include <cstdint>
 
-#ifdef X86_32
-void af_vertical_mmx(BYTE* line_buf, BYTE* dstp, int height, int pitch, int width, int amount);
-#endif
 void af_vertical_sse2(BYTE* line_buf, BYTE* dstp, int height, int pitch, int width, int amount);
-void af_vertical_uint16_t_sse2(BYTE* line_buf, BYTE* dstp, int height, int pitch, int row_size, int amount);
+void af_vertical_ssse3(BYTE* line_buf, BYTE* dstp, int height, int pitch, int width, int amount);
+void af_vertical_uint16_t_sse2(BYTE* line_buf, BYTE* dstp, int height, int pitch, int row_size, int amount, int bits_per_pixel);
 #if defined(GCC) || defined(CLANG)
 __attribute__((__target__("sse4.1")))
 #endif
-void af_vertical_uint16_t_sse41(BYTE* line_buf, BYTE* dstp, int height, int pitch, int row_size, int amount);
+void af_vertical_uint16_t_sse41(BYTE* line_buf, BYTE* dstp, int height, int pitch, int row_size, int amount, int bits_per_pixel);
 void af_vertical_sse2_float(BYTE * line_buf, BYTE * dstp, const int height, const int pitch, const int row_size, const float amount);
 
 
-#ifdef X86_32
-void af_horizontal_planar_mmx(BYTE* dstp, size_t height, size_t pitch, size_t width, size_t amount);
-#endif
 void af_horizontal_planar_sse2(BYTE* dstp, size_t height, size_t pitch, size_t width, size_t amount);
+void af_horizontal_planar_ssse3(BYTE* dstp, size_t height, size_t pitch, size_t width, size_t amount);
 void af_horizontal_planar_uint16_t_sse2(BYTE* dstp, size_t height, size_t pitch, size_t row_size, size_t amount, int bits_per_pixel);
 #if defined(GCC) || defined(CLANG)
 __attribute__((__target__("sse4.1")))
@@ -63,14 +59,8 @@ void af_horizontal_planar_uint16_t_sse41(BYTE* dstp, size_t height, size_t pitch
 void af_horizontal_planar_float_sse2(BYTE* dstp, size_t height, size_t pitch, size_t row_size, float amount);
 
 
-#ifdef X86_32
-void af_horizontal_yuy2_mmx(BYTE* dstp, const BYTE* srcp, size_t dst_pitch, size_t src_pitch, size_t height, size_t width, size_t amount);
-#endif
 void af_horizontal_yuy2_sse2(BYTE* dstp, const BYTE* srcp, size_t dst_pitch, size_t src_pitch, size_t height, size_t width, size_t amount);
 
-#ifdef X86_32
-void af_horizontal_rgb32_mmx(BYTE* dstp, const BYTE* srcp, size_t dst_pitch, size_t src_pitch, size_t height, size_t width, size_t amount);
-#endif
 void af_horizontal_rgb32_sse2(BYTE* dstp, const BYTE* srcp, size_t dst_pitch, size_t src_pitch, size_t height, size_t width, size_t amount);
 
 void af_horizontal_rgb64_sse2(BYTE* dstp, const BYTE* srcp, size_t dst_pitch, size_t src_pitch, size_t height, size_t width, size_t amount);
@@ -100,10 +90,9 @@ __attribute__((__target__("sse4.1")))
 void accumulate_line_16_sse41(BYTE* c_plane, const BYTE** planeP, int planes, size_t rowsize, int threshold, int div, int bits_per_pixel);
 
 #ifdef X86_32
-int calculate_sad_isse(const BYTE* cur_ptr, const BYTE* other_ptr, int cur_pitch, int other_pitch, size_t rowsize, size_t height);
+template<bool packedRGB32>
+int64_t calculate_sad_isse(const BYTE* cur_ptr, const BYTE* other_ptr, int cur_pitch, int other_pitch, size_t rowsize, size_t height);
 #endif
-template<bool packedRGB3264>
-int calculate_sad_sse2(const BYTE* cur_ptr, const BYTE* other_ptr, int cur_pitch, int other_pitch, size_t rowsize, size_t height);
 template<typename pixel_t, bool packedRGB3264>
 int64_t calculate_sad_8_or_16_sse2(const BYTE* cur_ptr, const BYTE* other_ptr, int cur_pitch, int other_pitch, size_t rowsize, size_t height);
 

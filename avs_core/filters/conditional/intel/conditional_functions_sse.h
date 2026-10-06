@@ -36,8 +36,7 @@
 #include <avisynth.h>
 
 double get_sum_of_pixels_sse2(const uint8_t* srcp, size_t height, size_t width, size_t pitch);
+double get_sum_of_pixels_uint16_sse2(const uint8_t* srcp, size_t height, size_t width, size_t pitch);
 #ifdef X86_32
 double get_sum_of_pixels_isse(const uint8_t* srcp, size_t height, size_t width, size_t pitch);
-size_t get_sad_isse(const uint8_t* src_ptr, const uint8_t* other_ptr, size_t height, size_t width, size_t src_pitch, size_t other_pitch);
-size_t get_sad_rgb_isse(const uint8_t* src_ptr, const uint8_t* other_ptr, size_t height, size_t width, size_t src_pitch, size_t other_pitch);
 #endif

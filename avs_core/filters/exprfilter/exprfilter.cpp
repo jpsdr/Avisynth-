@@ -7190,13 +7190,13 @@ Exprfilter::Exprfilter(const std::vector<PClip>& _child_array, const std::vector
         if (op == opAsin || op == opAcos || op == opAtan) {
           d.planeOptAvx2[i] = false;
           d.planeOptSSE2[i] = false;
-          break;
+          break; // we can break here, we limited to the minimum.
         }
         // round, trunc, ceil: minimum of SSE4.1
         if (op == opRound || op == opFloor || op == opCeil || op == opTrunc ) {
           if (!(env->GetCPUFlags() & CPUF_SSE4_1)) // required minimum (_mm_round_ps...)
             d.planeOptSSE2[i] = false;
-          break;
+          // no break: later ops (relative load, asin/acos/atan) must be checked as well
         }
       }
 #endif

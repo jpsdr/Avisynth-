@@ -552,6 +552,12 @@ Changelog
 +-----------------+----------------------------------------------------------+
 | Version         | Changes                                                  |
 +=================+==========================================================+
+| 3.7.6           || Fix: round, floor, ceil or trunc before a relative      |
+|                 |  pixel load: crash on AVX2 CPUs; before asin, acos,      |
+|                 |  atan: wrong results (JIT). Bug since 3.7.1.             |
+|                 || Fix #505: Vector-C relative-row addressing ignored the  |
+|                 |  current row, mis-scaled the row offset at 16/32 bit     |
++-----------------+----------------------------------------------------------+
 | 3.7.4           || Enhancement: vectorizable C implementation helps nonJIT |
 |                 || New parameter: optVectorC                               |
 |                 || Implement ``tan`` for JitASM                            |
@@ -597,7 +603,7 @@ Changelog
 | AviSynth+ r2542 |  Initial release                                         |
 +-----------------+----------------------------------------------------------+
 
-$Date: 2025/03/06 16:15:00 $
+$Date: 2026/10/05 10:00:00 $
 
 .. _mathematical function:
     https://en.wikipedia.org/wiki/Function_(mathematics)
