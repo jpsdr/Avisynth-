@@ -1,70 +1,25 @@
 /*
 *
-* Avisynth+ Expression filter, ported from the VapourSynth project
-* Copyright (c) 2012-2015 Fredrik Mellbin
+* Avisynth+ Expression filter
+* SPDX-License-Identifier: GPL-2.0-or-later
+* Base version: ported from the VapourSynth project (Expr, VS r39)
+*   Copyright (c) 2012-2015 Fredrik Mellbin
+* Modified and extended by the AviSynth+ project. Ideas and syntax elements:
+*   masktools2 mt_lut family: built-in constants (ymin/ymax/cmin/cmax/range_*),
+*     scaleb/scalef, clip, spatial input (mt_lutspa -> sx/sy/sxr/syr), lut modes
+*   wonkey_monkey: variables, store (@) and store-and-pop (^),
+*     frameno and time; after his RPN filters
+*   akarin.Expr (VSAkarin): clip.PropName frame property syntax,
+*     SIMD sin/cos (VapourSynth Expr port), :m border mode compatibility
+* Full feature list: see the documentation (expr.rst).
 *
-* Additions and differences to VS r39 version:
-* ------------------------------
-* (similar features to the masktools mt_lut family syntax)
-* Operator aliases:
-*   Caret (^) can be used like pow
-*   For equality check "==" can be used like "="
-*   & same as and
-*   | same as or
-* New operator: != (not equal)
-* Built-in constants
-*   ymin, ymax (ymin_a .. ymin_z for individual clips) - the usual luma limits (16..235 or scaled equivalents)
-*   cmin, cmax (cmin_a .. cmin_z) - chroma limits (16..240 or scaled equivalents)
-*   range_half (range_half_a .. range_half_z) - half of the range, (128 or scaled equivalents)
-*   range_size, range_half, range_min, range_max (range_size_a .. range_size_z , etc..)
-* Autoscale helper functions (operand is treated as being a 8 bit constant unless i8..i16 or f32 is specified)
-*   scaleb (scale by bit shift - mul or div by 2, 4, 6, 8...)
-*   scalef (scale by stretch full scale - mul or div by source_max/target_max
-* Keywords for modifying base bit depth for scaleb and scalef
-*   i8, i10, i12, i14, i16, f32
-* Built-in math constant
-*   pi
-* Alpha plane handling. When no separate expression is supplied for alpha, plane is copied instead of reusing last expression parameter
-* Proper clamping when storing 10,12 or 14 bit outputs
-* Faster storing of results for 8 and 10-16 bit outputs
-* 16 pixels/cycle instead of 8 when avx2, with fallback to 8-pixel case on the right edge. Thus no need for 64 byte alignment for 32 bit float.
-* (Load zeros for nonvisible pixels, when simd block size goes beyond image width, to prevent garbage input for simd calculation)
-* Optimizations: x^0.5 is sqrt, ^1 +0 -0 *1 /1 to nothing, ^2, ^3, ^4 is done by faster and more precise multiplication
-* spatial input variables in expr syntax:
-*    sx, sy (absolute x and y coordinates, 0 to width-1 and 0 to height-1)
-*    sxr, syr (relative x and y coordinates, from 0 to 1.0)
-* Optimize: recognize constant plane expression: use fast memset instead of generic simd process. Approx. 3-4x (32 bits) to 10-12x (8 bits) speedup
-* Optimize: Recognize single clip letter in expression: use fast plane copy (BitBlt)
-*   (e.g. for 8-16 bits: instead of load-convert_to_float-clamp-convert_to_int-store). Approx. 1.4x (32 bits), 3x (16 bits), 8-9x (8 bits) speedup
-* Optimize: do not call GetFrame for input clips that are not referenced or plane-copied
-* 20171211: Implement relative pixel indexing e.g. x[-1,-3], requires SSSE3
-*           Fix jitasm code generation (corrupt code when doing register reorders)
-* 20171212: Variables:  A..Z
-*           To store the current top value of the stack to a variable: A@ .. Z@
-*           To store the current top value and pop it from the top of the stack: A^.. Z^
-*           To use a stored variable: single uppercase letter. E.g. A
-* 20171214: Trig.functions (C only): sin, cos, tan, asin, acos, atan
-*           '%' The implementation is fmod-like: x - trunc(x/d)*d.
-*             Note: SSE2 and up is using trunc for float->integer conversion, works for usual width/height magnitude.
-*             (A float can hold a 24 bit integer w/o losing precision)
-*           expr constants: 'width', 'height' for current plane width and height
-*           expr auto variable: 'frameno' holds the current frame number 0..total number of frames-1
-*           expr auto variable: 'time' relative time in clip, 0 <= time <= 1
-*                calculation: time = frameno/(total number of frames - 1)
-* 20180614 new parameters: scale_inputs, clamp_float
-*          implement 'clip' three operand operator like in masktools2: x minvalue maxvalue clip -> max(min(x, maxvalue), minvalue)
-* 20191120 yrange_min, yrange_half, yrange_max, clamp_float_UV param, allow "float_UV" for scale_inputs
-*          yscalef, yscaleb forcing non-chroma rules for scaling even when processing chroma planes
-* 202107xx round, floor, ceil, trunc (acceleration from SSE4.1 and up)
-*          arbitrary variable names; instead of 'A' to 'Z', up to 256 of them can be used
-* 20210924 frame property access clip.framePropName syntax after VSAkarin idea (no array access yet)
-*          sin and cos as SIMD (VSAkarin, port from VS)
-* 20211116 neg
-* 20211117 atan2 as SIMD
-* 20211118 sgn
-* 20211127 lutx, lutxy (lut=1 and 2)
-* 20211128 allow f32 for 'scale_inputs' when "int", "intf", "all", "allf"
-* 20250309 tan as SIMD
+* Optimizations
+*   x^0.5 is sqrt, ^1 +0 -0 *1 /1 to nothing, ^2, ^3, ^4 by multiplication
+*   constant plane expression: plane fill instead of the generic SIMD process
+*   single clip letter expression: plane copy (BitBlt)
+*   no GetFrame for input clips that are not referenced or plane-copied
+*
+* Version history: see the changelog in the documentation (expr.rst).
 *
 * Differences from masktools 2.2.15
 * ---------------------------------
@@ -139,6 +94,36 @@
 #pragma auto_inline(on) // enable aggressive inlining, equivalent of /Ob2
 #endif
 #endif
+
+// Source index of position s (may be off-screen) in a row/column of n pixels, for border mode bc.
+// Any distance: mirror and wrap modes reflect or wrap as many times as needed (periodic,
+// period 2n or 2n-2 for mirror, n for wrap).
+static inline int borderIndex(int s, int n, int bc)
+{
+  if (bc == borderMirror) {
+    // boundary value is repeated d c b a | a b c d
+    const int period = 2 * n;
+    int m = s % period;
+    if (m < 0) m += period;
+    return m < n ? m : period - 1 - m;
+  }
+  if (bc == borderReflect101) {
+    //                                                4 3 2   1 2 3 4
+    // boundary value is single point of reflection e d c b | a b c d
+    if (n == 1) return 0;
+    const int period = 2 * n - 2;
+    int m = s % period;
+    if (m < 0) m += period;
+    return m < n ? m : period - m;
+  }
+  if (bc == borderWrap) {
+    // periodic: f g h | a b c d
+    int m = s % n;
+    if (m < 0) m += n;
+    return m;
+  }
+  return std::max(0, std::min(s, n - 1)); // borderClamp, borderConstant (n/a)
+}
 
 #ifdef VS_TARGET_CPU_X86
 
@@ -292,8 +277,6 @@ enum {
     elfloat_one, elfloat_minusone, elfloat_half, elsignmask, elstore8, elstore10, elstore12, elstore14, elstore16,
     spatialX, spatialX2,
     loadmask1000, loadmask1100, loadmask1110,
-    elShuffleForRight0, elShuffleForRight1, elShuffleForRight2, elShuffleForRight3, elShuffleForRight4, elShuffleForRight5, elShuffleForRight6,
-    elShuffleForLeft0, elShuffleForLeft1, elShuffleForLeft2, elShuffleForLeft3, elShuffleForLeft4, elShuffleForLeft5, elShuffleForLeft6,
     elexp_hi, elexp_lo, elcephes_LOG2EF,
     elcephes_exp_C1, elcephes_log_q2 = elcephes_exp_C1, elcephes_exp_C2, elcephes_log_q1 = elcephes_exp_C2, elcephes_exp_p0, elcephes_exp_p1, elcephes_exp_p2, elcephes_exp_p3, elcephes_exp_p4, elcephes_exp_p5, elcephes_SQRTHF,
     elcephes_log_p0, elcephes_log_p1, elcephes_log_p2, elcephes_log_p3, elcephes_log_p4, elcephes_log_p5, elcephes_log_p6, elcephes_log_p7, elcephes_log_p8,
@@ -302,22 +285,15 @@ enum {
     float_sinC3, float_sinC5, float_sinC7, float_sinC9,
     float_cosC2, float_cosC4, float_cosC6, float_cosC8,
     float_atan2f_rmul, float_atan2f_radd, float_atan2f_tmul, float_atan2f_tadd, float_atan2f_halfpi, float_atan2f_pi,
-    float_tan_p0, float_tan_p2, float_tan_p4, float_tan_p6, float_tan_p8,
-    float_tan_q0, float_tan_q2, float_tan_q4, float_tan_q6, float_tan_q8,
-    float_tan_small_limit, float_tan_asympt_a1, float_tan_asympt_a2, float_tan_asympt_limit
+    float_tan_2_over_pi, float_tan_c0, float_tan_c1, float_tan_c2, float_tan_c3, float_tan_c4, float_tan_c5
 };
 
 // constants for xmm
 
 #define XCONST(x) { x, x, x, x }
-#define MAKEDWORD(ch0, ch1, ch2, ch3)                              \
-                ((uint32_t)(unsigned char)(ch0) | ((uint32_t)(unsigned char)(ch1) << 8) |   \
-                ((uint32_t)(unsigned char)(ch2) << 16) | ((uint32_t)(unsigned char)(ch3) << 24 ))
-#define XBYTECONST(a0,a1,a2,a3,a4,a5,a6,a7,a8,a9,a10,a11,a12,a13,a14,a15) \
-  { (int)MAKEDWORD(a0,a1,a2,a3), (int)MAKEDWORD(a4,a5,a6,a7), (int)MAKEDWORD(a8,a9,a10,a11), (int)MAKEDWORD(a12,a13,a14,a15) }
 
 
-static constexpr ExprUnion logexpconst alignas(16)[87][4] = {
+static constexpr ExprUnion logexpconst alignas(16)[66][4] = {
     XCONST(0x7FFFFFFF), // absmask
     XCONST(0x7F), // c7F
     XCONST(0x00800000), // min_norm_pos
@@ -336,20 +312,6 @@ static constexpr ExprUnion logexpconst alignas(16)[87][4] = {
     { (int)0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000 }, // loadmask1000
     { (int)0xFFFFFFFF, (int)0xFFFFFFFF, 0x00000000, 0x00000000 }, // loadmask1100
     { (int)0xFFFFFFFF, (int)0xFFFFFFFF, (int)0xFFFFFFFF, 0x00000000 }, // loadmask1110
-    XBYTECONST(0,1,2,3,4,5,6,7,  8,9,10,11,12,13,12,13), // elShuffleForRight0
-    XBYTECONST(0,1,2,3,4,5,6,7,  8,9,10,11,10,11,10,11), // elShuffleForRight1
-    XBYTECONST(0,1,2,3,4,5,6,7,  8,9,8,9,8,9,8,9), // elShuffleForRight2
-    XBYTECONST(0,1,2,3,4,5,6,7,  6,7,6,7,6,7,6,7), // elShuffleForRight3
-    XBYTECONST(0,1,2,3,4,5,4,5,  4,5,4,5,4,5,4,5), // elShuffleForRight4
-    XBYTECONST(0,1,2,3,2,3,2,3,  2,3,2,3,2,3,2,3), // elShuffleForRight5
-    XBYTECONST(0,1,0,1,0,1,0,1,  0,1,0,1,0,1,0,1), // elShuffleForRight6
-    XBYTECONST(2,3,2,3,4,5,6,7,  8,9,10,11,12,13,14,15), // elShuffleForLeft0
-    XBYTECONST(4,5,4,5,4,5,6,7,  8,9,10,11,12,13,14,15), // elShuffleForLeft1
-    XBYTECONST(6,7,6,7,6,7,6,7,  8,9,10,11,12,13,14,15), // elShuffleForLeft2
-    XBYTECONST(8,9,8,9,8,9,8,9,  8,9,10,11,12,13,14,15), // elShuffleForLeft3
-    XBYTECONST(10,11,10,11,10,11,10,11, 10,11,10,11,12,13,14,15), // elShuffleForLeft4
-    XBYTECONST(12,13,12,13,12,13,12,13, 12,13,12,13,12,13,14,15), // elShuffleForLeft5
-    XBYTECONST(14,15,14,15,14,15,14,15, 14,15,14,15,14,15,14,15), // elShuffleForLeft6
     XCONST(88.3762626647949f), // exp_hi
     XCONST(-88.3762626647949f), // exp_lo
     XCONST(1.44269504088896341f), // cephes_LOG2EF
@@ -371,6 +333,10 @@ static constexpr ExprUnion logexpconst alignas(16)[87][4] = {
     XCONST(+2.0000714765E-1f), // cephes_log_p6
     XCONST(-2.4999993993E-1f), // cephes_log_p7
     XCONST(+3.3333331174E-1f), // cephes_log_p8
+    // sin/cos (SINCOS_PS), ported from VapourSynth's Expr.
+    // Range reduction and sin polynomial: glibc libmvec sinf (Intel SVML-derived, LGPL-2.1+),
+    // sysdeps/x86_64/fpu/svml_s_trig_data.S: __sInvPI, __sRShifter, __sPI1..__sPI4, __sA3..__sA9.
+    // cos polynomial (float_cosC2..C8): unknown origin, degree 8 minimax on [-pi/2, pi/2].
     XCONST(0x3ea2f983), // float_invpi, 1/pi = 0.31830988618379067154f
     XCONST(0x4b400000), // float_rintf  Used for rounding
     XCONST(0x40490000), // float_pi1    High precision part of Pi
@@ -391,21 +357,14 @@ static constexpr ExprUnion logexpconst alignas(16)[87][4] = {
     XCONST(0xbeaa0d0a), // float_atan2f_tadd -0.33213072f
     XCONST(0x3fc90fdb), // float_atan2f_halfpi 1.57079637f
     XCONST(0x40490fdb), // float_atan2f_pi 3.14159274f
-    // Tangent approximation coefficients up to p8 and helpers
-    XCONST(1.0f),          // float_tan_p0 - Numerator constant term
-    XCONST(0.3333314036f), // float_tan_p2 - Numerator x^2 coefficient
-    XCONST(0.1333923995f), // float_tan_p4 - Numerator x^4 coefficient 
-    XCONST(0.0533740603f), // float_tan_p6 - Numerator x^6 coefficient
-    XCONST(0.0245650893f), // float_tan_p8 - Numerator x^8 coefficient
-    XCONST(1.0f),          // float_tan_q0 - Denominator constant term
-    XCONST(0.1333835001f), // float_tan_q2 - Denominator x^2 coefficient
-    XCONST(0.0089270802f), // float_tan_q4 - Denominator x^4 coefficient
-    XCONST(0.0005908960f), // float_tan_q6 - Denominator x^6 coefficient
-    XCONST(0.0000342237f), // float_tan_q8 - Denominator x^8 coefficient
-    XCONST(1e-4f), // float_tan_small_limit
-    XCONST(0.97f), // float_tan_asympt_a1
-    XCONST(0.35f), // float_tan_asympt_a2
-    XCONST(0.8f), // float_tan_asympt_limit
+    // tan: 2/pi for quadrant, minimax polynomial coefficients for tan(r) = r + r^3*P(r^2), abs(r) <= pi/4
+    XCONST(0x3f22f983), // float_tan_2_over_pi 0.636619747f
+    XCONST(0x3eaaaa6f), // float_tan_c0 3.333315551e-01f
+    XCONST(0x3e0896dd), // float_tan_c1 1.333879977e-01f
+    XCONST(0x3d5ac5b2), // float_tan_c2 5.341119319e-02f
+    XCONST(0x3cc8225c), // float_tan_c3 2.443044633e-02f
+    XCONST(0x3b4c6f37), // float_tan_c4 3.119421890e-03f
+    XCONST(0x3c19c679), // float_tan_c5 9.385698475e-03f
 };
 
 
@@ -417,7 +376,7 @@ static constexpr ExprUnion logexpconst alignas(16)[87][4] = {
 #undef XCONST
 #define XCONST(x) { x, x, x, x, x, x, x, x }
 
-static constexpr ExprUnion logexpconst_avx alignas(32)[87][8] = {
+static constexpr ExprUnion logexpconst_avx alignas(32)[66][8] = {
   XCONST(0x7FFFFFFF), // absmask
   XCONST(0x7F), // c7F
   XCONST(0x00800000), // min_norm_pos
@@ -436,20 +395,6 @@ static constexpr ExprUnion logexpconst_avx alignas(32)[87][8] = {
   { (int)0xFFFFFFFF, 0x00000000, 0x00000000, 0x00000000, 0, 0, 0, 0 }, // loadmask1000 not used, avx supports blendps
   { (int)0xFFFFFFFF, (int)0xFFFFFFFF, 0x00000000, 0x00000000, 0, 0, 0, 0 }, // loadmask1100 not used, avx supports blendps
   { (int)0xFFFFFFFF, (int)0xFFFFFFFF, (int)0xFFFFFFFF, 0x00000000, 0, 0, 0, 0 }, // loadmask1110 not used, avx supports blendps
-  XCONST(0), // n/a elShuffleForRight0
-  XCONST(0), // n/a elShuffleForRight1
-  XCONST(0), // n/a elShuffleForRight2
-  XCONST(0), // n/a elShuffleForRight3
-  XCONST(0), // n/a elShuffleForRight4
-  XCONST(0), // n/a elShuffleForRight5
-  XCONST(0), // n/a elShuffleForRight6
-  XCONST(0), // n/a elShuffleForLeft0
-  XCONST(0), // n/a elShuffleForLeft1
-  XCONST(0), // n/a elShuffleForLeft2
-  XCONST(0), // n/a elShuffleForLeft3
-  XCONST(0), // n/a elShuffleForLeft4
-  XCONST(0), // n/a elShuffleForLeft5
-  XCONST(0), // n/a elShuffleForLeft6
   XCONST(88.3762626647949f), // exp_hi
   XCONST(-88.3762626647949f), // exp_lo
   XCONST(1.44269504088896341f), // cephes_LOG2EF
@@ -471,6 +416,7 @@ static constexpr ExprUnion logexpconst_avx alignas(32)[87][8] = {
   XCONST(+2.0000714765E-1f), // cephes_log_p6
   XCONST(-2.4999993993E-1f), // cephes_log_p7
   XCONST(+3.3333331174E-1f), // cephes_log_p8
+  // sin/cos: see logexpconst
   XCONST(0x3ea2f983), // float_invpi, 1/pi = 0.31830988618379067154f
   XCONST(0x4b400000), // float_rintf  Used for rounding
   XCONST(0x40490000), // float_pi1    High precision part of Pi
@@ -491,21 +437,14 @@ static constexpr ExprUnion logexpconst_avx alignas(32)[87][8] = {
   XCONST(0xbeaa0d0a), // float_atan2f_tadd -0.33213072f
   XCONST(0x3fc90fdb), // float_atan2f_halfpi 1.57079637f
   XCONST(0x40490fdb), // float_atan2f_pi 3.14159274f
-  // Tangent approximation coefficients up to p8 and helpers
-  XCONST(1.0f),          // float_tan_p0 - Numerator constant term
-  XCONST(0.3333314036f), // float_tan_p2 - Numerator x^2 coefficient
-  XCONST(0.1333923995f), // float_tan_p4 - Numerator x^4 coefficient 
-  XCONST(0.0533740603f), // float_tan_p6 - Numerator x^6 coefficient
-  XCONST(0.0245650893f), // float_tan_p8 - Numerator x^8 coefficient
-  XCONST(1.0f),          // float_tan_q0 - Denominator constant term
-  XCONST(0.1333835001f), // float_tan_q2 - Denominator x^2 coefficient
-  XCONST(0.0089270802f), // float_tan_q4 - Denominator x^4 coefficient
-  XCONST(0.0005908960f), // float_tan_q6 - Denominator x^6 coefficient
-  XCONST(0.0000342237f),  // float_tan_q8 - Denominator x^8 coefficient
-  XCONST(1e-4f), // float_tan_small_limit
-  XCONST(0.97f), // float_tan_asympt_a1
-  XCONST(0.35f), // float_tan_asympt_a2
-  XCONST(0.8f), // float_tan_asympt_limit
+  // tan: 2/pi for quadrant, minimax polynomial coefficients for tan(r) = r + r^3*P(r^2), |r| <= pi/4
+  XCONST(0x3f22f983), // float_tan_2_over_pi 0.636619747f
+  XCONST(0x3eaaaa6f), // float_tan_c0 3.333315551e-01f
+  XCONST(0x3e0896dd), // float_tan_c1 1.333879977e-01f
+  XCONST(0x3d5ac5b2), // float_tan_c2 5.341119319e-02f
+  XCONST(0x3cc8225c), // float_tan_c3 2.443044633e-02f
+  XCONST(0x3b4c6f37), // float_tan_c4 3.119421890e-03f
+  XCONST(0x3c19c679), // float_tan_c5 9.385698475e-03f
 };
 #undef XCONST
 
@@ -722,252 +661,115 @@ do { \
 } while (0)
 
 #if 0
-// Fast tangent approximation using rational function with 8th order terms
+// Scalar reference of the TAN_PS / TAN_PS_AVX JIT code
+// Each step maps to one SIMD instruction.
+// Same scheme as e.g. SLEEF's vectorized tan, see https://arxiv.org/pdf/2001.09258 :
+// - k = round(x * 2/pi), r = x - k * pi/2 (Cody-Waite, four-part pi), |r| <= pi/4
+// - tan(r) = r + r^3 * P(r^2), P: degree 5 (c0..c5), own fit
+// - odd k: tan(x) = -1/tan(r)
+// Coefficients: minimax fit for the relative error of tan(r) on [0, pi/4] (tan is odd), by Lawson's
+// algorithm (iteratively reweighted least squares, 20000 points, 200 iterations) in double
+// precision, then rounded to float. Fit error 1.8e-8; float32 polynomial evaluation <= 1.4 ulp.
+// Max error vs. double tan (all floats): SSE (no FMA) <= 3.5 ulp for |x| < 1e4, degrades above ~5e4
+// (k * pi1 no longer exact, same limit as sin/cos); AVX2 (FMA) <= 3.9 ulp up to 1e5.
 float fast_tanf(float x) {
-  // Constants for Pi approximation and range reduction
-  const float polyPI = 3.14159265358979f;
-  const float halfPI = polyPI * 0.5f;
-  // Reduce to [-polyPI, polyPI] range
-  float y = fmodf(x, polyPI);
-  if (y > halfPI) y -= polyPI;
-  else if (y < -halfPI) y += polyPI;
-  // At this point y is in [-polyPI/2, polyPI/2]
-  // For very small angles, return the angle itself
-  // LLVM would add a small epsilon: sign(y)*2^-25 (0x1p-25f)
-  float abs_y = fabsf(y);
-  const float small_limit = 1e-4f;
-  if (abs_y < small_limit) {
-    return y;
-  }
-  // Check proximity to asymptotes
-  const float asympt_limit = 0.8f;
-  float distToAsymptote = halfPI - abs_y;
-  // If very close to ±polyPI/2, use asymptotic approximation
-  if (distToAsymptote < asympt_limit) {
-    // The tangent function approaches 1/distToAsymptote as y approaches +/-polyPI/2
-    // Improved coefficients based on curve fitting to better match std::tan
-    // not needed a 3rd term float asymptotic = 1.0f / (distToAsymptote * (0.9963f + distToAsymptote * (0.3642f + distToAsymptote * 0.0173f)));
-    float asymptotic = 1.0f / (distToAsymptote * (0.97f + distToAsymptote * 0.35f));
-    // Preserve sign
-    return (y < 0) ? -asymptotic : asymptotic;
-  }
-  float y2 = y * y;
-  // Optimized coefficients with terms up to 8th order
-  // Numerator coefficients
-  const float p0 = 1.0f;
-  const float p2 = 0.3333314036f;
-  const float p4 = 0.1333923995f;
-  const float p6 = 0.0533740603f;
-  const float p8 = 0.0245650893f;
-  // Denominator coefficients
-  const float q0 = 1.0f;
-  const float q2 = 0.1333835001f;
-  const float q4 = 0.0089270802f;
-  const float q6 = 0.0005908960f;
-  const float q8 = 0.0000342237f;
-  // Calculate approximation using Horner's method for efficiency
-  float num = y * (p0 + y2 * (p2 + y2 * (p4 + y2 * (p6 + y2 * p8))));
-  float den = q0 + y2 * (q2 + y2 * (q4 + y2 * (q6 + y2 * q8)));
-  return num / den;
+  float kb = x * 0.636619747f + 12582912.0f; // 1.5*2^23 (float_rintf): rounds to integer
+  uint32_t kb_bits;
+  memcpy(&kb_bits, &kb, sizeof(kb_bits)); // C++17 equivalent of C++20 std::bit_cast<uint32_t>(kb)
+  const bool odd = (kb_bits & 1) != 0; // lowest mantissa bit is the parity of k
+  const float khalf = (kb - 12582912.0f) * 0.5f; // k/2: k * pi/2 = k/2 * pi, exact
+  float r = x - khalf * pi1; // float_pi1..float_pi4
+  r = r - khalf * pi2;
+  r = r - khalf * pi3;
+  r = r - khalf * pi4;
+  const float z = r * r;
+  float p = c5 * z + c4;
+  p = p * z + c3;
+  p = p * z + c2;
+  p = p * z + c1;
+  p = p * z + c0;
+  const float t = r + (r * z) * p;
+  return odd ? -1.0f / t : t / 1.0f; // one division in SIMD: blended numerator / denominator
 }
-// We are good with this, but LLVM does differently:
-// https://github.com/llvm/llvm-project/blob/main/libc/src/math/generic/tanf.cpp
 #endif
 
-// Fast tangent approximation for non-AVX version
+// Fast tangent approximation for non-AVX version, see fast_tanf
 #define TAN_PS(x0) { \
-XmmReg x1, x2, x3, x4, x5, x6, x7, x8, x9, x10; \
-/* Normalize to [-pi, pi] using multiplication and subtraction */ \
-VEX1(movaps, x1, CPTR(float_invpi)); /* 1/pi */ \
-VEX2(mulps, x2, x0, x1); /* x / pi */ \
-/* round to nearest integer */ \
-VEX1(movaps, x3, CPTR(float_rintf)); /* round to int helper */ \
-VEX2(addps, x4, x3, x2); /* x/pi + 2^23 */ \
-VEX2(subps, x4, x4, x3); /* round(x/pi) */ \
-VEX1(movaps, x5, CPTR(float_pi1)); /* Load pi1 (highest precision part) */ \
-VEX2(mulps, x6, x4, x5); /* round(x/pi) * pi1 */ \
-VEX2(subps, x7, x0, x6); /* Remainder after subtracting largest part */ \
-/* Subtract remaining parts for higher precision */ \
-VEX1(movaps, x3, CPTR(float_pi2)); \
-VEX2(mulps, x3, x4, x3); /* round(x/pi) * pi2 */ \
-VEX2(subps, x7, x7, x3); /* Further refine remainder */ \
-VEX1(movaps, x3, CPTR(float_pi3)); \
-VEX2(mulps, x3, x4, x3); /* round(x/pi) * pi3 */ \
-VEX2(subps, x7, x7, x3); /* Further refine remainder */ \
-VEX1(movaps, x3, CPTR(float_pi4)); \
-VEX2(mulps, x3, x4, x3); /* round(x/pi) * pi4 */ \
-VEX2(subps, x7, x7, x3); /* Final remainder, now x is in range [-pi, pi] */ \
-/* Check range for symmetry, normalize to [-pi/2, pi/2] */ \
-VEX2(mulps, x6, x5, CPTR(elfloat_half)); /* halfPI = pi/2 */ \
-VEX2(cmpltps, x3, x6, x7); /* halfPI < y (cmpgt -> cmplt)*/ \
-VEX2(subps, x4, x5, x7); /* pi - y */ \
-/* blend: if y > halfPI, use pi - y */ \
-VEX1(movaps, x2, x3); \
-VEX2(andps, x2, x2, x4); \
-VEX2(andnps, x3, x3, x7); \
-VEX2(orps, x7, x3, x2); /* now y is <= pi/2 */ \
-/* Check for y < -halfPI */ \
-VEX1(movaps, x3, x6); \
-VEX2(xorps, x3, x3, CPTR(elsignmask)); /* -halfPI */ \
-VEX2(cmpltps, x2, x7, x3); /* y < -halfPI */ \
-VEX2(xorps, x4, x5, CPTR(elsignmask)); /* -pi */ \
-VEX2(subps, x4, x4, x7); /* -pi - y */ \
-/* blend: if y < -halfPI, use -pi - y */ \
-VEX1(movaps, x3, x2); \
-VEX2(andps, x3, x3, x4); \
-VEX2(andnps, x2, x2, x7); \
-VEX2(orps, x7, x2, x3); /* now y is in [-pi/2, pi/2] */ \
-/* Range reduction end */ \
-\
-/* Check for small values */ \
-VEX1(movaps, x2, x7); \
-VEX2(andps, x2, x2, CPTR(elabsmask)); /* abs_y */ \
-VEX2(cmpltps, x3, x2, CPTR(float_tan_small_limit)); /* abs_y < small_limit */ \
-VEX2(andps, x3, x3, x7); /* y * (abs_y < small_limit) */ \
-\
-/* Check for asymptotic proximity */ \
-VEX1(movaps, x4, x6); /* Load halfPI */ \
-VEX2(subps, x4, x4, x2); /* distToAsymptote = halfPI - abs_y */ \
-VEX2(cmpltps, x5, x4, CPTR(float_tan_asympt_limit)); /* distToAsymptote < asympt_limit */ \
-\
-/* Calculate asymptotic approximation: 1.0f / (distToAsymptote * (0.97f + distToAsymptote * 0.35f)) */ \
-VEX2(mulps, x8, x4, CPTR(float_tan_asympt_a2)); /* distToAsymptote * 0.35f */ \
-VEX2(addps, x8, x8, CPTR(float_tan_asympt_a1)); /* 0.97f + distToAsymptote * 0.35f */ \
-VEX2(mulps, x8, x8, x4); /* distToAsymptote * (0.97f + distToAsymptote * 0.35f) */ \
-VEX1(movaps, x4, CPTR(elfloat_one)); /* 1.0f */ \
-VEX2(divps, x9, x4, x8); /* 1.0f / (distToAsymptote * (0.97f + distToAsymptote * 0.35f)) */ \
-\
-/* Adjust sign for asymptotic approximation */ \
-VEX1(movaps, x8, x7); /* original y */ \
-VEX2(andps, x8, x8, CPTR(elsignmask)); /* sign of y */ \
-VEX2(xorps, x9, x9, x8); /* apply sign to asymptotic result */ \
-\
-/* Calculate rational approximation for regular values */ \
-VEX1(movaps, x2, x7); \
-VEX2(mulps, x2, x2, x7); /* y^2 */ \
-\
-/* Compute numerator with higher order terms */ \
-VEX1(movaps, x10, CPTR(float_tan_p8)); /* p8 */ \
-VEX2(mulps, x10, x10, x2); /* p8*y^2 */ \
-VEX2(addps, x10, x10, CPTR(float_tan_p6)); /* p6 + p8*y^2 */ \
-VEX2(mulps, x10, x10, x2); /* y^2 * (p6 + p8*y^2) */ \
-VEX2(addps, x10, x10, CPTR(float_tan_p4)); /* p4 + y^2 * (p6 + p8*y^2) */ \
-VEX2(mulps, x10, x10, x2); /* y^2 * (p4 + y^2 * (p6 + p8*y^2)) */ \
-VEX2(addps, x10, x10, CPTR(float_tan_p2)); /* p2 + y^2 * (p4 + y^2 * (p6 + p8*y^2)) */ \
-VEX2(mulps, x10, x10, x2); /* y^2 * (p2 + y^2 * (p4 + y^2 * (p6 + p8*y^2))) */ \
-VEX2(addps, x10, x10, CPTR(float_tan_p0)); /* p0 + y^2 * (p2 + y^2 * (p4 + y^2 * (p6 + p8*y^2))) */ \
-VEX2(mulps, x10, x10, x7); /* y * (p0 + y^2 * (p2 + y^2 * (p4 + y^2 * (p6 + p8*y^2)))) */ \
-\
-/* Compute denominator with higher order terms */ \
-VEX1(movaps, x8, CPTR(float_tan_q8)); /* q8 */ \
-VEX2(mulps, x8, x8, x2); /* q8*y^2 */ \
-VEX2(addps, x8, x8, CPTR(float_tan_q6)); /* q6 + q8*y^2 */ \
-VEX2(mulps, x8, x8, x2); /* y^2 * (q6 + q8*y^2) */ \
-VEX2(addps, x8, x8, CPTR(float_tan_q4)); /* q4 + y^2 * (q6 + q8*y^2) */ \
-VEX2(mulps, x8, x8, x2); /* y^2 * (q4 + y^2 * (q6 + q8*y^2)) */ \
-VEX2(addps, x8, x8, CPTR(float_tan_q2)); /* q2 + y^2 * (q4 + y^2 * (q6 + q8*y^2)) */ \
-VEX2(mulps, x8, x8, x2); /* y^2 * (q2 + y^2 * (q4 + y^2 * (q6 + q8*y^2))) */ \
-VEX2(addps, x8, x8, CPTR(float_tan_q0)); /* q0 + y^2 * (q2 + y^2 * (q4 + y^2 * (q6 + q8*y^2))) */ \
-\
-/* Division: numerator/denominator for regular case */ \
-VEX2(divps, x1, x10, x8); /* Final result: tan(y) = numerator/denominator */ \
-\
-/* Select the appropriate result based on conditions */ \
-/* If close to asymptote, use asymptotic approximation, else use rational approximation */ \
-VEX1(movaps, x2, x5); /* Load asymptote condition */ \
-VEX2(andps, x2, x2, x9); /* asymptotic * (distToAsymptote < asympt_limit) */ \
-VEX2(andnps, x5, x5, x1); /* rational * !(distToAsymptote < asympt_limit) */ \
-VEX2(orps, x1, x5, x2); /* Blend asymptotic and rational results */ \
-\
-/* If very small value, use y itself, otherwise use computed result */ \
-VEX2(andnps, x5, x3, x1); /* result * !(abs_y < small_limit) */ \
-VEX2(orps, x0, x3, x5); /* Final result with small value handling */ \
+XmmReg x1, x2, x3, x4; \
+/* k = round(x * 2/pi): adding 1.5*2^23 rounds to integer, lowest mantissa bit is the parity of k */ \
+VEX2(mulps, x1, x0, CPTR(float_tan_2_over_pi)); \
+VEX2(addps, x1, x1, CPTR(float_rintf)); /* biased k */ \
+VEX1(movaps, x2, x1); \
+pslld(x2, 31); \
+psrad(x2, 31); /* odd quadrant mask */ \
+VEX2(subps, x1, x1, CPTR(float_rintf)); /* k */ \
+VEX2(mulps, x1, x1, CPTR(elfloat_half)); /* k/2: k * pi/2 = k/2 * pi, exact */ \
+/* r = x - k * pi/2, four-part pi for precision, |r| <= pi/4 */ \
+VEX2(mulps, x4, x1, CPTR(float_pi1)); \
+VEX2(subps, x3, x0, x4); \
+VEX2(mulps, x4, x1, CPTR(float_pi2)); \
+VEX2(subps, x3, x3, x4); \
+VEX2(mulps, x4, x1, CPTR(float_pi3)); \
+VEX2(subps, x3, x3, x4); \
+VEX2(mulps, x4, x1, CPTR(float_pi4)); \
+VEX2(subps, x3, x3, x4); /* r */ \
+/* tan(r) = r + r*z*P(z), z = r^2 */ \
+VEX2(mulps, x4, x3, x3); /* z */ \
+VEX1(movaps, x1, CPTR(float_tan_c5)); \
+VEX2(mulps, x1, x1, x4); \
+VEX2(addps, x1, x1, CPTR(float_tan_c4)); \
+VEX2(mulps, x1, x1, x4); \
+VEX2(addps, x1, x1, CPTR(float_tan_c3)); \
+VEX2(mulps, x1, x1, x4); \
+VEX2(addps, x1, x1, CPTR(float_tan_c2)); \
+VEX2(mulps, x1, x1, x4); \
+VEX2(addps, x1, x1, CPTR(float_tan_c1)); \
+VEX2(mulps, x1, x1, x4); \
+VEX2(addps, x1, x1, CPTR(float_tan_c0)); /* P(z) */ \
+VEX2(mulps, x4, x4, x3); /* r*z */ \
+VEX2(mulps, x1, x1, x4); \
+VEX2(addps, x1, x1, x3); /* t = tan(r) */ \
+/* odd k: -1/t, even k: t/1 */ \
+VEX2(andnps, x3, x2, x1); /* even: t */ \
+VEX2(andps, x4, x2, CPTR(elfloat_minusone)); /* odd: -1 */ \
+VEX2(orps, x3, x3, x4); /* numerator */ \
+VEX2(andps, x4, x2, x1); /* odd: t */ \
+VEX2(andnps, x2, x2, CPTR(elfloat_one)); /* even: 1 */ \
+VEX2(orps, x4, x4, x2); /* denominator */ \
+VEX2(divps, x0, x3, x4); \
 }
 
-// Fast tangent approximation for AVX version
+// Fast tangent approximation for AVX version, see fast_tanf
 #define TAN_PS_AVX(x0) { \
-YmmReg x1, x2, x3, x4, x5, x6, x7, x8, x9, x10; \
-/* Normalize to [-pi, pi] using multiplication and subtraction */ \
-vmovaps(x1, CPTR_AVX(float_invpi)); /* 1/pi */ \
-vmulps(x2, x0, x1); /* x / pi */ \
-vroundps(x3, x2, FROUND_TO_NEAREST_INT); /* round(x / pi) */ \
-vmovaps(x4, CPTR_AVX(float_pi1)); /* Load pi1 (highest precision part) */ \
-vmulps(x5, x3, x4); /* round(x / pi) * pi1 */ \
-vsubps(x6, x0, x5); /* Remainder after subtracting largest part */ \
-/* Subtract remaining parts for higher precision */ \
-vmovaps(x7, CPTR_AVX(float_pi2)); \
-vmulps(x7, x3, x7); /* round(x / pi) * pi2 */ \
-vsubps(x6, x6, x7); /* Further refine remainder */ \
-vmovaps(x7, CPTR_AVX(float_pi3)); \
-vmulps(x7, x3, x7); /* round(x / pi) * pi3 */ \
-vsubps(x6, x6, x7); /* Further refine remainder */ \
-vmovaps(x7, CPTR_AVX(float_pi4)); \
-vmulps(x7, x3, x7); /* round(x / pi) * pi4 */ \
-vsubps(x6, x6, x7); /* Final remainder, now x is in range [-pi, pi] */ \
-/* Check range for symmetry, normalize to [-pi/2, pi/2] */ \
-vmulps(x5, x4, CPTR_AVX(elfloat_half)); /* halfPI = pi/2 */ \
-vcmpps(x7, x6, x5, _CMP_GT_OQ); /* y > halfPI */ \
-vsubps(x8, x4, x6); /* pi - y */ \
-vblendvps(x6, x6, x8, x7); /* if (y > halfPI) y = pi - y; */ \
-/* Check for y < -halfPI */ \
-vxorps(x7, x5, CPTR_AVX(elsignmask)); /* -halfPI */ \
-vcmpps(x8, x6, x7, _CMP_LT_OQ); /* y < -halfPI */ \
-vxorps(x2, x4, CPTR_AVX(elsignmask)); /* -pi */ \
-vsubps(x2, x2, x6); /* -pi - y */ \
-vblendvps(x6, x6, x2, x8); /* if (y < -halfPI) y = -pi - y; */ \
-/* now y is in [-pi/2, pi/2] */ \
-/* Range reduction end */ \
-\
-/* Check for small values */ \
-vandps(x2, x6, CPTR_AVX(elabsmask)); /* abs_y */ \
-vcmpps(x3, x2, CPTR_AVX(float_tan_small_limit), _CMP_LT_OQ); /* abs_y < small_limit */ \
-/* Save small value result for later blending */ \
-vandps(x7, x6, x3); /* y * (abs_y < small_limit) */ \
-\
-/* Check for asymptotic proximity */ \
-vmovaps(x4, x5); /* Load halfPI */ \
-vsubps(x4, x4, x2); /* distToAsymptote = halfPI - abs_y */ \
-vcmpps(x5, x4, CPTR_AVX(float_tan_asympt_limit), _CMP_LT_OQ); /* distToAsymptote < asympt_limit */ \
-\
-/* Calculate asymptotic approximation */ \
-vmulps(x8, x4, CPTR_AVX(float_tan_asympt_a2)); /* distToAsymptote * 0.35f */ \
-vaddps(x8, x8, CPTR_AVX(float_tan_asympt_a1)); /* 0.97f + distToAsymptote * 0.35f */ \
-vmulps(x8, x8, x4); /* distToAsymptote * (0.97f + distToAsymptote * 0.35f) */ \
-vmovaps(x4, CPTR_AVX(elfloat_one)); /* Load 1.0f */ \
-vdivps(x9, x4, x8); /* 1.0f / (distToAsymptote * (0.97f + distToAsymptote * 0.35f)) */ \
-\
-/* Adjust sign for asymptotic approximation */ \
-vmovaps(x8, x6); /* original y */ \
-vandps(x8, x8, CPTR_AVX(elsignmask)); /* sign of y */ \
-vxorps(x9, x9, x8); /* apply sign to asymptotic result */ \
-\
-/* Calculate rational approximation for regular values */ \
-vmulps(x2, x6, x6); /* y^2 */ \
-\
-/* Compute numerator with higher order terms using FMA instructions */ \
-vmovaps(x10, CPTR_AVX(float_tan_p8)); /* p8 */ \
-vfmadd213ps(x10, x2, CPTR_AVX(float_tan_p6)); /* p6 + p8*y^2 */ \
-vfmadd213ps(x10, x2, CPTR_AVX(float_tan_p4)); /* p4 + y^2 * (p6 + p8*y^2) */ \
-vfmadd213ps(x10, x2, CPTR_AVX(float_tan_p2)); /* p2 + y^2 * (p4 + y^2 * (p6 + p8*y^2)) */ \
-vfmadd213ps(x10, x2, CPTR_AVX(float_tan_p0)); /* p0 + y^2 * (p2 + y^2 * (p4 + y^2 * (p6 + p8*y^2))) */ \
-vmulps(x10, x10, x6); /* y * (p0 + y^2 * (p2 + y^2 * (p4 + y^2 * (p6 + p8*y^2)))) */ \
-\
-/* Compute denominator with higher order terms using FMA instructions */ \
-vmovaps(x8, CPTR_AVX(float_tan_q8)); /* q8 */ \
-vfmadd213ps(x8, x2, CPTR_AVX(float_tan_q6)); /* q6 + q8*y^2 */ \
-vfmadd213ps(x8, x2, CPTR_AVX(float_tan_q4)); /* q4 + y^2 * (q6 + q8*y^2) */ \
-vfmadd213ps(x8, x2, CPTR_AVX(float_tan_q2)); /* q2 + y^2 * (q4 + y^2 * (q6 + q8*y^2)) */ \
-vfmadd213ps(x8, x2, CPTR_AVX(float_tan_q0)); /* q0 + y^2 * (q2 + y^2 * (q4 + y^2 * (q6 + q8*y^2))) */ \
-\
-/* Division: numerator/denominator */ \
-vdivps(x1, x10, x8); /* tan(y) = numerator/denominator */ \
-\
-/* Select appropriate result based on conditions */ \
-/* If close to asymptote, use asymptotic approximation, else use rational approximation */ \
-vblendvps(x1, x1, x9, x5); /* Blend asymptotic and rational results */ \
-\
-/* If very small value, use y itself, otherwise use computed result */ \
-vblendvps(x0, x1, x7, x3); /* Final result with small value handling */ \
+YmmReg x1, x2, x3, x4; \
+/* k = round(x * 2/pi): adding 1.5*2^23 rounds to integer, lowest mantissa bit is the parity of k */ \
+vmovaps(x1, CPTR_AVX(float_tan_2_over_pi)); \
+vfmadd213ps(x1, x0, CPTR_AVX(float_rintf)); /* biased k */ \
+vpslld(x2, x1, 31); /* odd quadrant: sign bit set, enough for vblendvps */ \
+vsubps(x1, x1, CPTR_AVX(float_rintf)); /* k */ \
+vmulps(x1, x1, CPTR_AVX(elfloat_half)); /* k/2: k * pi/2 = k/2 * pi, exact */ \
+/* r = x - k * pi/2, four-part pi for precision, |r| <= pi/4 */ \
+vmovaps(x3, x0); \
+vfnmadd231ps(x3, x1, CPTR_AVX(float_pi1)); \
+vfnmadd231ps(x3, x1, CPTR_AVX(float_pi2)); \
+vfnmadd231ps(x3, x1, CPTR_AVX(float_pi3)); \
+vfnmadd231ps(x3, x1, CPTR_AVX(float_pi4)); /* r */ \
+/* tan(r) = r + r*z*P(z), z = r^2 */ \
+vmulps(x4, x3, x3); /* z */ \
+vmovaps(x1, CPTR_AVX(float_tan_c5)); \
+vfmadd213ps(x1, x4, CPTR_AVX(float_tan_c4)); \
+vfmadd213ps(x1, x4, CPTR_AVX(float_tan_c3)); \
+vfmadd213ps(x1, x4, CPTR_AVX(float_tan_c2)); \
+vfmadd213ps(x1, x4, CPTR_AVX(float_tan_c1)); \
+vfmadd213ps(x1, x4, CPTR_AVX(float_tan_c0)); /* P(z) */ \
+vmulps(x4, x4, x3); /* r*z */ \
+vfmadd213ps(x1, x4, x3); /* t = tan(r) = r*z*P(z) + r */ \
+/* odd k: -1/t, even k: t/1 */ \
+vmovaps(x3, CPTR_AVX(elfloat_minusone)); \
+vblendvps(x3, x1, x3, x2); /* numerator */ \
+vmovaps(x4, CPTR_AVX(elfloat_one)); \
+vblendvps(x4, x4, x1, x2); /* denominator */ \
+vdivps(x0, x3, x4); \
 }
 
 // atan2: based on https://stackoverflow.com/questions/46210708/atan2-approximation-with-11bits-in-mantissa-on-x86with-sse2-and-armwith-vfpv4?noredirect=1&lq=1
@@ -1125,6 +927,9 @@ vandps(x0, x0, x3); \
 /* no need. input was "x0" for y */ \
 }
 
+// sin/cos: k = round(x/pi) (1.5*2^23 shifter), r = x - k*pi (four-part pi, Cody-Waite),
+// sign flipped for odd k; sin(r) = r + r^3*P(r^2) (degree 9), cos(r) = 1 + r^2*Q(r^2) (degree 8),
+// |r| <= pi/2. Same scheme and comments as glibc libmvec sinf (see the constant table).
 #define SINCOS_PS(issin, y, x) { \
 XmmReg t1, sign, t2, t3, t4; \
 /* // Remove sign */ \
@@ -1210,6 +1015,7 @@ else { \
 VEX2(xorps, y, t1, sign); \
 }
 
+// sin/cos, AVX2 version of SINCOS_PS
 // y dst x src
 #define SINCOS_PS_AVX(issin, y, x) { \
 YmmReg t1, sign, t2, t3, t4; \
@@ -1259,23 +1065,628 @@ else { \
 vxorps(y, t1, sign); \
 }
 
-// return (x - std::round(x / d)*d);
+// x % d, same result as C fmodf when |x/d| < 2^24:
+// q = trunc(|x|/|d|) can be one too big (division rounding), never too small.
+// r = |x| - q*|d| is exactly representable; computed exactly (SSE2: in double, AVX2: by FMA)
+// r < 0 (q was one too big): r += |d|. Result gets the sign of x (also -0); d == 0: NaN.
+// SSE2 intrinsic equivalent of FMOD_PS:
+//   __m128 fmod_ps(__m128 x, __m128 d) {
+//     const __m128 absmask = _mm_castsi128_ps(_mm_set1_epi32(0x7fffffff));
+//     __m128 ax = _mm_and_ps(x, absmask);
+//     __m128 ad = _mm_and_ps(d, absmask);
+//     __m128 q = _mm_cvtepi32_ps(_mm_cvttps_epi32(_mm_div_ps(ax, ad)));
+//     __m128d lo = _mm_sub_pd(_mm_cvtps_pd(ax), _mm_mul_pd(_mm_cvtps_pd(q), _mm_cvtps_pd(ad)));
+//     __m128d hi = _mm_sub_pd(_mm_cvtps_pd(_mm_movehl_ps(ax, ax)),
+//                             _mm_mul_pd(_mm_cvtps_pd(_mm_movehl_ps(q, q)), _mm_cvtps_pd(_mm_movehl_ps(ad, ad))));
+//     __m128 r = _mm_movelh_ps(_mm_cvtpd_ps(lo), _mm_cvtpd_ps(hi));
+//     r = _mm_add_ps(r, _mm_and_ps(_mm_cmplt_ps(r, _mm_setzero_ps()), ad));
+//     r = _mm_or_ps(r, _mm_andnot_ps(absmask, x));
+//     return _mm_or_ps(r, _mm_cmpeq_ps(ad, _mm_setzero_ps()));
+//   }
 #define FMOD_PS(x, d) { \
-XmmReg aTmp; \
-movaps(aTmp, x); \
-divps(aTmp, d); \
-cvttps2dq(aTmp,aTmp); \
-cvtdq2ps(aTmp,aTmp); \
-mulps(aTmp, d); \
-subps(x, aTmp); }
+XmmReg aX, aD, aQ, aR, aT0, aT1, aT2; \
+movaps(aX, x); \
+andps(aX, CPTR(elabsmask)); /* |x| */ \
+movaps(aD, d); \
+andps(aD, CPTR(elabsmask)); /* |d| */ \
+movaps(aQ, aX); \
+divps(aQ, aD); \
+cvttps2dq(aQ, aQ); \
+cvtdq2ps(aQ, aQ); /* q = trunc(|x|/|d|) */ \
+/* r = |x| - q*|d| in double: 24x24 bit product is exact, the difference is representable */ \
+cvtps2pd(aT0, aQ); \
+cvtps2pd(aT1, aD); \
+mulpd(aT0, aT1); \
+cvtps2pd(aT1, aX); \
+subpd(aT1, aT0); \
+cvtpd2ps(aR, aT1); /* elements 0,1 */ \
+movhlps(aQ, aQ); \
+movaps(aT2, aD); \
+movhlps(aT2, aT2); \
+movhlps(aX, aX); \
+cvtps2pd(aT0, aQ); \
+cvtps2pd(aT1, aT2); \
+mulpd(aT0, aT1); \
+cvtps2pd(aT1, aX); \
+subpd(aT1, aT0); \
+cvtpd2ps(aT1, aT1); \
+movlhps(aR, aT1); /* elements 2,3 */ \
+xorps(aT0, aT0); \
+movaps(aT1, aR); \
+cmpltps(aT1, aT0); \
+andps(aT1, aD); \
+addps(aR, aT1); /* r < 0: r += |d| */ \
+cmpeqps(aD, aT0); /* d == 0 */ \
+andps(x, CPTR(elsignmask)); \
+orps(x, aR); /* sign of x */ \
+orps(x, aD); /* d == 0: NaN */ \
+}
 
 #define FMOD_PS_AVX(x, d) { \
-YmmReg aTmp; \
-vdivps(aTmp, x, d); \
-vcvttps2dq(aTmp,aTmp); \
-vcvtdq2ps(aTmp,aTmp); \
-vmulps(aTmp, aTmp, d); \
-vsubps(x, x, aTmp); }
+YmmReg aX, aD, aQ, aZ; \
+vandps(aX, x, CPTR_AVX(elabsmask)); /* |x| */ \
+vandps(aD, d, CPTR_AVX(elabsmask)); /* |d| */ \
+vdivps(aQ, aX, aD); \
+vroundps(aQ, aQ, FROUND_TO_ZERO | FROUND_NO_EXC); /* q = trunc(|x|/|d|) */ \
+vfnmadd231ps(aX, aQ, aD); /* r = |x| - q*|d|, single rounding: exact */ \
+vxorps(aZ, aZ, aZ); \
+vcmpps(aQ, aX, aZ, _CMP_LT_OQ); \
+vandps(aQ, aQ, aD); \
+vaddps(aX, aX, aQ); /* r < 0: r += |d| */ \
+vcmpps(aD, aD, aZ, _CMP_EQ_OQ); /* d == 0 */ \
+vandps(x, x, CPTR_AVX(elsignmask)); \
+vorps(x, x, aX); /* sign of x */ \
+vorps(x, x, aD); /* d == 0: NaN */ \
+}
+
+// Register types for the code generator functions below. They are not class members,
+// so they cannot use the evaluators' inherited Reg / XmmReg names.
+using JitReg = jitasm::Reg;
+using JitXmmReg = jitasm::XmmReg;
+
+
+// pshufd immediate: element x gets source element src_element_of(x)
+template<typename F>
+static constexpr uint8_t elements_imm(F src_element_of) {
+  return (uint8_t)(src_element_of(0) | (src_element_of(1) << 2) | (src_element_of(2) << 4) | (src_element_of(3) << 6));
+}
+
+// Element masks for emitPshufdWithFiller (bit i set: element i gets the filler)
+// first_elements(n): elements 0..n-1     n = 1, 2, 3, 4 -> 0001, 0011, 0111, 1111 (0x1, 0x3, 0x7, 0xF)
+// last_elements(n):  elements 4-n..3     n = 1, 2, 3, 4 -> 1000, 1100, 1110, 1111 (0x8, 0xC, 0xE, 0xF)
+static constexpr uint8_t first_elements(int n) { return (uint8_t)((1 << n) - 1); }
+static constexpr uint8_t last_elements(int n) { return (uint8_t)(0xF & ~((1 << (4 - n)) - 1)); }
+
+
+// borderConstant: scale_inputs conversion of the loaded pixels in r (and r2, when given),
+// before the filler is put in place of the off-screen ones. Same steps, same order as the
+// separate operations of other loads (see ExprLoadConv). No code when there is no conversion.
+template<bool VEX, class J>
+static AVS_FORCEINLINE void emitConvert4(J& j, JitXmmReg& r, JitXmmReg* r2, const ExprLoadConv* conv)
+{
+  if (conv == nullptr || !conv->active())
+    return;
+  enum { Sub, Mul, Add };
+  // one step: broadcast 'value', then sub/mul/add it to r (and r2)
+  auto step = [&](float value, int kind) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits)); // C++17 equivalent of C++20 std::bit_cast<uint32_t>(value)
+    jitasm::Reg32 t;
+    JitXmmReg c;
+    j.mov(t, (int32_t)bits);
+    if constexpr (VEX) {
+      j.vmovd(c, t);
+      j.vpshufd(c, c, 0);
+    }
+    else {
+      j.movd(c, t);
+      j.pshufd(c, c, 0);
+    }
+    for (JitXmmReg* x : { &r, r2 }) {
+      if (x == nullptr)
+        continue;
+      if constexpr (VEX) {
+        if (kind == Sub) j.vsubps(*x, *x, c);
+        else if (kind == Mul) j.vmulps(*x, *x, c);
+        else j.vaddps(*x, *x, c);
+      }
+      else {
+        if (kind == Sub) j.subps(*x, c);
+        else if (kind == Mul) j.mulps(*x, c);
+        else j.addps(*x, c);
+      }
+    }
+  };
+  // and now the real work, optimized to skip no-op steps
+  if (conv->sub != 0.0f) step(conv->sub, Sub);
+  if (conv->mul != 1.0f) step(conv->mul, Mul);
+  if (conv->add != 0.0f) step(conv->add, Add);
+  if (conv->add_uv != 0.0f) step(conv->add_uv, Add);
+}
+
+// Load 4 pixels from [base + offset] and convert them to 4 floats.
+// VEX: VEX-encoded instructions for the AVX2 evaluator; 'zero' for the SSE2 unpack based
+//      widening is not needed, direct vpmovzx* zero-extends directly.
+// conv: borderConstant only, the scale_inputs conversion (see emitConvert4), nullptr: none.
+template<bool VEX, class J>
+static AVS_FORCEINLINE void emitLoad4AsFloat(J& j, JitXmmReg& r, JitReg& base, int offset, int op, const JitXmmReg* zero, const ExprLoadConv* conv)
+{
+  if constexpr (VEX) {
+    if (op == opLoadRelSrc8) {
+      // 8->32 bits like _mm256_cvtepu8_epi32
+      j.vpmovzxbd(r, j.dword_ptr[base + offset]);
+      j.vcvtdq2ps(r, r);
+    }
+    else if (op == opLoadRelSrc16) {
+      // 16->32 bit like _mm256_cvtepu16_epi32
+      j.vpmovzxwd(r, j.qword_ptr[base + offset]);
+      j.vcvtdq2ps(r, r);
+    }
+    else // opLoadRelSrcF32
+      j.vmovdqu(r, j.xmmword_ptr[base + offset]);
+  }
+  else {
+    // SSE2: widen with unpacks
+    if (op == opLoadRelSrc8) {
+      j.movd(r, j.dword_ptr[base + offset]);
+      j.punpcklbw(r, *zero);
+      j.punpcklwd(r, *zero);
+      j.cvtdq2ps(r, r);
+    }
+    else if (op == opLoadRelSrc16) {
+      j.movq(r, j.mmword_ptr[base + offset]);
+      j.punpcklwd(r, *zero);
+      j.cvtdq2ps(r, r);
+    }
+    else // opLoadRelSrcF32
+      j.movdqu(r, j.xmmword_ptr[base + offset]);
+  }
+  emitConvert4<VEX>(j, r, nullptr, conv);
+}
+
+template<bool VEX, class J>
+static AVS_FORCEINLINE void emitPshufd(J& j, JitXmmReg& r, uint8_t imm)
+{
+  if constexpr (VEX)
+    j.vpshufd(r, r, imm);
+  else
+    j.pshufd(r, r, imm);
+}
+
+// used from 'constant' and 'wrap' border modes
+template<bool VEX, class J>
+static AVS_FORCEINLINE void emitPshufdWithFiller(
+  J& j,
+  JitXmmReg& r,
+  uint8_t imm, // shuffle
+  uint8_t blend_mask, // bit i set: element i gets the filler: first_elements(n) or last_elements(n), n = 1..4 (VEX: vblendps immediate)
+  JitXmmReg& filler_value_r,
+  JitReg* constptr) // SSE2 only (element mask constants), nullptr for VEX
+{
+  if (blend_mask == first_elements(4)) {
+    // 4: all elements filler: nothing to shuffle or blend
+    if constexpr (VEX)
+      j.vmovaps(r, filler_value_r);
+    else
+      j.movaps(r, filler_value_r);
+    return;
+  }
+  // shuffle first
+  emitPshufd<VEX, J>(j, r, imm);
+
+  // overwrite with filler_value_r constant
+  if (blend_mask != 0)
+  {
+    if constexpr (VEX)
+    {
+      // VEX 32-bit blending (0 = r, 1 = filler_value_r)
+      j.vblendps(r, r, filler_value_r, blend_mask);
+    }
+    else
+    {
+      // SSE2 blend with the loadmask1000/1100/1110 mask constants
+      // Unfortunately blend exists only since sse 4.1
+      // SSE2: r = (filler & fillmask) | (r & ~fillmask)
+      auto element_mask = [&](int c) { return j.xmmword_ptr[*constptr + c * 16]; };
+
+      JitXmmReg t;
+      switch (blend_mask) {
+      case first_elements(1):
+      case first_elements(2):
+      case first_elements(3): {
+        // first 1,2,3 => mask1000/1100/1110
+        // prefix: the filler elements are the mask elements
+        const int fillmask = blend_mask == first_elements(1) ? loadmask1000 : blend_mask == first_elements(2) ? loadmask1100 : loadmask1110;
+        j.movaps(t, element_mask(fillmask));
+        j.andnps(t, r); // t = r & ~fillmask (andnps: dst = ~dst & src)
+        j.movaps(r, filler_value_r);
+        j.andps(r, element_mask(fillmask)); // r = filler & fillmask
+        j.orps(r, t);
+        break;
+      }
+      case last_elements(1):
+      case last_elements(2):
+      case last_elements(3): {
+        // last 1,2,3 => mask1110/1100/1000 (+inverted arguments)
+        // suffix: the filler elements are the complement of a prefix, keep the prefix of r
+        const int keepmask = blend_mask == last_elements(1) ? loadmask1110 : blend_mask == last_elements(2) ? loadmask1100 : loadmask1000;
+        j.movaps(t, element_mask(keepmask));
+        j.andnps(t, filler_value_r); // t = filler & ~keepmask
+        j.andps(r, element_mask(keepmask)); // r = r & keepmask
+        j.orps(r, t);
+        break;
+      }
+      default:
+        assert(false); // cannot occur
+      }
+    }
+  }
+}
+
+
+// Generates code that moves 'a' (pointer at xcounter in the current row of clip 'clip') to the
+// source row y + dy, handled by border mode bc.
+// Mirror and wrap modes: only a single reflection or wrap is handled, |dy| < planeheight
+// (checked when the JIT is chosen for the plane).
+template<class J>
+static void emitRowAdjust(J& j, JitReg& a, JitReg& regptrs, JitReg& SpatialY, int clip, int dy, int bc, int planeheight)
+{
+  if (dy == 0)
+    return;
+  JitReg rows; // signed row difference
+  if (bc == borderClamp || bc == borderConstant) {
+    // borderConstant: pointer clamped to a valid row, the caller replaces the result
+    // with the filler when the source row is off-screen (emitRowOffscreenCheck)
+    // repeat (clamp) mode
+    JitReg sy;
+    if (dy < 0) {
+      // Read from above: rows = -min(-dy, y)
+      j.mov(sy, SpatialY);
+      j.mov(rows, -dy);
+      j.cmp(rows, sy);
+      j.cmovg(rows, sy);
+      j.neg(rows);
+    }
+    else {
+      // Read from below: rows = min(dy, planeheight - 1 - y)
+      j.mov(sy, planeheight - 1);
+      j.sub(sy, SpatialY);
+      j.mov(rows, dy);
+      j.cmp(rows, sy);
+      j.cmovg(rows, sy);
+    }
+  }
+  else if (bc == borderWrap) {
+    // source row t = y + dy, wrapped once
+    JitReg t, alt;
+    j.mov(t, SpatialY);
+    j.add(t, dy);
+    // alt computed independently from SpatialY (not as a copy of t)
+    j.mov(alt, SpatialY);
+    if (dy < 0) {
+      j.add(alt, dy + planeheight); // t < 0: t + h
+      j.cmp(t, 0);
+      j.cmovl(t, alt);
+    }
+    else {
+      j.add(alt, dy - planeheight); // t >= h: t - h
+      j.cmp(t, planeheight);
+      j.cmovge(t, alt);
+    }
+    j.mov(rows, t);
+    j.sub(rows, SpatialY);
+  }
+  else {
+    // two types of mirror modes: borderMirror and borderReflect101
+    // source row t = y + dy, reflected once
+    JitReg t, alt;
+    j.mov(t, SpatialY);
+    j.add(t, dy);
+    if (dy < 0) {
+      j.mov(alt, bc == borderMirror ? -1 : 0); // t < 0: -1 - t (:m) or -t (:r)
+      j.sub(alt, t);
+      j.cmp(t, 0);
+      j.cmovl(t, alt);
+    }
+    else {
+      j.mov(alt, 2 * planeheight - (bc == borderMirror ? 1 : 2)); // t >= h: 2h-1-t (:m) or 2h-2-t (:r)
+      j.sub(alt, t);
+      j.cmp(t, planeheight);
+      j.cmovge(t, alt);
+    }
+    j.mov(rows, t);
+    j.sub(rows, SpatialY);
+  }
+#ifdef JITASM64
+  j.imul(rows, j.qword_ptr[regptrs + sizeof(void *) * (clip + RWPTR_START_OF_STRIDES)]); // rows * stride
+#else
+  j.imul(rows, j.dword_ptr[regptrs + sizeof(void *) * (clip + RWPTR_START_OF_STRIDES)]); // rows * stride
+#endif
+  j.add(a, rows);
+}
+
+// borderConstant: emits a jump to labelOnScreen when the source row y + dy is inside the plane.
+// The code following it (up to the label) is for an off-screen row: fill with the filler.
+template<class J>
+static void emitRowOffscreenCheck(J& j, JitReg& SpatialY, int dy, int planeheight, const std::string& labelOnScreen)
+{
+  if (dy < 0) {
+    j.cmp(SpatialY, -dy);
+    j.jge(labelOnScreen); // y + dy >= 0
+  }
+  else {
+    j.cmp(SpatialY, planeheight - 1 - dy);
+    j.jle(labelOnScreen); // y + dy <= planeheight - 1
+  }
+}
+
+// Generates code (into JIT function j) that loads 4 pixels at x + dxh (x = current xcounter) as floats.
+// Why four: 4 float pixels fill one 128 bit XMM register.
+// Where the position falls outside the row, border mode bc decides:
+// - repeat the first/last pixel (borderClamp, :c)
+// - mirror (borderMirror :m, borderReflect101 :r).
+// - constant (borderConstant :k): the filler value of filler_r (from the stack, see foldConstants).
+//   The loaded pixels get their scale_inputs conversion (conv) right after the load, the filler
+//   is already in the expression's domain: it is blended in after the conversion.
+// - wrap (borderWrap :w): the pixel from the other end of the row (periodic)
+// Result: pixel i of r = pixel borderIndex(xcounter + dxh + i, planewidth, bc) of the row
+// pointed by 'a' (a: pointer at xcounter, vertical dy offset already applied).
+// For :k: the filler when xcounter + dxh + i is outside 0..planewidth-1. An off-screen
+// source row (vertical) is not handled here: 'a' points to a clamped valid row, the caller
+// replaces the whole result with the filler (emitRowOffscreenCheck).
+//
+// Mirror and wrap modes reflect or wrap once: valid for -(planewidth-1) <= dx <= planewidth-3
+// (:m, :w) or planewidth-4 (:r). Other offsets cannot be handled by JIT, and handled by scalar C path.
+//
+// When planewidth is not a multiple of 4, the last group extends past the row end
+// (xcounter + i >= planewidth). Those output pixels are never stored, their values
+// do not matter.
+//
+// Cases:
+// - dxh == 0: simple load
+// - dxh < 0: left edge crossed
+//   Partial (group crosses the edge): load pixels 0..3, constant shuffle.
+//     constant: elements 0..s-1 get the filler (emitPshufdWithFiller, blend mask 1, 3, 7).
+//     wrap: elements 0..s-1 come from the row end: pixels planewidth-4..planewidth-1 are loaded
+//     as well, shuffled, and blended in (blend mask 1, 3, 7).
+//   Full (group entirely left of the row):
+//   - clamp: load pixels 0..3, all = pixel 0;
+//   - mirror: the needed pixels are a reversed run of 4 inside the row, load it, reverse.
+//   - constant: all = filler, no load.
+//   - wrap: a forward run of 4 from newx+planewidth, at a constant offset from 'a'
+//     (dxh+planewidth), no shuffle.
+// - dxh > 0: right edge crossed.
+//   Partial: load pixels planewidth-4..planewidth-1, constant shuffle.
+//     constant: elements 4-t..3 get the filler (blend mask 8, C, E).
+//     wrap: elements 4-t..3 come from the row start: pixels 0..3 are loaded as well, shuffled,
+//     and blended in (blend mask 8, C, E).
+//   Full:
+//   - clamp: same load, all = pixel planewidth-1
+//   - mirror: reversed run of 4, its start limited to >= 0 (only groups without
+//     stored pixels would start lower).
+//   - constant: all = filler, no load.
+//   - wrap: a forward run of 4 from newx-planewidth, at a constant offset from 'a'
+//     (dxh-planewidth), no shuffle. For groups without stored pixels the run may extend
+//     past the row end, not further than a normal load of the same group.
+// - planewidth < 4: only the group at xcounter == 0 is stored, one constant shuffle
+//   (any dx, any mode). constant: plus a blend of the off-screen elements; no load when
+//   all elements are off-screen.
+//
+// - Constant shuffles: xcounter is a multiple of 4, so the shift of a partial edge case is
+//   known at code generation time (pshufd immediate, see elements_imm).
+// - Shuffles are done after conversion to float: one implementation for 8/16/32 bit,
+//   only emitLoad4AsFloat depends on the pixel type.
+// - Reads stay within [0, planewidth) of the row, except where a normal (non-relative) load of
+//   the same pixel group would read as well.
+// - Used by the SSE2 (VEX=false) and AVX2 (VEX=true) evaluators; xcounter is a multiple of 4
+//   in both (8 or 16 in AVX2).
+template<bool VEX, class J>
+static void emitRelLoad4(J& j, JitXmmReg& r, JitReg& a, JitReg& regptrs, const JitXmmReg* zero, int op, int dxh, int planewidth, int bc,
+  JitXmmReg& filler_r, // borderConstant: the filler value in all 4 elements
+  const ExprLoadConv* conv, // borderConstant: scale_inputs conversion of the loaded pixels, done before the filler is blended in
+  JitReg* sse_helper_constptr) // SSE2 (VEX=false) only: constant table for emitPshufdWithFiller, nullptr for VEX
+{
+  const int shift = op == opLoadRelSrc8 ? 0 : op == opLoadRelSrc16 ? 1 : 2; // log2(bytes per pixel)
+  if (dxh == 0) {
+    // valid elements need no border handling
+    emitLoad4AsFloat<VEX>(j, r, a, 0, op, zero, conv);
+    return;
+  }
+  if (planewidth < 4) {
+    // only the group at xcounter == 0 has valid elements: everything is known at compile time
+    // :k mode: off-screen elements get the filler. Only stored elements (i < planewidth) matter, so only one
+    // side is checked: dxh < 0: a prefix of elements, dxh > 0: a suffix (contiguous blend mask)
+    uint8_t blendmask = 0;
+    if (bc == borderConstant) {
+      // dxh < 0: elements i + dxh < 0, the first -dxh elements; dxh > 0: elements i + dxh >= planewidth, the last 4-(planewidth-dxh)
+      blendmask = dxh < 0 ? first_elements(std::min(-dxh, 4)) : last_elements(std::max(0, std::min(4 - (planewidth - dxh), 4)));
+      if (blendmask == first_elements(4)) {
+        emitPshufdWithFiller<VEX>(j, r, 0, first_elements(4), filler_r, sse_helper_constptr); // all filler, no source pixel needed
+        return;
+      }
+    }
+    JitReg rowp, xb;
+    j.mov(xb, j.ptr[regptrs + sizeof(void*) * (RWPTR_START_OF_XCOUNTER)]);
+    j.shl(xb, shift);
+    j.mov(rowp, a);
+    j.sub(rowp, xb); // start of row
+    emitLoad4AsFloat<VEX>(j, r, rowp, 0, op, zero, conv);
+    if (bc != borderConstant) {
+      emitPshufd<VEX>(j, r, elements_imm([=](int i) { return borderIndex(i + dxh, planewidth, bc); }));
+    }
+    else {
+      emitPshufdWithFiller<VEX>(j, r, elements_imm([=](int i) { return std::max(0, std::min(i + dxh, 3)); }), blendmask, filler_r, sse_helper_constptr);
+    }
+
+    return;
+  }
+  // trivial cases are done
+
+  std::string LabelEdge = "relEdge" + j.getLabelCount();
+  std::string LabelPartial = "relPartial" + j.getLabelCount();
+  std::string LabelEnd = "relEnd" + j.getLabelCount();
+
+  JitReg newx;
+  j.mov(newx, j.ptr[regptrs + sizeof(void*) * (RWPTR_START_OF_XCOUNTER)]);
+  j.add(newx, dxh);
+  // dxh < 0: only the left edge needs border handling, valid elements never reach the right edge.
+  // dxh > 0: only the right edge.
+  j.cmp(newx, dxh < 0 ? 0 : planewidth - 4);
+  if (dxh < 0)
+    j.jl(LabelEdge); // newx < 0
+  else
+    j.jg(LabelEdge); // newx > planewidth - 4
+
+  emitLoad4AsFloat<VEX>(j, r, a, dxh << shift, op, zero, conv); // normal case: no border handling
+  j.jmp(LabelEnd);
+
+  j.L(LabelEdge);
+  JitReg rowp;
+  j.mov(rowp, j.ptr[regptrs + sizeof(void*) * (RWPTR_START_OF_XCOUNTER)]);
+  j.shl(rowp, shift); // index to real ptr 1-2-4x uint8/uint16/float
+  j.neg(rowp);
+  j.add(rowp, a); // start of row
+  const uint8_t reverse = elements_imm([](int i) { return 3 - i; });
+  if (dxh < 0) {
+    const int s = (-dxh) & 3; // -newx for the partial case, -3 < newx < 0
+    if (s != 0) {
+      j.cmp(newx, -4);
+      j.jg(LabelPartial);
+    }
+    // newx <= -4: all elements are left of the row start
+    if (bc == borderClamp) {
+      emitLoad4AsFloat<VEX>(j, r, rowp, 0, op, zero, conv);
+      emitPshufd<VEX>(j, r, elements_imm([](int) { return 0; })); // all elements pixel 0
+    }
+    else if (bc == borderConstant) {
+      // :k mode: all elements filler, no source pixel needed
+      emitPshufdWithFiller<VEX>(j, r, 0, first_elements(4) /* all elements */, filler_r, sse_helper_constptr);
+    }
+    else if (bc == borderWrap) {
+      // wrapped: pixels newx+i+w, a forward run of 4 inside the row (1 <= newx+w, newx+w+3 <= w-1).
+      // Relative to 'a' (xcounter) it is a constant offset: dxh + w
+      emitLoad4AsFloat<VEX>(j, r, a, (dxh + planewidth) << shift, op, zero, conv);
+    }
+    else {
+      // two kinds of mirror modes: borderMirror and borderReflect101
+      // mirrored: pixels -1-newx-i (:m) or -newx-i (:r), a reversed run of 4 inside the row.
+      // Its first pixel (of element 3) from the row start: c - newx, c = -4 (:m), -3 (:r).
+      // Note: on x86 this case crashed under register pressure (a jitasm register allocator bug,
+      // fixed 20261008 in jitasm.h GenerateInterBlockInstr); it was worked around by reading X
+      // from memory until then.
+      JitReg b;
+      j.mov(b, newx);
+      j.neg(b);
+      j.sub(b, bc == borderMirror ? 4 : 3);
+      j.shl(b, shift); // index to real ptr 1-2-4x uint8/uint16/float
+      j.add(b, rowp);
+      emitLoad4AsFloat<VEX>(j, r, b, 0, op, zero, conv);
+      emitPshufd<VEX>(j, r, reverse);
+    }
+    if (s != 0) {
+      j.jmp(LabelEnd);
+      j.L(LabelPartial);
+      // all needed pixels are within 0..3 (wrap: also within planewidth-4..planewidth-1)
+      emitLoad4AsFloat<VEX>(j, r, rowp, 0, op, zero, conv);
+      if (bc == borderWrap) {
+        // elements 0..s-1 wrap to the row end: pixels w-s+i, block w-4..w-1 index 4-s+i (blend mask 1, 3, 7);
+        // the others pixel i - s from the row start
+        JitXmmReg u;
+        emitLoad4AsFloat<VEX>(j, u, rowp, (planewidth - 4) << shift, op, zero, conv);
+        emitPshufd<VEX>(j, u, elements_imm([=](int i) { return i < s ? 4 - s + i : 3; }));
+        const uint8_t blendmask = first_elements(s);
+        emitPshufdWithFiller<VEX>(j, r, elements_imm([=](int i) { return std::max(i - s, 0); }), blendmask, u, sse_helper_constptr);
+      }
+      else if (bc != borderConstant)
+        emitPshufd<VEX>(j, r, elements_imm([=](int i) { return borderIndex(i - s, planewidth, bc); }));
+      else {
+        // elements 0..s-1 are left of the row start: filler (blend mask 1, 3, 7), the others pixel i - s
+        const uint8_t blendmask = first_elements(s);
+        emitPshufdWithFiller<VEX>(j, r, elements_imm([=](int i) { return std::max(i - s, 0); }), blendmask, filler_r, sse_helper_constptr);
+      }
+    }
+  }
+  else {
+    const int t = (dxh - planewidth) & 3;
+    // newx - (planewidth - 4) for the partial case, 0 < t < 4
+
+    // clamp (edge repeat): with t == 3 only pixel 0 is inside the row, all 4 elements
+    // get pixel at (planewidth-1), the same as the full case, where
+    // no partial branch needed (t == 0 is the trivial no partial case)
+    //
+    //   loaded: the last 4 pixels of the row      P Q R S | (row end)
+    //   block index                               0 1 2 3 |
+    //                        clamp                                  constant (:k), k: filler
+    //   t   group starts at  needs        -> indexes                needs        -> indexes  blend mask
+    //   1        Q           Q R S + S       1 2 3 3                Q R S + k       1 2 3 k     8
+    //   2        R           R S + S S       2 3 3 3                R S + k k       2 3 k k     C
+    //   3        S           S + S S S       3 3 3 3 = full case    S + k k k       3 k k k     E
+    const bool hasPartial = bc == borderClamp ? (t == 1 || t == 2) : (t != 0);
+    if (hasPartial) {
+      j.cmp(newx, planewidth);
+      j.jl(LabelPartial);
+    }
+    // newx >= planewidth: all elements are right of the row end
+    if (bc == borderClamp) {
+      emitLoad4AsFloat<VEX>(j, r, rowp, (planewidth - 4) << shift /* byte index */, op, zero, conv);
+      emitPshufd<VEX>(j, r, elements_imm([](int) { return 3; })); // all elements pixel planewidth-1
+    }
+    else if (bc == borderConstant) {
+      // :k mode: all elements filler, no source pixel needed
+      emitPshufdWithFiller<VEX>(j, r, 0, first_elements(4) /* all elements */, filler_r, sse_helper_constptr);
+    }
+    else if (bc == borderWrap) {
+      // wrapped: pixels newx-w+i, a forward run of 4 from newx-w (>= 0).
+      // Relative to 'a' (xcounter) it is a constant offset: dxh - w.
+      // For groups without stored pixels the run may extend past the row end,
+      // but not further than a normal load of the same pixel group would read.
+      emitLoad4AsFloat<VEX>(j, r, a, (dxh - planewidth) << shift, op, zero, conv);
+    }
+    else {
+      // w: planewidth. :m and :r are the mirror modes (borderMirror, borderReflect101)
+      // mirrored: pixels 2w-1-newx-i (:m) or 2w-2-newx-i (:r), a reversed run of 4.
+      // Its start is negative only for groups without stored pixels: limited to 0.
+      // First pixel (of element 3) from the row start:
+      // c - newx, where c = 2w-4 (:m), 2w-5 (:r), limited to >= 0.
+      JitReg b, z;
+      j.mov(b, 2 * planewidth - (bc == borderMirror ? 4 : 5));
+      j.sub(b, newx);
+      j.mov(z, 0);
+      j.cmp(b, 0);
+      j.cmovl(b, z); // limited to 0
+      j.shl(b, shift); // index to real ptr 1-2-4x uint8/uint16/float
+      j.add(b, rowp);
+      emitLoad4AsFloat<VEX>(j, r, b, 0, op, zero, conv);
+      emitPshufd<VEX>(j, r, reverse);
+    }
+
+    if (hasPartial) {
+      j.jmp(LabelEnd);
+      j.L(LabelPartial);
+      // all needed pixels are within planewidth-4..planewidth-1 (wrap: also within 0..3)
+      emitLoad4AsFloat<VEX>(j, r, rowp, (planewidth - 4) << shift, op, zero, conv);
+      if (bc == borderWrap) {
+        // elements 4-t..3 wrap to the row start: pixels t+i-4 (blend mask 8, C, E);
+        // the others block pixel t + i
+        JitXmmReg u;
+        emitLoad4AsFloat<VEX>(j, u, rowp, 0, op, zero, conv);
+        emitPshufd<VEX>(j, u, elements_imm([=](int i) { return i < 4 - t ? 0 : t + i - 4; }));
+        const uint8_t blendmask = last_elements(t);
+        emitPshufdWithFiller<VEX>(j, r, elements_imm([=](int i) { return std::min(t + i, 3); }), blendmask, u, sse_helper_constptr);
+      }
+      else if (bc != borderConstant) {
+        emitPshufd<VEX>(j, r, elements_imm([=](int i) { return borderIndex(planewidth - 4 + t + i, planewidth, bc) - (planewidth - 4); }));
+      }
+      else {
+        // elements 4-t..3 are right of the row end: filler (blend mask 8, C, E), the others block pixel t + i
+        const uint8_t blendmask = last_elements(t);
+        emitPshufdWithFiller<VEX>(j, r, elements_imm([=](int i) { return borderIndex(planewidth - 4 + t + i, planewidth, bc) - (planewidth - 4); }), blendmask, filler_r, sse_helper_constptr);
+      }
+    }
+  }
+  j.L(LabelEnd);
+}
+
 
 struct ExprEval : public jitasm::function<void, ExprEval, uint8_t *, const intptr_t *, intptr_t, intptr_t> {
 
@@ -1304,13 +1715,99 @@ struct ExprEval : public jitasm::function<void, ExprEval, uint8_t *, const intpt
     }
   }
 
+  // Load 8 pixels from [base + offset] and convert them to 2x4 floats
+  AVS_FORCEINLINE void load8AsFloat(XmmReg& r1, XmmReg& r2, Reg& base, int offset, int op, XmmReg& zero)
+  {
+    // widen by unpacks
+    if (op == opLoadRelSrc8) {
+      movq(r1, mmword_ptr[base + offset]);
+      punpcklbw(r1, zero);
+      movdqa(r2, r1);
+      punpcklwd(r1, zero);
+      punpckhwd(r2, zero);
+      cvtdq2ps(r1, r1);
+      cvtdq2ps(r2, r2);
+    }
+    else if (op == opLoadRelSrc16) {
+      movdqu(r1, xmmword_ptr[base + offset]);
+      movdqa(r2, r1);
+      punpcklwd(r1, zero);
+      punpckhwd(r2, zero);
+      cvtdq2ps(r1, r1);
+      cvtdq2ps(r2, r2);
+    }
+    else { // opLoadRelSrcF32
+      movdqu(r1, xmmword_ptr[base + offset]);
+      movdqu(r2, xmmword_ptr[base + offset + 16]);
+    }
+  }
+
+  // borderConstant: broadcast the filler value into all 4 elements
+  AVS_FORCEINLINE void loadFiller(XmmReg& r, float filler)
+  {
+    uint32_t bits;
+    memcpy(&bits, &filler, sizeof(bits)); // C++17 equivalent of C++20 std::bit_cast<uint32_t>(filler)
+    Reg t;
+    mov(t, (int32_t)bits);
+#ifdef JITASM64
+    movq(r, t);
+#else
+    movd(r, t);
+#endif
+    pshufd(r, r, 0);
+  }
+
+  AVS_FORCEINLINE void relLoad4(XmmReg& r, Reg& a, Reg& regptrs, XmmReg& zero, int op, int dxh, int bc, XmmReg& filler_r, const ExprLoadConv* conv, Reg& constptr)
+  {
+    emitRelLoad4<false>(*this, r, a, regptrs, &zero, op, dxh, planewidth, bc, filler_r, conv, &constptr);
+  }
+
+  // Generates code that loads 8 pixels at x + dx (x = current xcounter, multiple of 8) as floats.
+  // Fast path: when no pixel of the group needs border handling, a single 8-pixel load.
+  // Otherwise (row edges, a few groups per row) two relLoad4, at dx and dx + 4: the second
+  // half's stored pixels are a subset of what relLoad4 assumes as stored, so its rules hold.
+  AVS_FORCEINLINE void relLoad8(XmmReg& r1, XmmReg& r2, Reg& a, Reg& regptrs, XmmReg& zero, int op, int dx, int bc, XmmReg& filler_r, const ExprLoadConv* conv, Reg& constptr)
+  {
+    const int shift = op == opLoadRelSrc8 ? 0 : op == opLoadRelSrc16 ? 1 : 2; // log2(bytes per pixel)
+    if (dx == 0) {
+      load8AsFloat(r1, r2, a, 0, op, zero); // stored pixels need no border handling
+      emitConvert4<false>(*this, r1, &r2, conv);
+      return;
+    }
+    // trivial case is done
+    std::string LabelEdge = "relEdge8_" + getLabelCount();
+    std::string LabelEnd = "relEnd8_" + getLabelCount();
+    Reg newx;
+    mov(newx, ptr[regptrs + sizeof(void*) * (RWPTR_START_OF_XCOUNTER)]);
+    add(newx, dx);
+    // dx < 0: only the left edge
+    // dx > 0: only the right edge can be crossed (similar to relLoad4)
+    cmp(newx, dx < 0 ? 0 : planewidth - 8);
+    if (dx < 0)
+      jl(LabelEdge); // newx < 0
+    else
+      jg(LabelEdge); // newx > planewidth - 8
+
+    // direct load, no border handling needed
+    load8AsFloat(r1, r2, a, dx << shift, op, zero);
+    emitConvert4<false>(*this, r1, &r2, conv);
+    jmp(LabelEnd);
+
+    L(LabelEdge);
+    // with border handling
+    relLoad4(r1, a, regptrs, zero, op, dx, bc, filler_r, conv, constptr);
+    relLoad4(r2, a, regptrs, zero, op, dx + 4, bc, filler_r, conv, constptr);
+
+    L(LabelEnd);
+  }
+
+
   template<bool processSingle, bool maskUnused>
   AVS_FORCEINLINE void processingLoop(Reg &regptrs, XmmReg &zero, Reg &constptr, Reg &SpatialY)
   {
     std::list<std::pair<XmmReg, XmmReg>> stack;
     std::list<XmmReg> stack1;
 
-    const int pixels_per_cycle = processSingle ? 4 : 8;
 
     const bool maskIt = (maskUnused && ((planewidth & 3) != 0));
 
@@ -1385,938 +1882,41 @@ struct ExprEval : public jitasm::function<void, ExprEval, uint8_t *, const intpt
       else if (iter.op == opLoadRelSrc8 || iter.op == opLoadRelSrc16 || iter.op == opLoadRelSrcF32) {
         // either dx or dy is nonzero
         // common part follows for single 4 pixels/cycle and dual 8 pixels/cycle
-        Reg newx;
-        if (iter.dx != 0) {
-          mov(newx, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]); // original base
-          add(newx, iter.dx); // new base
-        }
-
         Reg a;
         mov(a, ptr[regptrs + sizeof(void *) * (iter.e.ival + RWPTR_START_OF_INPUTS)]); // current pixel group of current line
-                                                                                       // adjust read pointer vertically for nonzero dy, keep 0..height-1 limits
-        if (iter.dy < 0) {
-          // Read from above
-          Reg dy, sy;
-          mov(sy, SpatialY);
-          mov(dy, -iter.dy); // dy = -dy;
-          cmp(dy, sy);
-          cmovg(dy, sy); // mov if greater: if (dy > SpatialY) dy = SpatialY;
-#ifdef JITASM64
-          imul(dy, qword_ptr[regptrs + sizeof(void *) * (iter.e.ival + RWPTR_START_OF_STRIDES)]); // dy * stride
-#else
-          imul(dy, dword_ptr[regptrs + sizeof(void *) * (iter.e.ival + RWPTR_START_OF_STRIDES)]); // dy * stride
-#endif
-          sub(a, dy); // a -= dy * stride
-        }
-        else if (iter.dy > 0) {
-          // Read from bottom
-          Reg dy, sy;
-          mov(sy, planeheight - 1);
-          sub(sy, SpatialY);
-          mov(dy, iter.dy);
-          cmp(dy, sy);
-          cmovg(dy, sy); // mov if greater: if (dy > (planeheight - 1) - SpatialY) dy = SpatialY;
-#ifdef JITASM64
-          imul(dy, qword_ptr[regptrs + sizeof(void *) * (iter.e.ival + RWPTR_START_OF_STRIDES)]); // dy * stride
-#else
-          imul(dy, dword_ptr[regptrs + sizeof(void *) * (iter.e.ival + RWPTR_START_OF_STRIDES)]); // dy * stride
-#endif
-          add(a, dy); // a += dy * stride
-        }
-
-        // dy shift is done already. newx holds xcounter + dx
-        // Cases:
-        // ReadBefore: xcounter + dx < 0 (only when dx < 0):
-        //   FullReadBefore: dx <= pixels_per_cycle: clone leftmost pixel to each pixel posision in the group
-        //   PartialReadBefore: pixels_per_cycle < dx < 0: close leftmost pixel to -dx positions
-        // NormalRead: 0 <= xcounter + dx < planewidth - (pixels_per_cycle - 1) (can read whole pixel group)
-        // OverRead:
-        //   PartialOverRead when pixel at (planewidth-1) is current read position
-        //   PartialOverRead when pixel at (planewidth-1) is after current read position
-        //   FullOverRead: clone pixel at (planewidth-1) to each pixel posision in the group
+        emitRowAdjust(*this, a, regptrs, SpatialY, iter.e.ival, iter.dy, iter.bc, planeheight);
+        // 'a' points to xcounter in the source row
         if (processSingle) {
           // LoadRel8/16/32, single register mode 1x4 pixels
-
-          // Use getLabelCount: names should be unique across multiple calls to processingLoop
-          std::string LabelNeg = "neg" + getLabelCount();
-          std::string LabelOver = "over" + getLabelCount();
-          std::string LabelEnd = "end" + getLabelCount();
-
           XmmReg r1;
-
-          if (iter.dx < 0) { // Optim: read from left is possible only for dx<0 case
-            cmp(newx, 0);
-            jl(LabelNeg); // newx < 0, read (partially or fully) from before the leftmost pixel
+          XmmReg filler_r; // borderConstant: filler value in all elements
+          if (iter.bc == borderConstant)
+            loadFiller(filler_r, iter.filler);
+          relLoad4(r1, a, regptrs, zero, iter.op, iter.dx, iter.bc, filler_r, &iter.conv, constptr);
+          if (iter.bc == borderConstant && iter.dy != 0) {
+            std::string LabelOnScreen = "relRowOn" + getLabelCount();
+            emitRowOffscreenCheck(*this, SpatialY, iter.dy, planeheight, LabelOnScreen);
+            // this can be skipped by a conditional jump from the function above
+            movaps(r1, filler_r); // source row off-screen: all filler
+            L(LabelOnScreen);
           }
-          if (iter.dx != 0) { // Optim: read after rightmost pixel is possible only for dx>0 case
-                              // Also check for dx<0, because of possible memory overread
-                              // e.g.: planewidth = 64, dx = -1, 16 bit pixels, 16 bytes/cycle, reading from offsets -1(0), 15, 31, 47, then 63
-                              // When we read 16 bytes from offset 63, we are overaddressing the 64 byte scanline,
-                              // which may give access violation when pointer is in the most bottom line.
-            cmp(newx, planewidth - (pixels_per_cycle - 1)); // read (partially of fully) after the rightmost pixel
-            jge(LabelOver);
-          }
-
-          // It's safe to read the whole pixel group
-          int offset;
-          if (iter.op == opLoadRelSrc8)
-            offset = iter.dx;
-          else if (iter.op == opLoadRelSrc16)
-            offset = iter.dx * sizeof(uint16_t);
-          else if (iter.op == opLoadRelSrcF32)
-            offset = iter.dx * sizeof(float);
-
-          if (iter.op == opLoadRelSrc8) {
-            movd(r1, dword_ptr[a + offset]); // 4 pixels, 4 bytes
-            punpcklbw(r1, zero);
-            punpcklwd(r1, zero);
-            cvtdq2ps(r1, r1);
-          }
-          else if (iter.op == opLoadRelSrc16) {
-            movq(r1, mmword_ptr[a + offset]); // 4 pixels, 8 bytes
-            punpcklwd(r1, zero);
-            cvtdq2ps(r1, r1);
-          }
-          else if (iter.op == opLoadRelSrcF32) {
-            if (iter.dx % 4 == 0)
-              movdqa(r1, xmmword_ptr[a + offset]); // 4 pixels, 16 bytes aligned
-            else
-              movdqu(r1, xmmword_ptr[a + offset]); // 4 pixels, 16 bytes unaligned
-          }
-          if (iter.dx != 0) {
-            jmp(LabelEnd); // generate jump only when over/negative branches exist
-          }
-
-          if (iter.dx != 0) {
-            L(LabelOver);
-            std::string PartialOverread = "PartialOverread" + getLabelCount();
-            std::string NoFullOverReadFromNewX = "NoFullOverReadFromNewX" + getLabelCount();
-            std::string labelDoOver = "DoOver" + getLabelCount();
-
-            if (iter.dx > 0) { // FullOverRead possible only when dx>0
-              cmp(newx, planewidth);
-              jl(PartialOverread); // if newx < planewidth ->
-
-                                   // case: FullOver
-                                   // even the first pixel to read is beyond the end of line
-                                   // We have to clone the rightmost pixel from (planewidth-1)
-              if (iter.op == opLoadRelSrc8) {
-                sub(a, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                add(a, planewidth - 1);
-                // reuse newx
-                movzx(newx, byte_ptr[a]);
-                movd(r1, newx);
-                punpcklbw(r1, zero); // words
-                pshufb(r1, CPTR(elShuffleForRight6)); // duplicate last word to all
-
-                punpcklwd(r1, zero);
-                cvtdq2ps(r1, r1);
-              }
-              else if (iter.op == opLoadRelSrc16) {
-                Reg tmp;
-                mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                shl(tmp, 1); // for 16 bit 2*xcounter
-                sub(a, tmp);
-                add(a, (planewidth - 1) * 2);
-                // reuse newx
-                movzx(newx, word_ptr[a]);
-                movd(r1, newx);
-                pshufb(r1, CPTR(elShuffleForRight6)); // duplicate last word to all
-
-                punpcklwd(r1, zero);
-                cvtdq2ps(r1, r1);
-              }
-              else if (iter.op == opLoadRelSrcF32) {
-                Reg tmp;
-                mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                shl(tmp, 2); // for 32 bit 4*xcounter
-                sub(a, tmp);
-                add(a, (planewidth - 1) * 4);
-                movd(r1, dword_ptr[a]);
-                pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6));
-              }
-              jmp(LabelEnd);
-            } // full OverRead path, needed when iter.dx>0
-
-              // case: Partial overread
-              // read the block, then clone the last valid pixel from position (planewidth-1)
-              // problem: newx is not aligned
-            L(PartialOverread);
-
-            // planewidth == 14  dx=7   newx = 0+7=7, newx>=planewidth-7, then not newx>=planewidth => newx = 13 => planewidth-newx = 1
-            // sample 1: newx is in different segment than planewidth-1
-            // [xcounter]
-            // [a]           [newx]    [pw-1]
-            // V             V           V
-            // 0 1 2 3 4 5 6 7 8 9 A B C D e f g h i j k l
-            //               P Q R S T U V w              need this
-            //               0 1 2 3 4 5 6 7              we can read this
-            //               P Q R S T U V w              last pixel is beyond
-            //               P Q R S T U V V              need this
-            // sample 2: newx is in the same segment than planewidth-1
-            // planewidth == 13  dx=3
-            //           [xcounter] [newx]
-            //                [a][newx][pw-1]
-            //                 V     V V
-            // 0 1 2 3 4 5 6 7 8 9 A B C d e f g h i j
-            //                       P Q x x x x x x        need this
-            //                       P Q Q Q Q Q Q Q        duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            // when newx and (planewidth-1) are in different segments then we read from newx
-            Reg tmp;
-            mov(tmp, newx);
-            and_(tmp, ~(pixels_per_cycle - 1));
-            cmp(tmp, (planewidth & ~(pixels_per_cycle - 1)));
-            jle(NoFullOverReadFromNewX); // jump if (newx and ~0x07) < (planewidth & ~0x07) (in another segment)
-
-                                         // read from current (last) pointer,
-            if (iter.op == opLoadRelSrc8 || iter.op == opLoadRelSrc16) {
-              if (iter.op == opLoadRelSrc8) {
-                movd(r1, dword_ptr[a]); // 4 pixels, 4 bytes
-                punpcklbw(r1, zero); // words
-              }
-              else { // opLoadRel16
-                movq(r1, mmword_ptr[a]); // 8 pixels, 16 bytes, here still aligned
-              }
-              /*
-              psrldq(r1, ((planewidth - 1) & (pixels_per_cycle - 1)) * sizeof(uint16_t)); // Shift right by (planewidth - 1) & 7 to lose low words
-              sub(newx, planewidth - (pixels_per_cycle - 1)); // find out shuffle pointer -1, ... -7 -> 6 ... 0
-              shl(newx, 4); // *16 for shuffle table
-              // LabelDoOver copied here
-              // reuse a : Reg shuffleTable;
-              lea(a, CPTR(elShuffleForRight0)); // ptr for word shuffle
-              pshufb(r1, xmmword_ptr[a + newx]);
-              */
-              punpcklwd(r1, zero);
-              cvtdq2ps(r1, r1);
-              //jmp(LabelEnd);
-              //jmp(labelDoOver);
-            }
-            else if (iter.op == opLoadRelSrcF32) {
-              // omg it's complicated
-              movdqa(r1, xmmword_ptr[a]); // 4 pixels, 16 bytes, here still aligned
-            }
-            int bytes_to_shift = ((planewidth - 1) & (pixels_per_cycle - 1)) * sizeof(float);
-            if (bytes_to_shift > 0) {
-              psrldq(r1, bytes_to_shift);
-              switch (bytes_to_shift) { // 4, 8, 12
-              case 4:
-                pshufd(r1, r1, (0 << 0) | (1 << 2) | (2 << 4) | (2 << 6));
-                break;
-              case 8:
-                pshufd(r1, r1, (0 << 0) | (1 << 2) | (1 << 4) | (1 << 6));
-                break;
-              case 12:
-                pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6));
-                break;
-              }
-            }
-            jmp(LabelEnd);
-            //}
-
-            L(NoFullOverReadFromNewX);
-            // read from newx
-            if (iter.op == opLoadRelSrc8) {
-              sub(a, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]); // back x counter bytes to the beginning
-              add(a, newx);     // new position
-              movd(r1, dword_ptr[a]); // 4 pixels, 4 bytes
-              punpcklbw(r1, zero); // words
-                                   /*
-                                   // no shift here, just duplicate appropriate pixel into the high ones
-                                   mov(newx, (6 - ((planewidth - iter.dx - 1) & (pixels_per_cycle - 1))) << 4); // find out shuffle pointer
-                                   // shuffle by the pattern, table offset in newx, and finalizes
-                                   // here r1 contains words
-                                   // todo direct load
-                                   Reg shuffleTable;
-                                   lea(shuffleTable, CPTR(elShuffleForRight4)); // for dual: elShuffleForRight0
-                                   add(shuffleTable, newx);
-                                   pshufb(r1, xmmword_ptr[shuffleTable]);
-                                   */
-              punpcklwd(r1, zero);
-              cvtdq2ps(r1, r1);
-            }
-            else if (iter.op == opLoadRelSrc16) {
-              //a = a - 2 * xcounter + 2 * newx;
-              sub(newx, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-              shl(newx, 1);
-              add(a, newx);
-              movq(r1, mmword_ptr[a]); // 4 pixels, 8 bytes
-                                       // no shift here, just duplicate appropriate pixel into the high ones
-                                       /*
-                                       // reuse newx
-                                       mov(newx, (6 - ((planewidth - iter.dx - 1) & (pixels_per_cycle - 1))) << 4); // find out shuffle pointer
-                                       // ((planewidth - iter.dx - 1) & (pixels_per_cycle - 1))    keep
-                                       //                         0                                ShuffleForRight6     keep word #0, spread it to 1..7
-                                       //                         1                                ShuffleForRight5     keep word #0..1, spread it to 2..7
-                                       //
-                                       //                         6                                ShuffleForRight0     keep word #0..6, spread it to 7..7
-                                       // continues on labelDoOver
-                                       // todo direct load
-                                       Reg shuffleTable;
-                                       lea(shuffleTable, CPTR(elShuffleForRight4)); // for dual: elShuffleForRight0
-                                       add(shuffleTable, newx);
-                                       pshufb(r1, xmmword_ptr[shuffleTable]);
-                                       */
-              punpcklwd(r1, zero);
-              cvtdq2ps(r1, r1);
-            }
-            else if (iter.op == opLoadRelSrcF32) {
-              //a = a - 4 * xcounter + 4 * newx;
-              sub(newx, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-              shl(newx, 2);
-              add(a, newx);
-
-
-              // no real shift here, just duplicate appropriate pixel into the high ones. But we have two registers
-              movdqu(r1, xmmword_ptr[a]); // 4 pixels, 16 bytes, no need for upper 4 pixels
-            }
-            // we have 4 floats here in r1, common part
-            int what = ((planewidth - iter.dx - 1) & (pixels_per_cycle - 1));
-            //                        what
-            //                         0     ShuffleForRight2_32  keep r1 dword #0   , spread it to 1..3, then spread r1.3 to r2 (ShuffleForRight2_32(r2,r1)
-            //                         1     ShuffleForRight1_32  keep r1 dword #0..1, spread it to 2..3, then spread r1.3 to r2
-            //                         2     ShuffleForRight0_32  keep r1 dword #0..2, spread it to 3   , then spread r1.3 to r2
-            //                         3                          keep r1 dword #0..3,                   , then spread r1.3 to r2
-            //                         4                          keep r1 dword #0..3,                   , keep r2 dword #0   , spread it to 1..3
-            //                         5                          keep r1 dword #0..3,                   , keep r2 dword #0..1, spread it to 2..3
-            //                         6                          keep r1 dword #0..3,                   , keep r2 dword #0..2, spread it to    3
-
-            switch (what) {
-            case 0:
-              pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6)); // fill 3 upper dwords of r1 from r1.0
-              break;
-            case 1:
-              pshufd(r1, r1, (0 << 0) | (1 << 2) | (1 << 4) | (1 << 6)); // fill 2 upper dwords of r1 from r1.1
-              break;
-            case 2:
-              pshufd(r1, r1, (0 << 0) | (1 << 2) | (2 << 4) | (2 << 6)); // fill 1 upper dwords of r1 from r1.2
-              break;
-            }
-            // continues on labelEnd
-            //}
-            if (iter.dx < 0)
-              jmp(LabelEnd);
-          } // over: iter.dx != 0
-          if (iter.dx < 0) {
-            L(LabelNeg);
-            // read from negative area on the left side, read exactly from 0th, then shift
-            // When reading from negative x coordinates we read exactly from 0th, then shift and duplicate
-            // For extreme minus offsets we duplicate 0th (leftmost) pixel to each position
-            // example: dx = -1
-            // -1 0  1  2  3  4  5  6  7
-            // A  A  B  C  D  E  F  G         we need this
-            //    A  B  C  D  E  F  G  H      read [0]
-            //    0  A  B  C  D  E  F  G  H   shift
-            //    A  A  B  C  D  E  F  G  H   duplicate by shuffle
-            if (iter.op == opLoadRelSrc8 || iter.op == opLoadRelSrc16) {
-              if (iter.op == opLoadRelSrc8) {
-                sub(a, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]); // go back to the beginning
-                movd(r1, dword_ptr[a]); // 8 pixels, 8 bytes
-                punpcklbw(r1, zero); // bytes to words
-              }
-              else if (iter.op == opLoadRelSrc16) {
-                // go back to the beginning, in 16 bit, *2
-                Reg tmp;
-                mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                shl(tmp, 1); // for 16 bit 2*xcounter
-                sub(a, tmp);
-                movq(r1, mmword_ptr[a]); // 8 pixels, 16 bytes
-              }
-              punpcklwd(r1, zero);
-              cvtdq2ps(r1, r1);
-            }
-            else if (iter.op == opLoadRelSrcF32) {
-              Reg tmp;
-              mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-              shl(tmp, 2); // *4
-              sub(a, tmp);
-              movdqa(r1, xmmword_ptr[a]); // 4 pixels, 16 bytes aligned
-            }
-            std::string PartialReadBefore = "PartialReadBefore" + getLabelCount();
-
-            cmp(newx, -pixels_per_cycle);
-            jg(PartialReadBefore);
-            // FullReadBefore: newx <= -pixels_per_cycle, clone 0th (leftmost) pixel to all
-            pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6));
-            jmp(LabelEnd);
-
-            L(PartialReadBefore);
-            // -pixels_per_cycle < newx < 0
-            int bytes_to_shift = sizeof(float) * min(pixels_per_cycle - 1, (-iter.dx) & (pixels_per_cycle - 1));
-            //    shift bytes
-            //         4                  r1 << 4     shuffle r1.1 to r1.0-0
-            //         8                  r1 << 8     shuffle r1.2 to r1.0-1
-            //         12                 r1 << 12    shuffle r1.3 to r1.0-2
-            pslldq(r1, bytes_to_shift); // todo: shift + shuffle = single shuffle
-
-            switch (bytes_to_shift) { // 4, 8, 12
-            case 4:
-              pshufd(r1, r1, (1 << 0) | (1 << 2) | (2 << 4) | (3 << 6)); // elShuffleForLeft0_32 // shuffle r1.1 to r1.0-0
-              break;
-            case 8:
-              pshufd(r1, r1, (2 << 0) | (2 << 2) | (2 << 4) | (3 << 6)); // elShuffleForLeft1_32 // shuffle r1.2 to r1.0-1
-              break;
-            case 12:
-              pshufd(r1, r1, (3 << 0) | (3 << 2) | (3 << 4) | (3 << 6)); // elShuffleForLeft2_32 // shuffle r1.3 to r1.0-2
-              break;
-            }
-          } // negative
-          L(LabelEnd);
           stack1.push_back(r1);
-        } // end of single Relative Mode
+        }
         else {
           // LoadRel8/16/32, dual register mode 2x4 pixels
-
-          // Use getLabelCount: names should be unique across multiple calls to processingLoop
-          std::string LabelNeg = "neg" + getLabelCount();
-          std::string LabelOver = "over" + getLabelCount();
-          std::string LabelEnd = "end" + getLabelCount();
-
           XmmReg r1, r2;
-
-          // damn, when the order of the two comparisons is exchanged, bad code is generated for dx=-1 (expr=x[-1]).
-          // jitasm cannot guess the proper register for 'a', it uses register 'xcounter' instead
-          // maybe the jump order has to match the label order?
-          // good: LabelOver, LabelNeg. Bad: LabelNeg, LabelOver
-          // But it's not true. Now x[-2] fails for 32 bit clip
-          if (iter.dx < 0) { // Optim: read from left is possible only for dx<0 case
-            cmp(newx, 0);
-            jl(LabelNeg); // newx < 0, read (partially or fully) from before the leftmost pixel
+          XmmReg filler_r; // borderConstant: filler value in all elements
+          if (iter.bc == borderConstant)
+            loadFiller(filler_r, iter.filler);
+          relLoad8(r1, r2, a, regptrs, zero, iter.op, iter.dx, iter.bc, filler_r, &iter.conv, constptr);
+          if (iter.bc == borderConstant && iter.dy != 0) {
+            std::string LabelOnScreen = "relRowOn" + getLabelCount();
+            emitRowOffscreenCheck(*this, SpatialY, iter.dy, planeheight, LabelOnScreen);
+            // next two fills can be skipped by a conditional jump from the function above
+            movaps(r1, filler_r); // source row off-screen: all filler
+            movaps(r2, filler_r);
+            L(LabelOnScreen);
           }
-          if (iter.dx != 0) {
-            // Also check for dx<0, because of possible memory overread
-            // e.g.: planewidth = 64, dx = -1, 16 bit pixels, 16 bytes/cycle, reading from offsets -1(0), 15, 31, 47, then 63
-            // When we read 16 bytes from offset 63, we are overaddressing the 64 byte scanline,
-            // which may give access violation when pointer is in the most bottom line.
-            cmp(newx, planewidth - (pixels_per_cycle - 1)); // read (partially of fully) after the rightmost pixel
-            jge(LabelOver);
-          }
-          /*
-          if (iter.dx < 0) { // Optim: read from left is possible only for dx<0 case
-          cmp(newx, 0);
-          jl(LabelNeg); // newx < 0, read (partially or fully) from before the leftmost pixel
-          }
-          */
-
-          // It's safe to read the whole pixel group
-          int offset;
-          if (iter.op == opLoadRelSrc8)
-            offset = iter.dx;
-          else if (iter.op == opLoadRelSrc16)
-            offset = iter.dx * sizeof(uint16_t);
-          else if (iter.op == opLoadRelSrcF32)
-            offset = iter.dx * sizeof(float);
-
-          if (iter.op == opLoadRelSrc8) {
-            movq(r1, mmword_ptr[a + offset]); // 8 pixels, 8 bytes
-            punpcklbw(r1, zero);
-            movdqa(r2, r1);
-            punpcklwd(r1, zero);
-            punpckhwd(r2, zero);
-            cvtdq2ps(r1, r1);
-            cvtdq2ps(r2, r2);
-          }
-          else if (iter.op == opLoadRelSrc16) {
-            if (iter.dx % 8 == 0)
-              movdqa(r1, xmmword_ptr[a + offset]); // 8 pixels 16 byte boundary, aligned
-            else
-              movdqu(r1, xmmword_ptr[a + offset]);
-            movdqa(r2, r1);
-            punpcklwd(r1, zero);
-            punpckhwd(r2, zero);
-            cvtdq2ps(r1, r1);
-            cvtdq2ps(r2, r2);
-          }
-          else if (iter.op == opLoadRelSrcF32) {
-            if (iter.dx % 4 == 0) {
-              movdqa(r1, xmmword_ptr[a + offset]); // // 4 pixels 16 byte boundary, aligned
-              movdqa(r2, xmmword_ptr[a + offset + 16]);
-            }
-            else {
-              movdqu(r1, xmmword_ptr[a + offset]); // unaligned
-              movdqu(r2, xmmword_ptr[a + offset + 16]);
-            }
-          }
-          if (iter.dx != 0) {
-            jmp(LabelEnd); // Optim: generate jump only when over/negative branches exist
-          }
-
-          if (iter.dx != 0) {
-            L(LabelOver);
-
-            // x  dx   newx
-            // 8   1  8+1=9
-            // planewidth == 16
-            // 0 1 2 3 4 5 6 7 8 9 A B C D E F g h i j
-            //                   P Q R S T U V x            need this
-            //                   P Q R S T U V V            duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 1 2 3 4 5 6 7 -              Shift right by dx to lose low bytes
-            //                 1 2 3 4 5 6 7 7              have to make this one from it. Only the first planewidth-newx (7) bytes valid
-            // x  dx   newx
-            // 8   3  8+3=11
-            // planewidth == 15
-            // 0 1 2 3 4 5 6 7 8 9 A B C D E f g h i j
-            //                       P Q R S T x x x        need this
-            //                       P Q R S S S S S        duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 3 4 5 6 7 - - -              Shift right by dx to lose low bytes
-            //                 3 4 5 6 6 6 6 6              have to make this one from it. Only the first planewidth-newx (4) bytes valid
-            // planewidth == 14
-            // 0 1 2 3 4 5 6 7 8 9 A B C D e f g h i j
-            //                       P Q R x x x x x        need this
-            //                       P Q R R R R R R        duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 3 4 5 6 7 - - -              Shift right by dx to lose low bytes
-            //                 3 4 5 5 5 5 5 5              have to make this one from it. Only the first planewidth-newx (3) bytes valid
-            // special case: full read from beyond line
-            // planewidth == 14  dx=6   newx = 8+6=14, newx>=planewidth => newx = 13 => planewidth-newx = 1
-            // 0 1 2 3 4 5 6 7 8 9 A B C D e f g h i j k l
-            //                             ? ? ? ? ? ? ? ?  need this, but overread
-            //                             ? ? ? ? ? ? ? ?  duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 5 6 7 - - - - -              Shift right by not dx but (planewidth-1)&7, it's 5 in this example, to lose low bytes
-            //                 5 5 5 5 5 5 5 5              case(1): duplicate very first
-            // planewidth == 14  dx=7   newx = 0+7=7, newx>=planewidth-7, then not newx>=planewidth => newx = 13 => planewidth-newx = 1
-            // 0 1 2 3 4 5 6 7 8 9 A B C D e f g h i j k l
-            //               P Q R S T U V w                need this
-            //               P Q R S T U V V                duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 5 6 7 - - - - -              Shift right by not dx but (planewidth-1)&7, it's 5 in this example, to lose low bytes
-            //                 5 5 5 5 5 5 5 5              case(1): duplicate very first
-            // planewidth == 14  dx=7   newx = 8+7=15, newx>=planewidth => newx = 13 => planewidth-newx = 1
-            //                             ? ? ? ? ? ? ? ?  need this, but overread
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 5 - - - - - - -              Shift right to have the last pixel
-            //                 5 5 5 5 5 5 5 5              case(1): duplicate very first
-            // planewidth == 13
-            // 0 1 2 3 4 5 6 7 8 9 A B C d e f g h i j
-            //                       P Q x x x x x x        need this
-            //                       P Q Q Q Q Q Q Q        duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 3 4 5 6 7 - - -              Shift right by dx to lose low bytes
-            //                 3 4 4 4 4 4 4 4              have to make this one from it. Only the first planewidth-newx (2) bytes valid
-            // planewidth == 12
-            // 0 1 2 3 4 5 6 7 8 9 A B c d e f g h i j
-            //                       P x x x x x x x        need this
-            //                       P P P P P P P P        duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            //                 3 4 5 6 7 - - -              Shift right by dx to lose low bytes
-            //                 3 3 3 3 3 3 3 3              have to make this one from it. Only the first planewidth-newx (1) bytes valid
-
-            // duplicate highest, make a shuffle table by planewidth-newx (1..7)
-            // planewidth - newx    newx-pw  newx-pw+7    shuffle
-            //                               newx-(pw-7)
-            //           1            -1         6        0->0 0->1 0->2 0->3 0->4 0->5 0->6 0->7 elSuffleForRight6 (lowest to everywhere)
-            //           2            -2         5        0->0 1->1 1->2 1->3 1->4 1->5 1->6 1->7 elSuffleForRight5 (lowest two remains then second duplicates)
-            //           3            -3         4        0->0 1->1 2->2 2->3 2->4 2->5 2->6 2->7 elSuffleForRight4 (lowest three remains then third duplicates)
-            //           4            -4         3        0->0 1->1 2->2 3->3 3->4 3->5 3->6 3->7 elSuffleForRight3
-            //           5            -5         2        0->0 1->1 2->2 3->3 4->4 4->5 4->6 4->7 elSuffleForRight2
-            //           6            -6         1        0->0 1->1 2->2 3->3 4->4 5->5 5->6 5->7 elSuffleForRight1
-            //           7            -7         0        0->0 1->1 2->2 3->3 4->4 5->5 6->6 6->7 elSuffleForRight0 (lowest seven remains then seventh duplicates)
-            // in extreme case (read all beyond last pixel): newx >= planewidth: ==> case of elSuffleForRight6
-
-            // shuffleTable = elShuffleForRight0 + 16*(newx-(planewidth-7))
-            std::string PartialOverread = "PartialOverread" + getLabelCount();
-            std::string NoFullOverReadFromNewX = "NoFullOverReadFromNewX" + getLabelCount();
-            std::string labelDoOver = "DoOver" + getLabelCount();
-
-            if (iter.dx > 0) { // FullOverRead possible only when dx>0
-              cmp(newx, planewidth);
-              jl(PartialOverread); // if newx < planewidth ->
-
-                                   // case: FullOver
-                                   // even the first pixel to read is beyond the end of line
-                                   // We have to clone the rightmost pixel from (planewidth-1)
-              if (iter.op == opLoadRelSrc8) {
-                sub(a, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                add(a, planewidth - 1);
-                // reuse newx
-                movzx(newx, byte_ptr[a]);
-                movd(r1, newx);
-                punpcklbw(r1, zero); // words
-                pshufb(r1, CPTR(elShuffleForRight6)); // duplicate last word to all
-
-                movdqa(r2, r1);
-                punpcklwd(r1, zero);
-                punpckhwd(r2, zero);
-                cvtdq2ps(r1, r1);
-                cvtdq2ps(r2, r2);
-              }
-              else if (iter.op == opLoadRelSrc16) {
-                Reg tmp;
-                mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                shl(tmp, 1); // for 16 bit 2*xcounter
-                sub(a, tmp);
-                add(a, (planewidth - 1) * 2);
-                // reuse newx
-                movzx(newx, word_ptr[a]);
-                movd(r1, newx);
-                pshufb(r1, CPTR(elShuffleForRight6)); // duplicate last word to all
-
-                movdqa(r2, r1);
-                punpcklwd(r1, zero);
-                punpckhwd(r2, zero);
-                cvtdq2ps(r1, r1);
-                cvtdq2ps(r2, r2);
-              }
-              else if (iter.op == opLoadRelSrcF32) {
-                Reg tmp;
-                mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                shl(tmp, 2); // for 32 bit 4*xcounter
-                sub(a, tmp);
-                add(a, (planewidth - 1) * 4);
-                movd(r1, dword_ptr[a]);
-                pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6));
-                movdqa(r2, r1);
-              }
-              jmp(LabelEnd);
-            } // full OverRead path, needed when iter.dx>0
-
-              // case: Partial overread
-              // read the block, then clone the last valid pixel from position (planewidth-1)
-              // problem: newx is not aligned
-            L(PartialOverread);
-            // planewidth == 14  dx=7   newx = 0+7=7, newx>=planewidth-7, then not newx>=planewidth => newx = 13 => planewidth-newx = 1
-            // sample 1: newx is in different segment than planewidth-1
-            // [xcounter]
-            // [a]           [newx]    [pw-1]
-            // V             V           V
-            // 0 1 2 3 4 5 6 7 8 9 A B C D e f g h i j k l
-            //               P Q R S T U V w              need this
-            //               0 1 2 3 4 5 6 7              we can read this
-            //               P Q R S T U V w              last pixel is beyond
-            //               P Q R S T U V V              need this
-            // sample 2: newx is in the same segment than planewidth-1
-            // planewidth == 13  dx=3
-            //           [xcounter] [newx]
-            //                [a][newx][pw-1]
-            //                 V     V V
-            // 0 1 2 3 4 5 6 7 8 9 A B C d e f g h i j
-            //                       P Q x x x x x x        need this
-            //                       P Q Q Q Q Q Q Q        duplicated the last valid pixel
-            //                 0 1 2 3 4 5 6 7              we can read this
-            // when newx and (planewidth-1) are in different segments then we read from newx
-            Reg tmp;
-            mov(tmp, newx);
-            and_(tmp, ~(pixels_per_cycle - 1));
-            cmp(tmp, (planewidth & ~(pixels_per_cycle - 1)));
-            jle(NoFullOverReadFromNewX); // jump if (newx and ~0x07) < (planewidth & ~0x07) (in another segment)
-
-                                         // read from current (last) pointer,
-            if (iter.op == opLoadRelSrc8 || iter.op == opLoadRelSrc16) {
-              if (iter.op == opLoadRelSrc8) {
-                movq(r1, mmword_ptr[a]); // 8 pixels, 8 bytes
-                punpcklbw(r1, zero); // words
-              }
-              else { // opLoadRel16
-                movdqa(r1, xmmword_ptr[a]); // 8 pixels, 16 bytes, here still aligned
-              }
-              psrldq(r1, ((planewidth - 1) & (pixels_per_cycle - 1)) * sizeof(uint16_t)); // Shift right by (planewidth - 1) & 7 to lose low words
-              sub(newx, planewidth - (pixels_per_cycle - 1)); // find out shuffle pointer -1, ... -7 -> 6 ... 0
-              shl(newx, 4); // *16 for shuffle table
-                            // LabelDoOver copied here
-                            // reuse a : Reg shuffleTable;
-              lea(a/*shuffleTable*/, CPTR(elShuffleForRight0)); // ptr for word shuffle
-                                                                //add(a/*shuffleTable*/, newx);
-              pshufb(r1, xmmword_ptr[a/*shuffleTable*/ + newx]);
-
-              movdqa(r2, r1);
-              punpcklwd(r1, zero);
-              punpckhwd(r2, zero);
-              cvtdq2ps(r1, r1);
-              cvtdq2ps(r2, r2);
-              jmp(LabelEnd);
-            }
-            else if (iter.op == opLoadRelSrcF32) {
-              // omg it's complicated
-
-              // palignr memo
-              // temp1[255:0]  ((DEST[127:0] << 128) OR SRC[127:0]) >> (imm8*8);
-              // DEST[127:0]  temp1[127:0]
-
-              int bytes_to_shift = ((planewidth - 1) & (pixels_per_cycle - 1)) * sizeof(float);
-              if (bytes_to_shift < 16) {
-                // src              dst
-                // r2               r1
-                // 15 14 13.... 0   15 14 13 ... 0
-                //    15 14 13  1   0  15 14.... 1  palignr(dst, src, 1)
-                //              15  14 13  ..... 15 palignr(dst, src, 15)
-                movdqa(r1, xmmword_ptr[a]); // 4 pixels, 16 bytes, here still aligned
-                movdqa(r2, xmmword_ptr[a + 16]); // 4 pixels, 16 bytes
-                if (bytes_to_shift > 0) {
-                  palignr(r1, r2, bytes_to_shift); // shift right dualreg. r1 is ready.
-                  psrldq(r2, bytes_to_shift); // Shift right upper part
-                  switch (bytes_to_shift) { // 4, 8, 12
-                  case 4:
-                    pshufd(r2, r2, (0 << 0) | (1 << 2) | (2 << 4) | (2 << 6)); // elShuffleForRight0_32
-                    break;
-                  case 8:
-                    pshufd(r2, r2, (0 << 0) | (1 << 2) | (1 << 4) | (1 << 6));
-                    break;
-                  case 12:
-                    pshufd(r2, r2, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6)); // elShuffleForRight2_32
-                    break;
-                  }
-                }
-              }
-              else if (bytes_to_shift == 16) {
-                // src              dst
-                // r2               r1
-                // 15 14 13.... 0   15 14 13 ... 0  --> 16 bytes: r1 = r2
-                movdqa(r1, xmmword_ptr[a + 16]); // 4 pixels, 16 bytes, no need [a + 0], here still aligned
-                pshufd(r2, r1, (3 << 0) | (3 << 2) | (3 << 4) | (3 << 6)); // fill r2 with highest dword of r1
-              }
-              else {
-                // bytes to shift > 16 (20, 24, 28), ignore lower 4 pixels, move and shift and spread from upper 4 pixels
-                movdqa(r1, xmmword_ptr[a + 16]); // 4 pixels, 16 bytes, no need [a + 0], here still aligned
-                psrldq(r1, bytes_to_shift - 16); // Shift right upper part
-                switch (bytes_to_shift) { // 0, 4, 8, 12
-                case 20:
-                  pshufd(r1, r1, (0 << 0) | (1 << 2) | (2 << 4) | (2 << 6)); // elShuffleForRight0_32
-                  break;
-                case 24:
-                  pshufd(r1, r1, (0 << 0) | (1 << 2) | (1 << 4) | (1 << 6));
-                  break;
-                case 28:
-                  pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6)); // elShuffleForRight2_32
-                  break;
-                }
-                pshufd(r2, r1, (3 << 0) | (3 << 2) | (3 << 4) | (3 << 6)); // fill r2 with highest dword of r1
-              }
-              jmp(LabelEnd);
-            }
-
-            L(NoFullOverReadFromNewX);
-            // read from newx
-            //a = a - 1,2,4 * xcounter + 1,2,4 * newx;
-            sub(newx, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-            if (iter.op == opLoadRelSrc8 || iter.op == opLoadRelSrc16) {
-              if (iter.op == opLoadRelSrc8)
-              {
-                add(a, newx);     // new position
-                movq(r1, mmword_ptr[a]); // 8 pixels, 8 bytes
-                punpcklbw(r1, zero); // words
-              }
-              else {
-                shl(newx, 1); //a = a - 2 * xcounter + 2 * newx;
-                add(a, newx);
-                movdqu(r1, xmmword_ptr[a]); // 8 pixels, 16 bytes
-              }
-              // no shift here, just duplicate appropriate pixel into the high ones
-              int what = ((planewidth - iter.dx - 1) & (pixels_per_cycle - 1));
-              switch (what) {
-              case 0:
-                pshufb(r1, CPTR(elShuffleForRight6));
-                break;
-              case 1:
-                pshufb(r1, CPTR(elShuffleForRight5));
-                break;
-              case 2:
-                pshufb(r1, CPTR(elShuffleForRight4));
-                break;
-              case 3:
-                pshufb(r1, CPTR(elShuffleForRight3));
-                break;
-              case 4:
-                pshufb(r1, CPTR(elShuffleForRight2));
-                break;
-              case 5:
-                pshufb(r1, CPTR(elShuffleForRight1));
-                break;
-              case 6:
-                pshufb(r1, CPTR(elShuffleForRight0));
-                break;
-              }
-              movdqa(r2, r1);
-              punpcklwd(r1, zero);
-              punpckhwd(r2, zero);
-              cvtdq2ps(r1, r1);
-              cvtdq2ps(r2, r2);
-              //jmp(LabelEnd);
-            }
-            else if (iter.op == opLoadRelSrcF32) {
-              shl(newx, 2); // float: *4
-              add(a, newx);
-
-              int what = ((planewidth - iter.dx - 1) & (pixels_per_cycle - 1));
-              //                        what
-              //                         0     ShuffleForRight2_32  keep r1 dword #0   , spread it to 1..3, then spread r1.3 to r2 (ShuffleForRight2_32(r2,r1)
-              //                         1     ShuffleForRight1_32  keep r1 dword #0..1, spread it to 2..3, then spread r1.3 to r2
-              //                         2     ShuffleForRight0_32  keep r1 dword #0..2, spread it to 3   , then spread r1.3 to r2
-              //                         3                          keep r1 dword #0..3,                   , then spread r1.3 to r2
-              //                         4                          keep r1 dword #0..3,                   , keep r2 dword #0   , spread it to 1..3
-              //                         5                          keep r1 dword #0..3,                   , keep r2 dword #0..1, spread it to 2..3
-              //                         6                          keep r1 dword #0..3,                   , keep r2 dword #0..2, spread it to    3
-
-              // no real shift here, just duplicate appropriate pixel into the high ones. But we have two registers
-              if (what <= 3) {
-                movdqu(r1, xmmword_ptr[a]); // 4 pixels, 16 bytes, no need for upper 4 pixels
-                switch (what) {
-                case 0:
-                  pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6)); // elShuffleForRight2_32 // fill 3 upper dwords of r1 from r1.0
-                  break;
-                case 1:
-                  pshufd(r1, r1, (0 << 0) | (1 << 2) | (1 << 4) | (1 << 6)); // fill 2 upper dwords of r1 from r1.1
-                  break;
-                case 2:
-                  pshufd(r1, r1, (0 << 0) | (1 << 2) | (2 << 4) | (2 << 6)); // elShuffleForRight0_32 // fill 1 upper dwords of r1 from r1.2
-                  break;
-                }
-                pshufd(r2, r1, (3 << 0) | (3 << 2) | (3 << 4) | (3 << 6)); // fill all dwords of r2 from r1.3
-              }
-              else {
-                movdqu(r1, xmmword_ptr[a]); // 4 pixels, 16 bytes, low 4 pixels keep them as is
-                movdqu(r2, xmmword_ptr[a + 16]); // 4 pixels, 16 bytes
-                switch (what) {
-                case 4:
-                  pshufd(r2, r2, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6)); // elShuffleForRight2_32 // fill 3 upper dwords of r1 from r2.0
-                  break;
-                case 5:
-                  pshufd(r2, r2, (0 << 0) | (1 << 2) | (1 << 4) | (1 << 6)); // fill 2 upper dwords of r1 from r2.1
-                  break;
-                case 6:
-                  pshufd(r2, r2, (0 << 0) | (1 << 2) | (2 << 4) | (2 << 6)); // elShuffleForRight0_32 // fill 1 upper dwords of r1 from r2.2
-                  break;
-                }
-              }
-              // continues on labelEnd
-            }
-            if (iter.dx < 0)
-              jmp(LabelEnd);
-          } // over: iter.dx != 0
-          if (iter.dx < 0) {
-            L(LabelNeg);
-            // When reading from negative x coordinates we read exactly from 0th, then shift and duplicate
-            // For extreme minus offsets we duplicate 0th (leftmost) pixel to each position
-            // example: dx = -1
-            // -1 0  1  2  3  4  5  6  7
-            // A  A  B  C  D  E  F  G         we need this
-            //    A  B  C  D  E  F  G  H      read [0]
-            //    0  A  B  C  D  E  F  G  H   shift
-            //    A  A  B  C  D  E  F  G  H   duplicate by shuffle
-            if (iter.op == opLoadRelSrc8 || iter.op == opLoadRelSrc16) {
-              if (iter.op == opLoadRelSrc8) {
-                sub(a, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]); // go back to the beginning
-                movq(r1, mmword_ptr[a]); // 8 pixels, 8 bytes
-                punpcklbw(r1, zero); // bytes to words
-              }
-              else if (iter.op == opLoadRelSrc16) {
-                // go back to the beginning, in 16 bit, *2
-                Reg tmp;
-                mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-                shl(tmp, 1); // for 16 bit 2*xcounter
-                sub(a, tmp);
-                movdqa(r1, xmmword_ptr[a]); // 8 pixels, 16 bytes
-              }
-
-              std::string PartialReadBefore = "PartialReadBefore" + getLabelCount();
-              std::string Finalize = "Finalize" + getLabelCount();
-              cmp(newx, -pixels_per_cycle); // pixels_per_cycle words
-              jg(PartialReadBefore);
-              // FullReadBefore: newx <= -pixels_per_cycle, clone 0th (leftmost) pixel to all
-              pshufb(r1, CPTR(elShuffleForRight6)); // lowest word to all
-              jmp(Finalize);
-              L(PartialReadBefore);
-              // -pixels_per_cycle < newx < 0
-              int toShift = min(pixels_per_cycle - 1, (-iter.dx) & (pixels_per_cycle - 1));
-              pslldq(r1, toShift * 2); // shift in word domain
-              switch (toShift) {
-              case 1: pshufb(r1, CPTR(elShuffleForLeft0)); break;
-              case 2: pshufb(r1, CPTR(elShuffleForLeft1)); break;
-              case 3: pshufb(r1, CPTR(elShuffleForLeft2)); break;
-              case 4: pshufb(r1, CPTR(elShuffleForLeft3)); break;
-              case 5: pshufb(r1, CPTR(elShuffleForLeft4)); break;
-              case 6: pshufb(r1, CPTR(elShuffleForLeft5)); break;
-              case 7: pshufb(r1, CPTR(elShuffleForLeft6)); break;
-              }
-              L(Finalize);
-
-              movdqa(r2, r1);
-              punpcklwd(r1, zero);
-              punpckhwd(r2, zero);
-              cvtdq2ps(r1, r1);
-              cvtdq2ps(r2, r2);
-            }
-            else if (iter.op == opLoadRelSrcF32) {
-              // negative
-              // go back to the beginning, in 16 bit, *2
-              Reg tmp;
-              mov(tmp, ptr[regptrs + sizeof(void *) * (RWPTR_START_OF_XCOUNTER)]);
-              shl(tmp, 2); // go back to the beginning, in 32 bit, *4
-              sub(a, tmp);
-
-              std::string PartialReadBefore = "PartialReadBefore" + getLabelCount();
-
-              cmp(newx, -pixels_per_cycle);
-              jg(PartialReadBefore);
-              // FullReadBefore: newx <= -pixels_per_cycle, clone 0th (leftmost) pixel to all
-              movdqa(r1, xmmword_ptr[a]);
-              pshufd(r1, r1, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6));
-              movdqa(r2, r1);
-              jmp(LabelEnd);
-
-              L(PartialReadBefore);
-              // -pixels_per_cycle < newx < 0
-              int bytes_to_shift = sizeof(float) * min(pixels_per_cycle - 1, (-iter.dx) & (pixels_per_cycle - 1));
-              //    shift bytes
-              //         4                  r2r1 << 4     shuffle r1.1 to r1.0-0
-              //         8                  r2r1 << 8     shuffle r1.2 to r1.0-1
-              //         12                 r2r1 << 12    shuffle r1.3 to r1.0-2
-              //         16                 r2r1 << 16    -> r2 = r1,                                     , shuffle r2.0 to all r1
-              //         20                 r2r1 << 20    -> r2 = r1, r2 << (20-4), shuffle r2.1 to r2.0-0, shuffle r2.0 to all r1
-              //         24                 r2r1 << 24    -> r2 = r1, r2 << (24-4), shuffle r2.2 to r2.0-1, shuffle r2.0 to all r1
-              //         28                 r2r1 << 28    -> r2 = r1, r2 << (28-4), shuffle r2.3 to r2.0-2, shuffle r2.0 to all r1
-              if (bytes_to_shift < 16) {
-                movdqa(r1, xmmword_ptr[a]); // 4 pixels, 16 bytes
-                movdqa(r2, xmmword_ptr[a + 16]); // 4 pixels, 16 bytes
-                                                 // 4 floats
-                                                 // r2            r1
-                                                 // H3 H2 H1 H0   L3 L2 L1 L0   << 1*4 byte
-                                                 // H2 H1 H0 L3   L2 L1 L0 00
-                                                 // H2 H1 H0 00   or
-                                                 // 00 00 00 L3   L2 L1 L0 00
-                psrldq(r1, 16 - bytes_to_shift);
-                pslldq(r2, bytes_to_shift);
-                por(r2, r1);
-                movdqa(r1, xmmword_ptr[a]); // load again
-                pslldq(r1, bytes_to_shift); // todo: shift + shuffle = single shuffle
-
-                switch (bytes_to_shift) { // 4, 8, 12
-                case 4:
-                  pshufd(r1, r1, (1 << 0) | (1 << 2) | (2 << 4) | (3 << 6)); // elShuffleForLeft0_32 // shuffle r1.1 to r1.0-0
-                  break;
-                case 8:
-                  pshufd(r1, r1, (2 << 0) | (2 << 2) | (2 << 4) | (3 << 6)); // elShuffleForLeft1_32 // shuffle r1.2 to r1.0-1
-                  break;
-                case 12:
-                  pshufd(r1, r1, (3 << 0) | (3 << 2) | (3 << 4) | (3 << 6)); // elShuffleForLeft2_32 // shuffle r1.3 to r1.0-2
-                  break;
-                }
-              }
-              else {
-                // toShift >= 16
-                //movdqa(r1, xmmword_ptr[a]); // no need for 15..31
-                movdqa(r2, xmmword_ptr[a]); // 4 pixels, 16 bytes
-                if (bytes_to_shift > 16)
-                  pslldq(r2, bytes_to_shift - 16);
-
-                switch (bytes_to_shift) { // 20, 24, 28
-                case 20:
-                  pshufd(r2, r2, (1 << 0) | (1 << 2) | (2 << 4) | (3 << 6)); // elShuffleForLeft0_32 // shuffle r2.1 to r2.0-0
-                  break;
-                case 24:
-                  pshufd(r2, r2, (2 << 0) | (2 << 2) | (2 << 4) | (3 << 6)); // elShuffleForLeft1_32 // shuffle r2.2 to r2.0-1
-                  break;
-                case 28:
-                  pshufd(r2, r2, (3 << 0) | (3 << 2) | (3 << 4) | (3 << 6)); // elShuffleForLeft2_32 // shuffle r2.3 to r2.0-2
-                  break;
-                }
-                pshufd(r1, r2, (0 << 0) | (0 << 2) | (0 << 4) | (0 << 6)); // shuffle r2.0 to all r1
-              }
-            }
-          }
-          L(LabelEnd);
           stack.push_back(std::make_pair(r1, r2));
         }
       } // oploadRel8/16/32
@@ -3156,9 +2756,150 @@ struct ExprEvalAvx2 : public jitasm::function<void, ExprEvalAvx2, uint8_t *, con
   int planewidth; // original, lut can overwrite
   int planeheight;
   bool singleMode;
+  int labelCount; // to have unique label strings
+
+  std::string getLabelCount()
+  {
+    return std::to_string(++labelCount);
+  }
 
   ExprEvalAvx2(std::vector<ExprOp> &ops, int numInputs, int cpuFlags, int planewidth, int planeheight, bool singleMode) : ops(ops), numInputs(numInputs), cpuFlags(cpuFlags),
-    planewidth(planewidth), planeheight(planeheight), singleMode(singleMode) {}
+    planewidth(planewidth), planeheight(planeheight), singleMode(singleMode), labelCount(0) {}
+
+  // Load 8 pixels from [base + offset] and convert them to 8 floats
+  AVS_FORCEINLINE void load8AsFloat(YmmReg& r, Reg& base, int offset, int op)
+  {
+    if (op == opLoadRelSrc8) {
+      // 8->32 bits like _mm256_cvtepu8_epi32
+      vpmovzxbd(r, qword_ptr[base + offset]);
+      vcvtdq2ps(r, r);
+    }
+    else if (op == opLoadRelSrc16) {
+      // 16->32 bit like _mm256_cvtepu16_epi32
+      vpmovzxwd(r, xmmword_ptr[base + offset]);
+      vcvtdq2ps(r, r);
+    }
+    else // opLoadRelSrcF32
+      vmovdqu(r, ymmword_ptr[base + offset]);
+  }
+
+  // borderConstant: scale_inputs conversion of the 8 loaded pixels in r (and r2, when given),
+  // see emitConvert4. No code when there is no conversion.
+  AVS_FORCEINLINE void convert8(YmmReg& r, YmmReg* r2, const ExprLoadConv* conv)
+  {
+    if (conv == nullptr || !conv->active())
+      return;
+    enum { Sub, Mul, Add };
+    auto step = [&](float value, int kind) {
+      uint32_t bits;
+      memcpy(&bits, &value, sizeof(bits)); // C++17 equivalent of C++20 std::bit_cast<uint32_t>(value)
+      Reg32 t;
+      XmmReg cx;
+      YmmReg c;
+      mov(t, (int32_t)bits);
+      vmovd(cx, t);
+      vbroadcastss(c, cx);
+      for (YmmReg* x : { &r, r2 }) {
+        if (x == nullptr)
+          continue;
+        if (kind == Sub) vsubps(*x, *x, c);
+        else if (kind == Mul) vmulps(*x, *x, c);
+        else vaddps(*x, *x, c);
+      }
+    };
+    if (conv->sub != 0.0f) step(conv->sub, Sub);
+    if (conv->mul != 1.0f) step(conv->mul, Mul);
+    if (conv->add != 0.0f) step(conv->add, Add);
+    if (conv->add_uv != 0.0f) step(conv->add_uv, Add);
+  }
+
+  // borderConstant: broadcast the filler value into all 4 elements (VEX)
+  AVS_FORCEINLINE void loadFiller(XmmReg& r, float filler)
+  {
+    uint32_t bits;
+    memcpy(&bits, &filler, sizeof(bits)); // C++17 equivalent of C++20 std::bit_cast<uint32_t>(filler)
+    Reg t;
+    mov(t, (int32_t)bits);
+#ifdef JITASM64
+    vmovq(r, t);
+#else
+    vmovd(r, t);
+#endif
+    vpshufd(r, r, 0);
+  }
+
+  // Generates code that loads 8 pixels at x + dx (x = current xcounter, multiple of 8) as floats,
+  // off-screen positions handled by border mode bc (see emitRelLoad4).
+  // Fast path: when no pixel of the group is off-screen, a single 8-pixel load.
+  // Otherwise (row edges, a few groups per row) emitRelLoad4 (VEX) at dx and dx + 4, combined
+  // into r: the second half's stored pixels are a subset of what emitRelLoad4 assumes as stored.
+  // borderConstant: conv is the scale_inputs conversion of the loaded pixels (before the filler)
+  AVS_FORCEINLINE void relLoad8(YmmReg& r, Reg& a, Reg& regptrs, YmmReg& zero, int op, int dx, int bc, XmmReg& filler_r, const ExprLoadConv* conv)
+  {
+    const int shift = op == opLoadRelSrc8 ? 0 : op == opLoadRelSrc16 ? 1 : 2; // log2(bytes per pixel)
+    if (dx == 0) {
+      load8AsFloat(r, a, 0, op); // stored pixels need no border handling
+      convert8(r, nullptr, conv);
+      return;
+    }
+    std::string LabelEdge = "relEdge8_" + getLabelCount();
+    std::string LabelEnd = "relEnd8_" + getLabelCount();
+    Reg newx;
+    mov(newx, ptr[regptrs + sizeof(void*) * (RWPTR_START_OF_XCOUNTER)]);
+    add(newx, dx);
+    // dx < 0: only the left edge
+    // dx > 0: only the right edge can be crossed (see emitRelLoad4)
+    cmp(newx, dx < 0 ? 0 : planewidth - 8);
+    if (dx < 0)
+      jl(LabelEdge); // newx < 0
+    else
+      jg(LabelEdge); // newx > planewidth - 8
+    load8AsFloat(r, a, dx << shift, op);
+    convert8(r, nullptr, conv);
+    jmp(LabelEnd);
+    L(LabelEdge);
+    XmmReg lo, hi;
+    emitRelLoad4<true>(*this, lo, a, regptrs, nullptr, op, dx, planewidth, bc, filler_r, conv, nullptr);
+    emitRelLoad4<true>(*this, hi, a, regptrs, nullptr, op, dx + 4, planewidth, bc, filler_r, conv, nullptr);
+    vinsertf128(r, zero, lo, 0);
+    vinsertf128(r, r, hi, 1);
+    L(LabelEnd);
+  }
+
+  // Generates code that loads 16 pixels at x + dx (x = current xcounter, multiple of 16) as floats.
+  // Fast path: a single check for the whole group; otherwise relLoad8 at dx and dx + 8.
+  AVS_FORCEINLINE void relLoad16(YmmReg& r1, YmmReg& r2, Reg& a, Reg& regptrs, YmmReg& zero, int op, int dx, int bc, XmmReg& filler_r, const ExprLoadConv* conv)
+  {
+    const int shift = op == opLoadRelSrc8 ? 0 : op == opLoadRelSrc16 ? 1 : 2; // log2(bytes per pixel)
+    if (dx == 0) {
+      load8AsFloat(r1, a, 0, op); // stored pixels need no border handling
+      load8AsFloat(r2, a, 8 << shift, op);
+      convert8(r1, &r2, conv);
+      return;
+    }
+    // trivial case is done
+    std::string LabelEdge = "relEdge16_" + getLabelCount();
+    std::string LabelEnd = "relEnd16_" + getLabelCount();
+    Reg newx;
+    mov(newx, ptr[regptrs + sizeof(void*) * (RWPTR_START_OF_XCOUNTER)]);
+    add(newx, dx);
+    cmp(newx, dx < 0 ? 0 : planewidth - 16);
+    if (dx < 0)
+      jl(LabelEdge); // newx < 0
+    else
+      jg(LabelEdge); // newx > planewidth - 16
+    // no edge handling needed
+    load8AsFloat(r1, a, dx << shift, op);
+    load8AsFloat(r2, a, (dx + 8) << shift, op);
+    convert8(r1, &r2, conv);
+    jmp(LabelEnd);
+
+    L(LabelEdge);
+    // edge handling needed
+    relLoad8(r1, a, regptrs, zero, op, dx, bc, filler_r, conv);
+    relLoad8(r2, a, regptrs, zero, op, dx + 8, bc, filler_r, conv);
+    L(LabelEnd);
+  }
 
   template<bool processSingle, bool maskUnused>
   AVS_FORCEINLINE void processingLoop(Reg &regptrs, YmmReg &zero, Reg &constptr, Reg &SpatialY)
@@ -3167,12 +2908,12 @@ struct ExprEvalAvx2 : public jitasm::function<void, ExprEvalAvx2, uint8_t *, con
     std::list<YmmReg> stack1;
 
     // reason of masking: prevent loading 'junk', out of frame pixels, which can be NaN floats for example.
-    // If processingLoop works in dual lane mode (!processSingle), masking occurs only for the high lane,
-    // when there is no need for dual lanes (width mod 16 is <= 8 pixels), processSingle=true is used
+    // If processingLoop works in dual register mode (!processSingle), masking occurs only for the high register,
+    // when there is no need for dual registers (width mod 16 is <= 8 pixels), processSingle=true is used
     const bool maskIt = maskUnused && ((planewidth & 7) != 0);
     const int mask = ((1 << (planewidth & 7)) - 1);
 
-    // mask by zero when we have only 1-7 valid pixels in the lower (single-lane) or upper (dual-lane)
+    // mask by zero when we have only 1-7 valid pixels in the lower (single register) or upper (dual register)
     // 1: 2-1   = 1   // 00000001
     // 2: 4-1   = 3   // 00000011
     // 7: 128-1 = 127 // 01111111
@@ -3258,6 +2999,46 @@ struct ExprEvalAvx2 : public jitasm::function<void, ExprEvalAvx2, uint8_t *, con
           vmovd(r1x, dword_ptr[regptrs + sizeof(void*) * (iter.e.ival + RWPTR_START_OF_INTERNAL_FRAMEPROP_VARIABLES)]);
           vbroadcastss(r1, r1x);
           vmovaps(r2, r1);
+          stack.push_back(std::make_pair(r1, r2));
+        }
+      }
+      else if (iter.op == opLoadRelSrc8 || iter.op == opLoadRelSrc16 || iter.op == opLoadRelSrcF32) {
+        // either dx or dy is nonzero
+        Reg a;
+        mov(a, ptr[regptrs + sizeof(void *) * (iter.e.ival + RWPTR_START_OF_INPUTS)]); // current pixel group of current line
+
+        // handles y shift and vertical border repeat/reflextions
+        emitRowAdjust(*this, a, regptrs, SpatialY, iter.e.ival, iter.dy, iter.bc, planeheight);
+        // 'a' now points to xcounter in the source row
+        if (processSingle) {
+          // 8 pixels
+          YmmReg r1;
+          XmmReg filler_r; // borderConstant: filler value in all elements
+          if (iter.bc == borderConstant)
+            loadFiller(filler_r, iter.filler);
+          relLoad8(r1, a, regptrs, zero, iter.op, iter.dx, iter.bc, filler_r, &iter.conv);
+          if (iter.bc == borderConstant && iter.dy != 0) {
+            std::string LabelOnScreen = "relRowOn" + getLabelCount();
+            emitRowOffscreenCheck(*this, SpatialY, iter.dy, planeheight, LabelOnScreen);
+            vbroadcastss(r1, filler_r); // source row off-screen: all filler
+            L(LabelOnScreen);
+          }
+          stack1.push_back(r1);
+        }
+        else {
+          // 16 pixels
+          YmmReg r1, r2;
+          XmmReg filler_r; // borderConstant: filler value in all elements
+          if (iter.bc == borderConstant)
+            loadFiller(filler_r, iter.filler);
+          relLoad16(r1, r2, a, regptrs, zero, iter.op, iter.dx, iter.bc, filler_r, &iter.conv);
+          if (iter.bc == borderConstant && iter.dy != 0) {
+            std::string LabelOnScreen = "relRowOn" + getLabelCount();
+            emitRowOffscreenCheck(*this, SpatialY, iter.dy, planeheight, LabelOnScreen);
+            vbroadcastss(r1, filler_r); // source row off-screen: all filler
+            vbroadcastss(r2, filler_r);
+            L(LabelOnScreen);
+          }
           stack.push_back(std::make_pair(r1, r2));
         }
       }
@@ -4459,17 +4240,28 @@ public:
 
   // Load from source with relative offset
   template<typename T>
-  void loadRelSource(const T* src, int x, int y, int dx, int dy, int width, int height, int stride) {
+  void loadRelSource(const T* src, int x, int y, int dx, int dy, int bc, float filler, const ExprLoadConv& conv, int width, int height, int stride) {
     auto& current_stack = stack[stackIndex];
     for (int i = 0; i < VectorSize; ++i)
       current_stack[i] = stacktop[i];
-    // at the edges repeat, no mirror
+    // off-screen pixels: border mode bc (clamp, mirror, reflect101, constant, wrap)
+    // borderConstant: conv converts the loaded pixels (scale_inputs), the filler is used as is
     // stride is of byte pitch
-    int newY = std::max(0, std::min(y + dy, height - 1)) - y;
+    if (bc == borderConstant && (y + dy < 0 || y + dy >= height)) {
+      for (int i = 0; i < VectorSize; ++i)
+        stacktop[i] = filler;
+      stackIndex++;
+      return;
+    }
+    int newY = borderIndex(y + dy, height, bc) - y;
     const uint8_t* rowPtr = reinterpret_cast<const uint8_t*>(src) + static_cast<intptr_t>(newY) * stride;
     for (int i = 0; i < VectorSize; ++i) {
-      int newX = std::max(0, std::min(x + dx + i, width - 1));
-      stacktop[i] = static_cast<float>(reinterpret_cast<const T*>(rowPtr)[newX]);
+      if (bc == borderConstant && (x + dx + i < 0 || x + dx + i >= width)) {
+        stacktop[i] = filler;
+        continue;
+      }
+      int newX = borderIndex(x + dx + i, width, bc);
+      stacktop[i] = conv.apply(static_cast<float>(reinterpret_cast<const T*>(rowPtr)[newX]));
     }
     stackIndex++;
   }
@@ -4814,13 +4606,13 @@ public:
         loadSource<float>(reinterpret_cast<const float*>(srcp[vops_current->e.ival]), x);
         break;
       case opLoadRelSrc8:
-        loadRelSource<uint8_t>(reinterpret_cast<const uint8_t*>(srcp[vops_current->e.ival]), x, y, vops_current->dx, vops_current->dy, w, h, src_stride[vops_current->e.ival]);
+        loadRelSource<uint8_t>(reinterpret_cast<const uint8_t*>(srcp[vops_current->e.ival]), x, y, vops_current->dx, vops_current->dy, vops_current->bc, vops_current->filler, vops_current->conv, w, h, src_stride[vops_current->e.ival]);
         break;
       case opLoadRelSrc16:
-        loadRelSource<uint16_t>(reinterpret_cast<const uint16_t*>(srcp[vops_current->e.ival]), x, y, vops_current->dx, vops_current->dy, w, h, src_stride[vops_current->e.ival]);
+        loadRelSource<uint16_t>(reinterpret_cast<const uint16_t*>(srcp[vops_current->e.ival]), x, y, vops_current->dx, vops_current->dy, vops_current->bc, vops_current->filler, vops_current->conv, w, h, src_stride[vops_current->e.ival]);
         break;
       case opLoadRelSrcF32:
-        loadRelSource<float>(reinterpret_cast<const float*>(srcp[vops_current->e.ival]), x, y, vops_current->dx, vops_current->dy, w, h, src_stride[vops_current->e.ival]);
+        loadRelSource<float>(reinterpret_cast<const float*>(srcp[vops_current->e.ival]), x, y, vops_current->dx, vops_current->dy, vops_current->bc, vops_current->filler, vops_current->conv, w, h, src_stride[vops_current->e.ival]);
         break;
       case opLoadConst:
         push_and_broadcast(vops_current->e.fval);
@@ -5111,8 +4903,12 @@ void Exprfilter::processFrame(int plane, int w, int h, int pixels_per_iter, floa
               const int newx = x + vops[i].dx;
               const int newy = y + vops[i].dy;
               const int clipIndex = vops[i].e.ival;
-              const uint8_t* srcp2 = srcp_orig[clipIndex] + max(0, min(newy, h - 1)) * src_stride[clipIndex];
-              stacktop = srcp2[max(0, min(newx, w - 1))];
+              if (vops[i].bc == borderConstant && (newx < 0 || newx >= w || newy < 0 || newy >= h))
+                stacktop = vops[i].filler;
+              else {
+                const uint8_t* srcp2 = srcp_orig[clipIndex] + borderIndex(newy, h, vops[i].bc) * src_stride[clipIndex];
+                stacktop = vops[i].conv.apply(srcp2[borderIndex(newx, w, vops[i].bc)]); // conv: borderConstant only
+              }
             }
             ++si;
             break;
@@ -5122,8 +4918,12 @@ void Exprfilter::processFrame(int plane, int w, int h, int pixels_per_iter, floa
               const int newx = x + vops[i].dx;
               const int newy = y + vops[i].dy;
               const int clipIndex = vops[i].e.ival;
-              const uint16_t* srcp2 = reinterpret_cast<const uint16_t*>(srcp_orig[clipIndex] + max(0, min(newy, h - 1)) * src_stride[clipIndex]);
-              stacktop = srcp2[max(0, min(newx, w - 1))];
+              if (vops[i].bc == borderConstant && (newx < 0 || newx >= w || newy < 0 || newy >= h))
+                stacktop = vops[i].filler;
+              else {
+                const uint16_t* srcp2 = reinterpret_cast<const uint16_t*>(srcp_orig[clipIndex] + borderIndex(newy, h, vops[i].bc) * src_stride[clipIndex]);
+                stacktop = vops[i].conv.apply(srcp2[borderIndex(newx, w, vops[i].bc)]); // conv: borderConstant only
+              }
             }
             ++si;
             break;
@@ -5133,8 +4933,12 @@ void Exprfilter::processFrame(int plane, int w, int h, int pixels_per_iter, floa
               const int newx = x + vops[i].dx;
               const int newy = y + vops[i].dy;
               const int clipIndex = vops[i].e.ival;
-              const float* srcp2 = reinterpret_cast<const float*>(srcp_orig[clipIndex] + max(0, min(newy, h - 1)) * src_stride[clipIndex]);
-              stacktop = srcp2[max(0, min(newx, w - 1))];
+              if (vops[i].bc == borderConstant && (newx < 0 || newx >= w || newy < 0 || newy >= h))
+                stacktop = vops[i].filler;
+              else {
+                const float* srcp2 = reinterpret_cast<const float*>(srcp_orig[clipIndex] + borderIndex(newy, h, vops[i].bc) * src_stride[clipIndex]);
+                stacktop = vops[i].conv.apply(srcp2[borderIndex(newx, w, vops[i].bc)]); // conv: borderConstant only
+              }
             }
             ++si;
             break;
@@ -5693,7 +5497,7 @@ static SOperation getStoreOp(const VideoInfo *vi) {
 }
 
 #define LOAD_OP(op,v,req) do { if (stackSize < req) env->ThrowError("Expr: Not enough elements on stack to perform operation %s", tokens[i].c_str()); ops.push_back(ExprOp(op, (v))); maxStackSize = std::max(++stackSize, maxStackSize); } while(0)
-#define LOAD_REL_OP(op,v,req,dx,dy) do { if (stackSize < req) env->ThrowError("Expr: Not enough elements on stack to perform operation %s", tokens[i].c_str()); ops.push_back(ExprOp(op, (v), (dx), (dy))); maxStackSize = std::max(++stackSize, maxStackSize); } while(0)
+#define LOAD_REL_OP(op,v,req,dx,dy,bc) do { if (stackSize < req) env->ThrowError("Expr: Not enough elements on stack to perform operation %s", tokens[i].c_str()); ops.push_back(ExprOp(op, (v), (dx), (dy), (bc))); maxStackSize = std::max(++stackSize, maxStackSize); } while(0)
 #define GENERAL_OP(op, v, req, dec) do { if (stackSize < req) env->ThrowError("Expr: Not enough elements on stack to perform operation %s", tokens[i].c_str()); ops.push_back(ExprOp(op, (v))); stackSize-=(dec); } while(0)
 #define ONE_ARG_OP(op) GENERAL_OP(op, 0, 1, 0)
 #define VAR_STORE_OP(op,v) GENERAL_OP(op, v, 1, 0)
@@ -5978,8 +5782,17 @@ static size_t parseExpression(const std::string &expr, std::vector<ExprOp> &ops,
             // ending ']'
             if (numStream.get() != ']')
               env->ThrowError("Expr: Failed to convert '%s' to [x,y], closing ']' expected ", tokens[i].c_str());
-            if (numStream >> s)
-              env->ThrowError("Expr: Failed to convert '%s' to [x,y], invalid character after ']'", tokens[i].c_str());
+            // optional border mode suffix :c (clamp, default), :m (mirror), :r (reflect101), :k (constant filler from the stack), :w (wrap)
+            int bc = borderClamp;
+            if (numStream >> s) {
+              if (s == ":c") bc = borderClamp;
+              else if (s == ":m") bc = borderMirror;
+              else if (s == ":r") bc = borderReflect101;
+              else if (s == ":k") bc = borderConstant;
+              else if (s == ":w") bc = borderWrap;
+              else
+                env->ThrowError("Expr: Failed to convert '%s', after ']' only :c, :m, :r, :k or :w (border mode) is allowed", tokens[i].c_str());
+            }
 
             if (lutmode > 0)
               env->ThrowError("Expr: relative pixel addressing is forbidden in lut mode");
@@ -5988,7 +5801,16 @@ static size_t parseExpression(const std::string &expr, std::vector<ExprOp> &ops,
               env->ThrowError("Expr: dx must be between +/- (width-1) in '%s'", tokens[i].c_str());
             if (dy <= -vi_output->height || dy >= vi_output->height)
               env->ThrowError("Expr: dy must be between +/- (height-1) in '%s'", tokens[i].c_str());
-            LOAD_REL_OP(getLoadOp(vi[loadIndex], true), loadIndex, 0, dx, dy);
+            if (bc == borderConstant) {
+              // the filler is the stack top, must be a constant (checked after constant folding):
+              // pops it and pushes the loaded pixel: stack size unchanged
+              if (stackSize < 1)
+                env->ThrowError("Expr: '%s' needs a constant filler value on the stack", tokens[i].c_str());
+              ops.push_back(ExprOp(getLoadOp(vi[loadIndex], true), loadIndex, dx, dy, bc));
+              // stack size unchanged: maxStackSize was already updated when the filler was pushed
+            }
+            else
+              LOAD_REL_OP(getLoadOp(vi[loadIndex], true), loadIndex, 0, dx, dy, bc);
           }
           else {
             // not relative, single clip letter
@@ -6014,6 +5836,8 @@ static size_t parseExpression(const std::string &expr, std::vector<ExprOp> &ops,
           // are already loaded as float
           const int srcBitDepth = vi[loadIndex]->BitsPerComponent();
           const int dstBitDepth = autoScaleSourceBitDepth; // internal precision
+          const size_t loadOpIndex = ops.size() - 1; // the load op just added
+          ExprLoadConv conv; // the conversion steps after the load
 
           const bool use_chroma = chroma; // && !forceNonUV;
           const bool isfull = autoconv_full_scale;
@@ -6026,28 +5850,42 @@ static size_t parseExpression(const std::string &expr, std::vector<ExprOp> &ops,
               bits_conv_constants d;
               get_bits_conv_constants(d, use_chroma, isfull, isfull, srcBitDepth, dstBitDepth);
               // chroma is spec: signed. Limited:16-240 is really 128 +/-112. Full:1-255 is really 128+/-127
-
-              if (d.src_offset != 0) {
-                LOAD_OP(opLoadConst, (float)d.src_offset, 0);
-                TWO_ARG_OP(opSub);
-              }
-              if (d.mul_factor != 1.0f) {
-                LOAD_OP(opLoadConst, d.mul_factor, 0);
-                TWO_ARG_OP(opMul);
-              }
-              if (d.dst_offset != 0) {
-                LOAD_OP(opLoadConst, (float)d.dst_offset, 0);
-                TWO_ARG_OP(opAdd);
-              }
+              conv.sub = (float)d.src_offset;
+              conv.mul = d.mul_factor;
+              conv.add = (float)d.dst_offset;
             }
           }
 
           // "floatUV" - shifts -0.5 .. +0.5 chroma range to 0 .. 1.0 only when no other autoscaling is active
-          // the effect of this pre-shift is reversed at the storage phase
+          // the effect of this pre-shift is reversed at the storage phase (opSub at the end pixel exit)
           if ((!autoconv_conv_float || dstBitDepth == 32) && srcBitDepth == 32) {
-            if (chroma && shift_float) {
-              LOAD_OP(opLoadConst, 0.5f, 0);
-              TWO_ARG_OP(opAdd); // at the end pixel exit: opSub
+            if (chroma && shift_float)
+              conv.add_uv = 0.5f;
+          }
+
+          if (ops[loadOpIndex].bc == borderConstant) {
+            // :k relative load: the load op converts the loaded pixels itself, before putting
+            // the filler (given in the expression's domain, no conversion) in place of the
+            // off-screen ones.
+            ops[loadOpIndex].conv = conv;
+          }
+          else {
+            // separate operations after the load, steps in the order of ExprLoadConv::apply
+            if (conv.sub != 0.0f) {
+              LOAD_OP(opLoadConst, conv.sub, 0);
+              TWO_ARG_OP(opSub);
+            }
+            if (conv.mul != 1.0f) {
+              LOAD_OP(opLoadConst, conv.mul, 0);
+              TWO_ARG_OP(opMul);
+            }
+            if (conv.add != 0.0f) {
+              LOAD_OP(opLoadConst, conv.add, 0);
+              TWO_ARG_OP(opAdd);
+            }
+            if (conv.add_uv != 0.0f) {
+              LOAD_OP(opLoadConst, conv.add_uv, 0);
+              TWO_ARG_OP(opAdd);
             }
           }
         }
@@ -6674,6 +6512,17 @@ static bool isLoadOp(uint32_t op) {
     return false;
 }
 
+// true when ops[from..to) has a variable store, dup or swap
+// Used from constant folding (ternary part x?a:b )
+static bool hasStackOrStoreOps(const std::vector<ExprOp>& ops, size_t from, size_t to) {
+  for (size_t k = from; k < to; k++) {
+    const uint32_t op = ops[k].op;
+    if (op == opStoreVar || op == opStoreVarAndDrop1 || op == opDup || op == opSwap)
+      return true;
+  }
+  return false;
+}
+
 static void findBranches(std::vector<ExprOp>& ops, size_t pos, size_t* start1, size_t* start2, size_t* start3) {
   int operands = numOperands(ops[pos].op);
 
@@ -6752,9 +6601,25 @@ static void findBranches(std::vector<ExprOp>& ops, size_t pos, size_t* start1, s
 }
 
 
-static void foldConstants(std::vector<ExprOp> &ops) {
+static void foldConstants(std::vector<ExprOp> &ops, IScriptEnvironment* env) {
     for (size_t i = 0; i < ops.size(); i++) {
         switch (ops[i].op) {
+        case opLoadRelSrc8:
+        case opLoadRelSrc16:
+        case opLoadRelSrcF32:
+          // x[dx,dy]:k (constant border mode) takes the filler from the stack top, which
+          // must be constant by now.
+          // Store it in the op as is (expression's domain, the load op does the scale_inputs
+          // conversion of the pixels before putting the filler in), remove the constant:
+          // from here on the op is an ordinary load.
+          if (ops[i].bc == borderConstant) {
+            if (i == 0 || ops[i - 1].op != opLoadConst)
+              env->ThrowError("Expr: the filler value before x[dx,dy]:k must be a constant");
+            ops[i].filler = ops[i - 1].e.fval;
+            ops.erase(ops.begin() + i - 1);
+            i--;
+          }
+          break;
           // optimize pow
         case opPow:
           if (ops[i - 1].op == opLoadConst) {
@@ -6898,7 +6763,17 @@ static void foldConstants(std::vector<ExprOp> &ops) {
               size_t start1, start2, start3;
               findBranches(ops, i, &start1, &start2, &start3);
               // start1/2/3: condition/true/false branch
-              if (ops[start2 - 1].op == opLoadConst) { // condition expression is a single constant
+
+              // Folded only when the condition is a single constant and the operand range
+              // (condition..ternary) has none of these:
+              // - variable store (A@: store the stack top into A, keep it; A^: store and pop):
+              //   Expr evaluates both branches, so a store in the erased branch must still
+              //   happen. A^ also removes the value it stores, so e.g. "sx A^" leaves nothing
+              //   on the stack: it is not an operand, belongs to neither branch, but
+              //   findBranches attaches it to a neighbor (in "0 7 sx A^ A ?" to the "7").
+              // - dup, swap: they read stack values below their own branch, findBranches
+              //   cannot split the range correctly.
+              if (ops[start2 - 1].op == opLoadConst && !hasStackOrStoreOps(ops, start1, i)) {
                 ops.erase(ops.begin() + i); // erase ternary op
                 if (ops[start1].e.fval > 0.0f) { // condition is constant 'true'
                   // start1 is start2 - 1
@@ -7107,7 +6982,7 @@ Exprfilter::Exprfilter(const std::vector<PClip>& _child_array, const std::vector
       d.maxStackSize = std::max(parseExpression(expr[i], d.ops[i], d.frameprops[i], vi_array, &d.vi, getStoreOp(&d.vi), d.numInputs, planewidth, planeheight, chroma,
         autoconv_full_scale, autoconv_conv_int, autoconv_conv_float, clamp_float_i, shift_float, d.lutmode,
         env), d.maxStackSize);
-      foldConstants(d.ops[i]);
+      foldConstants(d.ops[i], env);
 
       // optimize constant store, change operation to "fill"
       if (d.plane[i] == poProcess && d.ops[i].size() == 2 && d.ops[i][0].op == opLoadConst) {
@@ -7173,18 +7048,25 @@ Exprfilter::Exprfilter(const std::vector<PClip>& _child_array, const std::vector
 
 #ifdef INTEL_INTRINSICS
       // Check CPU instuction level constraints:
-      // opLoadRel8/16/32: minimum SSSE3 (pshufb, alignr) for SIMD, and no AVX2 support
       // round, floor, ceil, trunc: minimun SSE4.1
       // Trig.func: C only
       d.planeOptAvx2[i] = optAvx2;
       d.planeOptSSE2[i] = optSSE2;
       for (size_t j = 0; j < d.ops[i].size(); j++) {
         const uint32_t op = d.ops[i][j].op;
-        if (op == opLoadRelSrc8 || op == opLoadRelSrc16 || op == opLoadRelSrcF32)
-        {
-          d.planeOptAvx2[i] = false; // avx2 path not implemented
-          if(!(env->GetCPUFlags() & CPUF_SSSE3)) // required minimum (pshufb, alignr)
+        // relative load with mirror or wrap border modes:
+        // the JIT code implements reflects or wraps only once.
+        // Offsets needing more will run in C.
+        if ((op == opLoadRelSrc8 || op == opLoadRelSrc16 || op == opLoadRelSrcF32) && (d.ops[i][j].bc == borderMirror || d.ops[i][j].bc == borderReflect101 || d.ops[i][j].bc == borderWrap)) {
+          const int dx = d.ops[i][j].dx;
+          const int dy = d.ops[i][j].dy;
+          const bool dx_ok = planewidth < 4 || // small planes: compile-time constant mapping, any dx
+            (dx >= -(planewidth - 1) && dx <= planewidth - (d.ops[i][j].bc == borderReflect101 ? 4 : 3));
+          const bool dy_ok = dy > -planeheight && dy < planeheight;
+          if (!dx_ok || !dy_ok) {
+            d.planeOptAvx2[i] = false;
             d.planeOptSSE2[i] = false;
+          }
         }
         // some trig.functions C only, except Sin and Cos and Atan2 and tan
         if (op == opAsin || op == opAcos || op == opAtan) {

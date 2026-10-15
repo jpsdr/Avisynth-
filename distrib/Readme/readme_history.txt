@@ -9,8 +9,51 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20261005 3.7.5.rXXXX (pre 3.7.6)
+20261015 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
+- Expr: relative pixel load border modes, as an optional suffix after x[dx,dy]:
+  :c - clamp, the edge pixel is cloned (default, same as no suffix)      a a a | a b c d
+  :m - mirror, edge pixel repeated (akarin.Expr compatible)              c b a | a b c d
+  :r - mirror, edge pixel not repeated (OpenCV BORDER_REFLECT_101)       d c b | a b c d
+  :k - constant filler (OpenCV BORDER_CONSTANT)                          k k k | a b c d
+  :w - wrap around (OpenCV BORDER_WRAP)                                  f g h | a b c d
+  e.g. "x[-2,0]:m x[2,0]:m + 2 /". Other suffixes are an error.
+  :k takes the filler from the stack before the pixel reference: "k x[dx,dy]:k". It must be a
+  constant (checked after constant folding): a number or a constant expression, e.g.
+  "range_half x[0,-1]:k", "64 2 * x[1,0]:k". It is in the value domain of the expression: a raw
+  pixel value by default, the converted value when scale_inputs is used.
+  Mirror and wrap modes reflect or wrap as many times as needed (periodic), relevant on subsampled chroma planes
+  where dx/dy (limited by the luma size) can exceed the plane size.
+  The SSE2/AVX2 JIT reflects or wraps once, a plane where a mirror or wrap mode offset needs
+  more runs in C (the other planes stay JIT); so does a plane where dx > planewidth-3 (:m, :w)
+  or dx > planewidth-4 (:r). Clamp (:c) and constant (:k) are always JIT.
+- Expr: relative pixel load (e.g. x[-1,0]) has an AVX2 JIT version. Before, an expression with
+  relative pixels ran on the SSE2 JIT even on AVX2 CPUs; now it runs ~2x faster on them
+  (1080p, 8/16/32 bit). The row edge handling is shared with the SSE2 path.
+- Expr: relative pixel load (e.g. x[-1,0]) in the SSE2 JIT no longer requires SSSE3; CPUs without
+  SSSE3 used to run the whole expression in C. Hugely refactored ans simplified edge handling.
+- Fix: Expr: wrong results or crash (mostly x86) in the SSE2/AVX2 JIT under certain conditions: relative
+  pixel loads x[dx,dy] near the row edges while many values are held on the stack (high register
+  pressure). A bug in the JIT code generator's register handling, existed in earlier versions as well.
+- Fix: Expr: a ternary with a constant condition (e.g. "0 a b ?") and a variable store (A@, A^), dup
+  or swap among its operands: the optimizer removed the wrong part, giving a wrong result or a crash.
+  E.g. "0 7 sx A^ A ?" returned 0 instead of sx; "0 sx dup ?" crashed. Such ternaries are no longer
+  folded. Existed since the first Expr version.
+- Fix: Expr: % (modulo) in the SSE2/AVX2 JIT now gives the same result as the C path (fmodf).
+  The JIT computed x - trunc(x/d)*d in float: near multiples of d the rounded division gave a quotient
+  one too big, so the result was 0 or slightly negative instead of almost d (e.g. 73 % 7.3 gave 0,
+  fmodf gives 7.2999983), and the result had a small rounding error elsewhere. Integer operands below
+  2^24 and power-of-two divisors were not affected.
+  Now the remainder is computed exactly (SSE2: in double, AVX2: by FMA) and corrected when the
+  quotient was one too big; the result has the sign of x (also -0), d == 0 gives NaN, like fmodf.
+  Exact while |x/d| < 2^24.
+  Bug existed since % was added (r2574).
+- Fix: Expr: tan in the SSE2/AVX2 JIT was inaccurate: up to ~8% relative error (e.g. tan(0.5) gave
+  0.528 instead of 0.546), and ~3-4% near +/-pi/2. New implementation: range reduction to [-pi/4, pi/4],
+  minimax polynomial, -1/tan(r) in odd quadrants. Max difference from the C path (std::tan) is ~3.5 ulp
+  (relative error ~2.5e-7). On the SSE2 path (CPUs without AVX2) the precision of sin, cos and tan
+  decreases for |x| above about 50000.
+  Bug existed since tan got JIT support in 3.7.4.
 - Fix: Expr: crash or wrong output when round, floor, ceil or trunc came before a relative pixel
   load (e.g. x[1,0]) or asin/acos/atan. The SIMD path selection (narrowing down) loop stopped at the
   first rounding op, so later ops were not checked. A relative pixel load then ran on the AVX2 JIT,

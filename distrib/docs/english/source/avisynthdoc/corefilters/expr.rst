@@ -60,7 +60,7 @@ Syntax and Parameters
     instead of two.
 
     * **Expr** generates assembly code that normally uses two 128 (SSE2) or 256
-      bit (AVX2) registers ("lanes"), thus processing 8 (SSE2)/16 (AVX2) pixels
+      bit (AVX2) registers, thus processing 8 (SSE2)/16 (AVX2) pixels
       per internal cycle.
     * Experimental parameter, ``optSingleMode=true`` makes the internal compiler
       generate instructions for only one register (4/8 pixels - SSE2/AVX2). The
@@ -246,8 +246,9 @@ Expr language/RPN elements
 * Clips: letters *x, y, z, a..w. x* is the first clip parameter, *y* is the
   second one, etc.
 * Math: ``* / + -``
-* ``%`` (modulo), like fmod. Example: ``result = x - trunc(x/d)*d``. Note: the
-  internal 32-bit float can hold only a 24 bit integer number (approximately).
+* ``%`` (modulo), same as C ``fmod``: ``x - trunc(x/d)*d``, the result has the sign
+  of ``x``. ``d`` = 0 results in NaN. Since 3.7.6 the JIT (SSE2/AVX2) result is exact while
+  \|x/d\| < 2^24; above that the result is inaccurate.
 * Math constant: ``pi``
 * Functions: ``min, max, sqrt, abs, exp, log, pow ^`` (synonyms: ``pow`` and ``^``)
 * Function: ``neg`` simple negates stack top
@@ -258,6 +259,12 @@ Expr language/RPN elements
   functions ``sin``, ``cos``, ``tan``  and ``atan2`` have SSE2/AVX2 optimization, 
   the others have not (if e.g. ``acos`` is used it makes the whole expression to 
   evaluate without JitASM optimization).
+  On the SSE2 path (CPUs without AVX2) the precision of ``sin``, ``cos`` and ``tan``
+  decreases for \|x\| above about 50000.
+  The JIT ``tan`` uses range reduction to [-pi/4, pi/4] and a polynomial approximation,
+  a method described e.g. in the `SLEEF paper`_ (N. Shibata, F. Petrogalli: SLEEF: A Portable
+  Vectorized Library of C Standard Mathematical Functions. IEEE Transactions on Parallel and
+  Distributed Systems, Vol. 31, No. 6, June 2020).
 * Functions: ``round, floor, ceil, trunc`` operators (nearest integer - banker's
   rounding, round down, round up, round to zero). |br| On Intel builds acceleration
   requires at least SSE4.1 capable processor or else the whole expression is
@@ -354,18 +361,149 @@ Pixel addressing
 
 Indexed, addressable source clip pixels by relative x,y positions.
 
-    Syntax: ``x[a,b]`` where
+    Syntax: ``x[a,b]``, ``x[a,b]:mode`` or ``k x[a,b]:k`` where
 
     * ``'x'`` : source clip letter a..z
     * ``'a'`` : horizontal shift. -width < a < width
     * ``'b'`` : vertical shift. -height < b < height
+    * ``':mode'`` : optional, how off-screen pixels are taken (since 3.7.6):
+
+      * ``:c`` : clamp, the edge pixel is cloned (default, same as no suffix)
+      * ``:m`` : mirror, the edge pixel is repeated (``d c b a | a b c d``),
+        compatible with `akarin.Expr`_ ``:m``
+      * ``:r`` : mirror, the edge pixel is not repeated (``e d c b | a b c d``),
+        like `OpenCV`_'s default ``BORDER_REFLECT_101``
+      * ``:k`` : constant, off-screen pixels get the filler value ``k``
+        (``k k k k | a b c d``). ``k`` is the value before the pixel reference on the
+        stack, it must be a constant: a number, or a constant expression like
+        ``range_half`` or ``64 2 *``. ``k`` is in the value domain of the expression:
+        a raw pixel value by default, the converted value when ``scale_inputs`` is
+        used (so ``range_half`` is always mid-grey).
+      * ``:w`` : wrap around, the row/column continues from its other end
+        (``e f g h | a b c d``), like OpenCV's ``BORDER_WRAP``. For pictures whose
+        opposite edges are neighbors, e.g. seamlessly tiling textures or 360 degree
+        panoramas.
 
     ``'a'`` and ``'b`` should be constant. e.g.:
-    ``"x[-1,-1] x[-1,0] x[-1,1] y[0,-10] + + + 4 /"``
+    ``"x[-1,-1] x[-1,0] x[-1,1] y[0,-10] + + + 4 /"``,
+    ``"x[-2,0]:m x[2,0]:m + 2 /"``, ``"range_half x[0,-1]:k"``, ``"x[-10,0]:w"``
 
-| When a pixel would come from off-screen, the pixels are cloned from the edge.
-| Optimized version of indexed pixels requires SSSE3, and no AVX2 version is
-  available. Non-SSSE3 falls back to C for the whole expression.
+| When a pixel would come from off-screen, it is taken by the border mode: cloned from
+  the edge (default ``:c``), mirrored (``:m``, ``:r``), the constant filler (``:k``) or
+  wrapped around from the other end (``:w``).
+| The limits of ``a`` and ``b`` come from the clip (luma) size, so on subsampled chroma
+  planes they can be larger than the plane. Mirror and wrap modes reflect or wrap as many
+  times as needed (periodic extension). The JIT reflects or wraps once, so a plane where
+  a mirror or wrap mode offset needs more runs in C (the other planes stay JIT optimized). Example, 640x480 YV12
+  (U and V planes are 320x240): ``a`` and ``b`` may be up to 639 and 479. ``x[2,1]:m``
+  is JIT optimized on all planes. ``x[400,0]:m`` and ``x[0,300]:m`` run in C on U and
+  V (400 > 320, 300 > 240), JIT on Y. Mirror and wrap modes run in C on a plane also when
+  ``a`` > planewidth-3 (``:m``, ``:w``) or ``a`` > planewidth-4 (``:r``), e.g. ``x[318,0]:m``
+  on U and V. Clamp (``:c``) and constant (``:k``) are always JIT optimized.
+| Note: ``a`` and ``b`` are pixel offsets of the plane being processed. When the same
+  expression is used for subsampled chroma planes (e.g. a single expression for all
+  planes), the same offsets cover a larger area there: a 5x5 neighborhood (``a``, ``b``
+  from -2 to 2) on Y covers 10x10 luma pixels on 4:2:0 U and V. For the same spatial
+  extent give the chroma planes their own expression with offsets scaled by the
+  subsampling (e.g. -1 to 1 for 4:2:0).
+| Indexed pixels are JIT optimized for SSE2 and AVX2 (before 3.7.6: SSSE3 required,
+  no AVX2 version: an expression with indexed pixels ran on the SSE2 JIT even on
+  AVX2 CPUs).
+
+Off-screen (border) handling modes and their names in other tools, shown at the left
+edge of the row ``a b c d ...``, for reference when porting expressions or comparing
+results.
+
+.. list-table::
+    :header-rows: 1
+    :widths: 20 12 10 17 12 14 10
+
+    * - Extension at the left edge
+      - Edge pixel repeated
+      - Expr
+      - `OpenCV`_
+      - `numpy.pad`_
+      - `scipy.ndimage`_
+      - `akarin.Expr`_
+    * - ``a a a a | a b c d``
+      - (clone, clamp)
+      - ``:c`` (default)
+      - BORDER_REPLICATE
+      - edge
+      - nearest
+      - ``:c``
+    * - ``d c b a | a b c d``
+      - yes
+      - ``:m``
+      - BORDER_REFLECT
+      - symmetric
+      - reflect
+      - ``:m``
+    * - ``e d c b | a b c d``
+      - no
+      - ``:r``
+      - BORDER_REFLECT_101 (OpenCV default)
+      - reflect
+      - mirror
+      - \-
+    * - ``k k k k | a b c d``
+      - (constant)
+      - ``k x[a,b]:k``
+      - BORDER_CONSTANT
+      - constant
+      - constant
+      - \-
+    * - ``e f g h | a b c d``
+      - (wrap)
+      - ``:w``
+      - BORDER_WRAP
+      - wrap
+      - wrap
+      - \-
+
+Note that the name "reflect" means different modes in numpy and scipy.
+
+Border mode examples (``a``, ``b`` offsets are in pixels of the processed plane).
+Note that for offsets of -1 and 1 ``:m`` gives the same result as ``:c`` (the mirrored
+pixel next to the edge is the edge pixel itself); ``:m`` differs from ``:c`` only from
+offset 2 on. So for 3x3 kernels ``:c`` and ``:m`` are identical, only ``:r`` (and ``:k``)
+gives a different result at the frame border.
+
+* ``:c`` clamp (default). 3-tap horizontal blur, the edge pixel is repeated:
+  ``"x[-1,0] x x[1,0] + + 3 /"``
+* ``:m`` mirror. 5-tap horizontal box blur. The edge pixel is not over-weighted at the
+  frame border as with clamp (where pixel ``a`` would get 3 of the 5 weights), the
+  border neighborhood keeps the texture of the picture:
+  ``"x[-2,0]:m x[-1,0]:m x x[1,0]:m x[2,0]:m + + + + 5 /"``
+* ``:r`` reflect101. 3x3 Laplacian edge detection (absolute value) with the border
+  handling of OpenCV's default, so border pixels match ``abs(cv2.Laplacian(img, ksize=1))``:
+  ``"x[-1,0]:r x[1,0]:r + x[0,-1]:r + x[0,1]:r + x 4 * - abs"``
+* ``:r`` reflect101. Sobel edge magnitude ``sqrt(Gx^2 + Gy^2)`` (as in ExTools'
+  ``ex_edge(mode="sobel")``; the corner pixels are stored in variables, since both
+  kernels use them). With ``:r`` the frame border is handled like OpenCV's default
+  (``cv2.magnitude`` of ``cv2.Sobel`` dx and dy). With ``:c`` (or no suffix) the same
+  expression is VapourSynth's ``std.Sobel`` (scale=1): same kernels, magnitude and
+  edge-repeat border; there the gradient across the frame edge is halved:
+  ``"x[1,-1]:r C@ x[1,1]:r I@ + x[-1,-1]:r A@ - x[-1,1]:r G@ - x[1,0]:r x[-1,0]:r - 2 * + dup *
+  G I + A - C - x[0,1]:r x[0,-1]:r - 2 * + dup * + sqrt"``
+* ``:r`` reflect101. 3x3 binomial blur, the kernel of RemoveGrain(11) / (12)
+  (``[1 2 1; 2 4 2; 1 2 1] / 16``). RemoveGrain copies the outermost rows and columns
+  unprocessed; here the frame edge is filtered as well:
+  ``"x[-1,-1]:r x[1,-1]:r + x[-1,1]:r + x[1,1]:r + x[0,-1]:r x[-1,0]:r + x[1,0]:r x[0,1]:r + + 2 * + x 4 * + 16 /"``
+* ``:k`` constant. Shift the picture down by one pixel, the new top row is mid-grey
+  at any bit depth:
+  ``"range_half x[0,-1]:k"``
+* ``:k`` constant. Number of set neighbors (4-neighborhood) of a 0/1 mask, off-screen
+  pixels count as not set (zero padding). With clamp a pixel at the frame edge would
+  count itself as its own off-screen neighbor:
+  ``"0 x[-1,0]:k 0 x[1,0]:k + 0 x[0,-1]:k + 0 x[0,1]:k +"``
+* ``:w`` wrap. Scroll the picture 10 pixels to the right, the pixels leaving at the
+  right edge come back at the left edge:
+  ``"x[-10,0]:w"``
+* ``:w`` wrap. 5-tap horizontal box blur of a seamlessly tiling texture (or a 360 degree
+  panorama): the left and right edges are treated as neighbors, so the result tiles
+  seamlessly as well:
+  ``"x[-2,0]:w x[-1,0]:w x x[1,0]:w x[2,0]:w + + + + 5 /"``
 
 Auto-scale inputs with "scale_inputs"
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -546,6 +684,23 @@ Examples
 
  See Doom9 thread `"Fade with configurable time curves?"`_ for more information.
 
+External Links
+--------------
+
+* `VapourSynth`_ Expr documentation: the base of this filter
+* `akarin.Expr`_ (VapourSynth plugin): extended Expr, ``:m`` border mode compatible
+* `MaskTools2`_ (``mt_lut`` family) and `mt_lutspa`_: similar syntax, spatial variables
+* `rgba_rpn`_ RPN filters by wonkey_monkey: origin of the variable store (``A@``) and
+  store-and-pop (``A^``) syntax, frame number and time variables
+* `SLEEF paper`_: vectorized math functions, the method of the JIT ``tan``
+* Border handling in other libraries: `OpenCV`_ border types, `numpy.pad`_ and
+  `scipy.ndimage`_ modes
+* `Doom9 thread`_: Mandelbrot zoomer, original code and idea
+* `"Fade with configurable time curves?"`_ (doom9.org): using the ``time`` variable
+* Background: `RPN`_ (Reverse Polish notation), `mathematical function`_, `JIT compiler`_,
+  `LUT`_, `chroma subsampling`_, `SSE2`_, `AVX2`_
+
+
 Changelog
 ----------
 
@@ -557,6 +712,27 @@ Changelog
 |                 |  atan: wrong results (JIT). Bug since 3.7.1.             |
 |                 || Fix #505: Vector-C relative-row addressing ignored the  |
 |                 |  current row, mis-scaled the row offset at 16/32 bit     |
+|                 || Fix: JIT tan (SSE2/AVX2) was inaccurate, up to 8%       |
+|                 |  relative error. New implementation, max ~3.5 ulp.       |
+|                 |  Bug since 3.7.4.                                        |
+|                 || Fix: JIT % (modulo) now gives the same result as        |
+|                 |  fmodf; was 0 or slightly negative near multiples        |
+|                 |  of the divisor (e.g. 73 % 7.3).                         |
+|                 || Fix: constant condition ternary with a variable store   |
+|                 |  (A@, A^), dup or swap among its operands: wrong result  |
+|                 |  or crash (e.g. "0 7 sx A^ A ?", "0 sx dup ?").          |
+|                 || Fix: relative pixel loads near the row edges with many  |
+|                 |  values on the stack: wrong results or crash, mostly     |
+|                 |  x86 (JIT register handling bug, also in earlier         |
+|                 |  versions).                                              |
+|                 || Relative pixel load (x[dx,dy]): new AVX2 JIT version,   |
+|                 |  ~2x faster on AVX2 CPUs; SSE2 JIT no longer requires    |
+|                 |  SSSE3, slightly quicker.                                |
+|                 || New: relative pixel load border modes x[dx,dy]:c        |
+|                 |  (clamp, default), :m (mirror, akarin.Expr compatible),  |
+|                 |  :r (mirror without repeating the edge pixel),           |
+|                 |  k x[dx,dy]:k (constant filler k from the stack),        |
+|                 |  :w (wrap around).                                       |
 +-----------------+----------------------------------------------------------+
 | 3.7.4           || Enhancement: vectorizable C implementation helps nonJIT |
 |                 || New parameter: optVectorC                               |
@@ -571,10 +747,11 @@ Changelog
 |                 || TAB, CR, LF are valid string delimiters inside expr     |
 |                 |  string                                                  |
 |                 || Enhanced: arbitrary variable names, not only A to Z     |
+|                 |  (up to 256 variables)                                   |
 |                 || Access clip's frame properties:                         |
 |                 |  *clipletter.frameProperty* syntax                       |
 |                 || Enhanced: ``sin`` and ``cos``: SIMD acceleration        |
-|                 || New: ``atan2``                                          |
+|                 || New: ``atan2`` (SIMD accelerated)                       |
 |                 || New: ``neg, sgn``                                       |
 |                 || Enhanced: allow ‘f32’ as internal autoscale target      |
 |                 |  besides integer i8..i16                                 |
@@ -583,14 +760,18 @@ Changelog
 +-----------------+----------------------------------------------------------+
 | AviSynth+ 3.5.0 || Allow ``"floatUV"`` for parameter ``"clamp_float"``     |
 |                 || New parameter ``"clamp_float_UV"``                      |
+|                 || Allow ``"floatUV"`` for parameter ``"scale_inputs"``    |
+|                 || New: ``yrange_min, yrange_half, yrange_max`` and        |
+|                 |  ``yscalef, yscaleb``: luma (non-chroma) rules even when |
+|                 |  processing chroma planes                                |
 +-----------------+----------------------------------------------------------+
 | AviSynth+ r2724 || New three operand function: clip                        |
 |                 || New parameter ``"clamp_float"``                         |
 |                 || New parameter ``"scale_inputs"``                        |
 +-----------------+----------------------------------------------------------+
 | AviSynth+ r2574 || New: indexable source clip pixels by relative x,y       |
-|                 |  positions like x[-1,1]                                  |
-|                 || New functions: ``sin cos tan asin acos atan``           |
+|                 |  positions like x[-1,1] (JIT requires SSSE3)             |
+|                 || New functions: ``sin cos tan asin acos atan`` (no JIT)  |
 |                 || New operator: % (modulo)                                |
 |                 || New: variables: uppercase letters A..Z for storing and  |
 |                 |  reuse temporary results, frequently used computations.  |
@@ -603,7 +784,7 @@ Changelog
 | AviSynth+ r2542 |  Initial release                                         |
 +-----------------+----------------------------------------------------------+
 
-$Date: 2026/10/05 10:00:00 $
+$Date: 2026/10/15 08:40:00 $
 
 .. _mathematical function:
     https://en.wikipedia.org/wiki/Function_(mathematics)
@@ -629,6 +810,18 @@ $Date: 2026/10/05 10:00:00 $
     http://avisynth.nl/index.php/MaskTools2/mt_lutspa
 .. _"Fade with configurable time curves?":
     https://forum.doom9.org/showthread.php?t=183934
+.. _SLEEF paper:
+    https://arxiv.org/pdf/2001.09258
+.. _OpenCV:
+    https://github.com/opencv/opencv/blob/4.x/modules/core/include/opencv2/core/base.hpp
+.. _numpy.pad:
+    https://numpy.org/doc/stable/reference/generated/numpy.pad.html
+.. _scipy.ndimage:
+    https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.convolve.html
+.. _akarin.Expr:
+    https://github.com/AkarinVS/vapoursynth-plugin
+.. _rgba_rpn:
+    https://horman.net/avisynth/rgba_rpn.html
 
 .. |br| raw:: html
 
