@@ -289,6 +289,12 @@ Build environment, Interface
   (e.g. when SSE2/AVX2/AVX512 specific ``.cpp`` files are built with different per-file compiler flags). 
   Part of our public headers, but no interface change was done.
 
+- "Expr": relative pixel load border modes: ``x[dx,dy]:c`` (clamp, clone the edge pixel; default,
+  same as without suffix), ``x[dx,dy]:m`` (mirror, edge pixel repeated; akarin.Expr compatible),
+  ``x[dx,dy]:r`` (mirror without repeating the edge pixel, like OpenCV ``BORDER_REFLECT_101``),
+  ``k x[dx,dy]:k`` (constant filler ``k`` from the stack, must be constant, e.g. ``range_half``;
+  like OpenCV ``BORDER_CONSTANT``) and ``x[dx,dy]:w`` (wrap around, like OpenCV ``BORDER_WRAP``).
+  All modes are JIT optimized (SSE2, AVX2).
 
 Bugfixes
 ~~~~~~~~
@@ -458,6 +464,18 @@ Bugfixes
 - Fix: "Expr" crash on AVX2 CPUs when ``round``, ``floor``, ``ceil`` or ``trunc`` came before 
   a relative pixel load (e.g. ``x[1,0]``) in the expression; wrong results when before ``asin``, ``acos``, ``atan``.
   Existed since 3.7.1 (round/floor/ceil/trunc added).
+- Fix: "Expr" ``tan`` in the SSE2/AVX2 JIT was inaccurate (up to ~8% relative error).
+  New implementation, max error ~3.5 ulp compared with the C path. Existed since 3.7.4.
+- Fix: "Expr" ``%`` (modulo) in the SSE2/AVX2 JIT now gives the same result as the C path
+  (``fmodf``). Near multiples of the divisor the result was 0 or slightly negative instead of
+  almost the divisor (e.g. ``73 % 7.3``). Existed since ``%`` was added (r2574).
+- Fix: "Expr" ternary with a constant condition (e.g. ``0 a b ?``) and a variable store
+  (``A@``, ``A^``), ``dup`` or ``swap`` among its operands: the optimizer removed the wrong part,
+  giving a wrong result or a crash. E.g. ``0 7 sx A^ A ?`` returned 0 instead of ``sx``;
+  ``0 sx dup ?`` crashed. Such ternaries are no longer folded. Existed since the first Expr version.
+- Fix: "Expr" wrong results or crash (mostly x86) in the SSE2/AVX2 JIT under certain conditions: relative
+  pixel loads (``x[dx,dy]``) near the row edges with many values held on the stack (high register pressure).
+  A bug in the JIT code generator's register handling, existed in earlier versions as well.
 
 
 Optimizations
@@ -528,6 +546,9 @@ Optimizations
 - "TemporalSoften": AVX2 path for 8 and 10-16 bit (1.1-1.3x in average mode, 1.3-1.5x with
   thresholds).
 - "Blur", "Sharpen": new SSSE3 path for 8 bit; MMX paths removed.
+- "Expr": relative pixel load (``x[dx,dy]``): new AVX2 JIT version, ~2x faster on AVX2 CPUs
+  (an expression with relative pixels ran on the SSE2 JIT before). The SSE2 JIT no longer requires
+  SSSE3 (non-SSSE3 CPUs ran the whole expression in C) and is slightly quicker.
 
 Documentation
 ~~~~~~~~~~~~~
@@ -576,7 +597,7 @@ Documentation
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
 
-$Date: 2026/10/05 10:00:00 $
+$Date: 2026/10/15 08:40:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus
