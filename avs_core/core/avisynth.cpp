@@ -86,6 +86,8 @@
 #include <cassert>
 #include "MTGuard.h"
 #include "cache.h"
+#include "info.h" // BitmapFont, font cache
+#include <avs/filesystem.h>
 #include <clocale>
 #include <cmath>
 #include <limits>
@@ -646,7 +648,7 @@ static std::string NormalizeString(const std::string& str)
   // lowercase
   std::string ret = str;
   for (size_t i = 0; i < ret.size(); ++i)
-    ret[i] = tolower(ret[i]);
+    ret[i] = asciiToLower(ret[i]);
 
   // trim trailing spaces
   size_t endpos = ret.find_last_not_of(" \t");
@@ -885,15 +887,15 @@ public:
   int propNumElements(const AVSMap* map, const char* key) AVS_NOEXCEPT;
   char propGetType(const AVSMap* map, const char* key) AVS_NOEXCEPT;
   int propDeleteKey(AVSMap* map, const char* key) AVS_NOEXCEPT;
-  int64_t propGetInt(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
+  int64_t propGetInt(const AVSMap* map, const char* key, int index, int* error); // not noexcept: a failed read with NULL error throws
   int propGetIntSaturated(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
-  double propGetFloat(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
+  double propGetFloat(const AVSMap* map, const char* key, int index, int* error); // not noexcept: a failed read with NULL error throws
   float propGetFloatSaturated(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
-  const char* propGetData(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
-  int propGetDataSize(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
-  int propGetDataTypeHint(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
-  PClip propGetClip(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
-  const PVideoFrame propGetFrame(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT;
+  const char* propGetData(const AVSMap* map, const char* key, int index, int* error); // not noexcept: a failed read with NULL error throws
+  int propGetDataSize(const AVSMap* map, const char* key, int index, int* error); // not noexcept: a failed read with NULL error throws
+  int propGetDataTypeHint(const AVSMap* map, const char* key, int index, int* error); // not noexcept: a failed read with NULL error throws
+  PClip propGetClip(const AVSMap* map, const char* key, int index, int* error); // not noexcept: a failed read with NULL error throws
+  const PVideoFrame propGetFrame(const AVSMap* map, const char* key, int index, int* error); // not noexcept: a failed read with NULL error throws
   int propSetInt(AVSMap* map, const char* key, int64_t i, int append) AVS_NOEXCEPT;
   int propSetFloat(AVSMap* map, const char* key, double d, int append) AVS_NOEXCEPT;
   int propSetData(AVSMap* map, const char* key, const char* d, int length, int append) AVS_NOEXCEPT;
@@ -901,8 +903,8 @@ public:
   int propSetClip(AVSMap* map, const char* key, PClip& clip, int append) AVS_NOEXCEPT;
   int propSetFrame(AVSMap* map, const char* key, const PVideoFrame& frame, int append) AVS_NOEXCEPT;
 
-  const int64_t* propGetIntArray(const AVSMap* map, const char* key, int* error) AVS_NOEXCEPT;
-  const double* propGetFloatArray(const AVSMap* map, const char* key, int* error) AVS_NOEXCEPT;
+  const int64_t* propGetIntArray(const AVSMap* map, const char* key, int* error); // not noexcept: a failed read with NULL error throws
+  const double* propGetFloatArray(const AVSMap* map, const char* key, int* error); // not noexcept: a failed read with NULL error throws
   int propSetIntArray(AVSMap* map, const char* key, const int64_t* i, int size) AVS_NOEXCEPT;
   int propSetFloatArray(AVSMap* map, const char* key, const double* d, int size) AVS_NOEXCEPT;
 
@@ -929,6 +931,7 @@ public:
                                 const char* key, const AVSValue& value, int mode);
   const char* GetFilterProps();
   void SetFilterPropPassthrough(const char* filter);
+  std::shared_ptr<const BitmapFont> GetCachedBitmapFont(int size, const char* name, bool bold);
   MtMode GetFilterMTMode(const Function* filter, bool* is_forced) const;
   void ParallelJob(ThreadWorkerFuncPtr jobFunc, void* jobData, IJobCompletion* completion);
   IJobCompletion* NewCompletion(size_t capacity);
@@ -1169,6 +1172,18 @@ private:
     AVSValue param_match;    // the value to compare against (only used when param_name is non-empty)
   };
   std::unordered_map<std::string, std::vector<PropEntry>> FilterPropMap;
+
+  // Bitmap font cache: fonts are immutable after creation and shared by all filters of this environment.
+  // Key: name (or BDF file name), size, bold.
+  // Optional:
+  // A font loaded from a BDF file is loaded again when the file's modification time changed.
+  struct FontCacheEntry {
+    std::shared_ptr<const BitmapFont> font;
+    bool from_file;
+    fs::file_time_type file_time; // valid when from_file
+  };
+  std::unordered_map<std::string, FontCacheEntry> font_cache;
+  std::mutex font_cache_mutex;
   std::unordered_set<std::string> FilterPropPassthroughSet; // filters that need input-prop forwarding
 
   // Logging-related members
@@ -2170,6 +2185,11 @@ public:
     core->SetFilterPropPassthrough(filter);
   }
 
+  std::shared_ptr<const BitmapFont> __stdcall GetCachedBitmapFont(int size, const char* name, bool bold)
+  {
+    return core->GetCachedBitmapFont(size, name, bold);
+  }
+
   int __stdcall IncrImportDepth()
   {
     return ++DISPATCH(ImportDepth);
@@ -3079,7 +3099,7 @@ void ScriptEnvironment::SetMaxCPU(const char* features)
   const int len = (int)strlen(features);
   s.resize(len);
   for (int i = 0; i < len; i++)
-    s[i] = tolower(features[i]);
+    s[i] = asciiToLower(features[i]);
 
   int64_t cpu_flags = GetCPUFlagsEx();
 
@@ -3406,6 +3426,76 @@ void ScriptEnvironment::SetFilterPropPassthrough(const char* filter)
   FilterPropPassthroughSet.insert(NormalizeString(name_to_register));
 }
 
+std::shared_ptr<const BitmapFont> ScriptEnvironment::GetCachedBitmapFont(int size, const char* name, bool bold)
+{
+  // Assemble lookup key: name|size|b or name|size|n
+  const std::string key = std::string(name) + '|' + std::to_string(size) + (bold ? "|b" : "|n");
+  // Reload a BDF font when its file was modified during the life of this environment. Off: such a change
+  // is very unlikely, a script reload (a new environment) loads it again anyway; saves a file system call
+  // per cache hit. The check is kept for an eventual use.
+  constexpr bool check_file_change = false; // This is uber correct but really unneeded, and may slow down.
+
+  // modification time of the file; false if not available (e.g. the file was removed)
+  // a file system call, done only for external BDF fonts on a cache hit
+  // file_time_type is kept as is, its representation is library dependent (e.g. 128 bit in libc++)
+  // Note: the resolution can be 1 second (e.g. libstdc++ on Windows), a change within the same second is not seen.
+  auto get_file_time = [name](fs::file_time_type& ftime) -> bool {
+    std::error_code ec;
+    ftime = fs::last_write_time(fs::path(name), ec);
+    return !ec;
+  };
+
+  std::lock_guard<std::mutex> lock(font_cache_mutex);
+  auto it = font_cache.find(key);
+  if (it != font_cache.end()) {
+    fs::file_time_type ftime;
+    // optional file change check
+    if (!check_file_change || !it->second.from_file || (get_file_time(ftime) && ftime == it->second.file_time))
+      return it->second.font;
+    // BDF file modified, removed or replaced: drop the stale entry, load again (fails like uncached loading
+    // would). Existing filters keep their own reference to the old font.
+    font_cache.erase(it);
+  }
+  std::shared_ptr<const BitmapFont> font = CreateBitmapFont(size, name, bold, false);
+  if (font) { // not found: not cached, a BDF file may appear later
+    // built-in fonts are found first by name, a file is used only when no built-in font matched
+    FontCacheEntry entry{ font, font->IsFromFile(), fs::file_time_type() };
+    if (check_file_change && entry.from_file && !get_file_time(entry.file_time))
+      entry.from_file = false; // no file time: no reload check
+    font_cache[key] = entry;
+  }
+  return font;
+}
+
+// JSON string literal: quotes, backslash and control characters escaped (UTF-8 bytes are kept)
+static std::string JsonString(const char* s)
+{
+  std::string r = "\"";
+  for (const char* p = s; *p; p++) {
+    const unsigned char c = static_cast<unsigned char>(*p);
+    if (c == '"') r += "\\\"";
+    else if (c == '\\') r += "\\\\";
+    else if (c == '\n') r += "\\n";
+    else if (c == '\r') r += "\\r";
+    else if (c == '\t') r += "\\t";
+    else if (c < 0x20) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "\\u%04x", c);
+      r += buf;
+    }
+    else r += static_cast<char>(c);
+  }
+  return r + "\"";
+}
+
+// JSON number of a floating point value, shortest exact form; nan and inf are not valid JSON numbers: null
+static std::string JsonNumber(const AVSValue& v)
+{
+  if (!std::isfinite(v.AsFloat()))
+    return "null";
+  return v.IsFloatfStrict() ? float_to_string(v.AsFloatf()) : double_to_string(v.AsFloat());
+}
+
 const char* ScriptEnvironment::GetFilterProps()
 {
   std::string json = "[\n";
@@ -3414,14 +3504,14 @@ const char* ScriptEnvironment::GetFilterProps()
     for (const auto& entry : kv.second) {
       if (!first) json += ",\n";
       first = false;
-      json += "  {\"filter\":\"" + kv.first + "\",\"key\":\"" + entry.key + "\"";
+      json += "  {\"filter\":" + JsonString(kv.first.c_str()) + ",\"key\":" + JsonString(entry.key.c_str());
       if (!entry.param_name.empty()) {
-        json += ",\"when_param\":\"" + entry.param_name + "\",\"when_value\":";
+        json += ",\"when_param\":" + JsonString(entry.param_name.c_str()) + ",\"when_value\":";
         // param_match can be a scalar or an alias array
         auto serializeScalar = [&](const AVSValue& v) -> std::string {
-          if (v.IsString()) return "\"" + std::string(v.AsString()) + "\"";
+          if (v.IsString()) return JsonString(v.AsString());
           if (v.IsInt())    return std::to_string(v.AsLong());
-          if (v.IsFloat())  return double_to_string(v.AsFloat());
+          if (v.IsFloat())  return JsonNumber(v);
           if (v.IsBool())   return v.AsBool() ? "true" : "false";
           return "null";
         };
@@ -3445,17 +3535,9 @@ const char* ScriptEnvironment::GetFilterProps()
         // bool values are converted to int at registration; this branch is a safety net
         json += "\"type\":\"int\",\"value\":" + std::to_string(entry.value.AsBool() ? 1 : 0);
       } else if (entry.value.IsFloat()) {
-        json += "\"type\":\"float\",\"value\":" + double_to_string(entry.value.AsFloat());
+        json += "\"type\":\"float\",\"value\":" + JsonNumber(entry.value);
       } else if (entry.value.IsString()) {
-        std::string escaped;
-        for (unsigned char c : std::string(entry.value.AsString())) {
-          if      (c == '"')  escaped += "\\\"";
-          else if (c == '\\') escaped += "\\\\";
-          else if (c == '\n') escaped += "\\n";
-          else if (c == '\r') escaped += "\\r";
-          else                escaped += c;
-        }
-        json += "\"type\":\"string\",\"value\":\"" + escaped + "\"";
+        json += "\"type\":\"string\",\"value\":" + JsonString(entry.value.AsString());
       } else if (!entry.value.Defined()) {
         json += "\"type\":\"capture\",\"value\":null"; // undefined(): capture from named call arg
       } else {
@@ -6029,7 +6111,10 @@ int ScriptEnvironment::propDeleteKey(AVSMap* map, const char* key) AVS_NOEXCEPT 
   return map->erase(key);
 }
 
-static VSArrayBase* propGetShared(const AVSMap* map, const char* key, int index, int* error, AVSPropertyType propType, ScriptEnvironment *env) noexcept {
+// Failed read: reports through *error; with NULL error it throws AvisynthError (VapourSynth: fatal error).
+// Not noexcept, nor are the propGetXXX callers passing the caller's error, so the exception reaches
+// the plugin (C API: avs_get_error) instead of std::terminate.
+static VSArrayBase* propGetShared(const AVSMap* map, const char* key, int index, int* error, AVSPropertyType propType, ScriptEnvironment *env) {
   assert(map && key && index >= 0);
 
   if (error)
@@ -6072,7 +6157,7 @@ static VSArrayBase* propGetShared(const AVSMap* map, const char* key, int index,
   return arr;
 }
 
-int64_t ScriptEnvironment::propGetInt(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT {
+int64_t ScriptEnvironment::propGetInt(const AVSMap* map, const char* key, int index, int* error) {
   VSArrayBase* arr = propGetShared(map, key, index, error, AVSPropertyType::PROPERTYTYPE_INT, this); //  ptInt
   if (arr)
     return reinterpret_cast<const VSIntArray*>(arr)->at(index);
@@ -6100,7 +6185,7 @@ int ScriptEnvironment::propGetIntSaturated(const AVSMap* map, const char* key, i
   return static_cast<int>(value);
 }
 
-double ScriptEnvironment::propGetFloat(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT {
+double ScriptEnvironment::propGetFloat(const AVSMap* map, const char* key, int index, int* error) {
   VSArrayBase* arr = propGetShared(map, key, index, error, AVSPropertyType::PROPERTYTYPE_FLOAT, this); // ptFloat
   if (arr)
     return reinterpret_cast<const VSFloatArray*>(arr)->at(index);
@@ -6131,7 +6216,7 @@ float ScriptEnvironment::propGetFloatSaturated(const AVSMap* map, const char* ke
   return static_cast<float>(value);
 }
 
-const char* ScriptEnvironment::propGetData(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT {
+const char* ScriptEnvironment::propGetData(const AVSMap* map, const char* key, int index, int* error) {
   VSArrayBase* arr = propGetShared(map, key, index, error, AVSPropertyType::PROPERTYTYPE_DATA, this); // ptData
   if (arr)
     return reinterpret_cast<const VSDataArray*>(arr)->at(index).data.c_str();
@@ -6139,7 +6224,7 @@ const char* ScriptEnvironment::propGetData(const AVSMap* map, const char* key, i
     return nullptr;
 }
 
-int ScriptEnvironment::propGetDataSize(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT {
+int ScriptEnvironment::propGetDataSize(const AVSMap* map, const char* key, int index, int* error) {
   VSArrayBase* arr = propGetShared(map, key, index, error, AVSPropertyType::PROPERTYTYPE_DATA, this); // ptData
   if (arr)
     return static_cast<int>(reinterpret_cast<const VSDataArray*>(arr)->at(index).data.size());
@@ -6147,7 +6232,7 @@ int ScriptEnvironment::propGetDataSize(const AVSMap* map, const char* key, int i
     return -1;
 }
 
-int ScriptEnvironment::propGetDataTypeHint(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT {
+int ScriptEnvironment::propGetDataTypeHint(const AVSMap* map, const char* key, int index, int* error) {
   VSArrayBase* arr = propGetShared(map, key, index, error, AVSPropertyType::PROPERTYTYPE_DATA, this); // ptData
   if (arr)
     return reinterpret_cast<const VSDataArray*>(arr)->at(index).typeHint;
@@ -6155,9 +6240,9 @@ int ScriptEnvironment::propGetDataTypeHint(const AVSMap* map, const char* key, i
     return AVSPropDataTypeHint::PROPDATATYPEHINT_UNKNOWN; // dtUnknown;
 }
 
-PClip ScriptEnvironment::propGetClip(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT {
-  int dummyError;
-  VSArrayBase* arr = propGetShared(map, key, index, &dummyError, AVSPropertyType::PROPERTYTYPE_CLIP, this); // ptVideoNode
+PClip ScriptEnvironment::propGetClip(const AVSMap* map, const char* key, int index, int* error) {
+  // single lookup: no VapourSynth-like dummy error, AVS has no separate audio node
+  VSArrayBase* arr = propGetShared(map, key, index, error, AVSPropertyType::PROPERTYTYPE_CLIP, this); // ptVideoNode
   if (arr) {
     // PClip itself is reference counted
     PClip ref = reinterpret_cast<VSVideoNodeArray*>(arr)->at(index);
@@ -6169,10 +6254,10 @@ PClip ScriptEnvironment::propGetClip(const AVSMap* map, const char* key, int ind
   }
 }
 
-const PVideoFrame ScriptEnvironment::propGetFrame(const AVSMap* map, const char* key, int index, int* error) AVS_NOEXCEPT {
+const PVideoFrame ScriptEnvironment::propGetFrame(const AVSMap* map, const char* key, int index, int* error) {
   // PVideoFrame itself is reference counted
-  int dummyError;
-  VSArrayBase* arr = propGetShared(map, key, index, &dummyError, AVSPropertyType::PROPERTYTYPE_FRAME, this); //  ptVideoFrame
+  // single lookup: no VapourSynth-like dummy error, AVS has no separate audio frame
+  VSArrayBase* arr = propGetShared(map, key, index, error, AVSPropertyType::PROPERTYTYPE_FRAME, this); //  ptVideoFrame
   if (arr) {
     PVideoFrame ref = reinterpret_cast<VSVideoFrameArray*>(arr)->at(index);
     return ref;
@@ -6181,14 +6266,6 @@ const PVideoFrame ScriptEnvironment::propGetFrame(const AVSMap* map, const char*
     // no separate audio frame in AVS
     return nullptr;
   }
-}
-
-static inline bool isAlphaUnderscore(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-}
-
-static inline bool isAlphaNumUnderscore(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
 }
 
 static bool isValidVSMapKey(const std::string& s) {
@@ -6317,7 +6394,7 @@ int ScriptEnvironment::propSetFrame(AVSMap* map, const char* key, const PVideoFr
   return !propSetShared<PVideoFrame, AVSPropertyType::PROPERTYTYPE_FRAME>(map, key, frame, append, this); // ptVideoFrame
 }
 
-const int64_t* ScriptEnvironment::propGetIntArray(const AVSMap* map, const char* key, int* error) AVS_NOEXCEPT {
+const int64_t* ScriptEnvironment::propGetIntArray(const AVSMap* map, const char* key, int* error) {
   const VSArrayBase* arr = propGetShared(map, key, 0, error, AVSPropertyType::PROPERTYTYPE_INT, this);
   if (arr) {
     return reinterpret_cast<const VSIntArray*>(arr)->getDataPointer();
@@ -6327,7 +6404,7 @@ const int64_t* ScriptEnvironment::propGetIntArray(const AVSMap* map, const char*
   }
 }
 
-const double* ScriptEnvironment::propGetFloatArray(const AVSMap* map, const char* key, int* error) AVS_NOEXCEPT {
+const double* ScriptEnvironment::propGetFloatArray(const AVSMap* map, const char* key, int* error) {
   const VSArrayBase* arr = propGetShared(map, key, 0, error, AVSPropertyType::PROPERTYTYPE_FLOAT, this);
   if (arr) {
     return reinterpret_cast<const VSFloatArray*>(arr)->getDataPointer();

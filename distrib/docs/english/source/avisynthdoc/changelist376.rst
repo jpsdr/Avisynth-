@@ -43,7 +43,8 @@ Additions, changes
   * ``SetFilterPropPassthrough`` — compatibility shim for old filters that predate frame-property
     support (e.g. ``ColorMatrix``).  Copies all input frame properties to the filter's output;
     self-healing: becomes a no-op per frame once the plugin is updated to use ``NewVideoFrameP``.
-  * ``GetFilterProps`` — returns the registered rule table as a JSON string for diagnostics.
+  * ``GetFilterProps`` — returns the registered rule table as a JSON string for diagnostics
+    (valid JSON: escaped strings, NaN and infinity as ``null``).
 
   Addresses `issue #393 <https://github.com/AviSynth/AviSynthPlus/issues/393>`_ and more.
   See :doc:`SetFilterProp <./corefilters/setfilterprop>`.
@@ -223,6 +224,39 @@ Additions, changes
 - "TemporalSoften" 10-16 bit: the average is rounded half up in all (C/SSE/AVX2) paths, which give
   identical results; differs from earlier versions by 1 only on exact .5 averages (when
   ``scenechange`` left an even number of frames).
+- ``Spline``: calculation and result in 64 bit double (were 32 bit float), e.g.
+  ``Spline(0.1, 0, 0, 1, 1, false)`` equals 0.1. Slight output change in the last digits.
+- Script: floating point constants in scientific notation, e.g. ``1.5e-5``, ``2E+3``, ``.5e1``.
+  A number with an exponent is always floating point (``2e3`` is 2000.0).
+- ``Format``: floating point values are inserted with the shortest representation which reads back to
+  exactly the same value, like Python's ``repr()`` (e.g. ``1.5``, ``1.0``, ``1e-07``, ``1.5259021896696422e-05``),
+  instead of 6 fixed decimals (``1.500000``, ``0.000000``). The old output made the usual use case,
+  building an expression like ``Expr(Format("x {a} *"))``, silently inaccurate or plain wrong: ``1.0/65535``
+  became ``0.000015`` (1.7% off), any value below 5e-7 became ``0``. Expressions built with ``Format``
+  (``Eval``, ``Expr``) now keep the full precision. For a fixed number of decimals use ``String(x, "%.2f")``.
+- ``String(x, format)``: the value is passed according to the conversion letter: integer conversions
+  ``d i u o x X`` (e.g. ``String(255, "%x")`` = 'ff', 64 bit longs exact) besides the floating point ones
+  ``f F e E g G a A``; a floating point value with an integer conversion is truncated like ``Int``.
+  C type size prefixes (``h l ll L I64``, e.g. ``%lf``, ``%lld``) are ignored, the value's own type decides:
+  64 bit integer support with the same format string on any compiler and OS (no ``%lld``/``%I64d``
+  needed). Exactly one conversion is allowed, an invalid format string is an error.
+  Was: the value was always passed as float, so integer conversions printed garbage
+  (``String(5, "%d")`` = '0'), and ``%s``, ``%n``, ``%Lf`` crashed.
+- ``Format``: optional format specification for numbers after a colon, e.g. ``{:.2f}``, ``{0:x}``,
+  ``{name:05d}``, ``{my_variable:.8f}``: a single printf-like numeric conversion, the leading ``%`` is
+  optional. Handled the same way as ``String(x, format_string)`` (integer conversions, 64 bit, no C type
+  size prefixes needed).
+- New script function ``Hex64(int [, int width])``: 64 bit version of ``Hex`` (pair of ``HexValue64``),
+  e.g. ``Hex64(-1)`` = "FFFFFFFFFFFFFFFF", ``Hex64(4294967297)`` = "100000001". Width is 0 to 16.
+  ``Hex`` documentation corrected: it is 32 bit, width 0 to 8.
+- ``propShow``: floating point property values in the same shortest exact form as ``Format`` (e.g. ``0.1``,
+  ``1e-07``), instead of 6 fixed decimals (``0.100000``, ``0.000000``).
+- "Expr": relative pixel load border modes: ``x[dx,dy]:c`` (clamp, clone the edge pixel; default,
+  same as without suffix), ``x[dx,dy]:m`` (mirror, edge pixel repeated; akarin.Expr compatible),
+  ``x[dx,dy]:r`` (mirror without repeating the edge pixel, like OpenCV ``BORDER_REFLECT_101``),
+  ``k x[dx,dy]:k`` (constant filler ``k`` from the stack, must be constant, e.g. ``range_half``;
+  like OpenCV ``BORDER_CONSTANT``) and ``x[dx,dy]:w`` (wrap around, like OpenCV ``BORDER_WRAP``).
+  All modes are JIT optimized (SSE2, AVX2).
 
 
 Build environment, Interface
@@ -236,6 +270,23 @@ Build environment, Interface
   * ``AVS_CACHE_USER_FORWARD_BEGIN`` .. ``AVS_CACHE_USER_FORWARD_END`` (C)
 
   See :ref:`SetCacheHints<cplusplus_setcachehints>` .
+- v14 interface: C API additions; C++ ``AVSValue::AsFunction`` exported.
+
+  * C++: ``AVSValue::AsFunction`` (was internal), for calling function values with ``Invoke3``, ``Invoke3Try``
+  * Function values: ``avs_val_is_function``, ``avs_invoke3``, ``avs_invoke3_try`` (like C++ ``Invoke3``, ``Invoke3Try``)
+  * ``avs_invoke_try``, ``avs_invoke2``, ``avs_invoke2_try`` (like C++ ``InvokeTry``, ``Invoke2``, ``Invoke2Try``)
+  * ``avs_val_get_type`` and ``AVS_VALUE_TYPE_xxx`` constants (like C++ ``AVSValue::GetType``, ``AvsValueType``)
+  * ``avs_create_map``, ``avs_free_map``: standalone property map (like C++ ``createMap``, ``freeMap``)
+  * ``avs_apply_message``: write a UTF-8 text message onto a frame (like C++ ``ApplyMessageEx`` with utf8=true)
+  * ``AVS_CS_RGBP8``, ``AVS_CS_RGBAP8`` aliases
+
+  See :ref:`API v14 changes<api_v14_whats_new>` for more details.
+- Fix: avisynth_c.h dynamic loader (``AVSC_NO_DECLSPEC``, ``avs_load_library``): the deprecated
+  ``avs_is_yuv444p16`` .. ``avs_is_y32`` entries (8 functions) were never loaded and contained garbage
+  (the struct was not zero filled); a failed load did not free the DLL. The header now includes
+  ``<windows.h>`` and ``<stdlib.h>`` itself for the loader. Existed since r2487.
+- avisynth.h: ``CS_xxx_CHROMA_PLACEMENT`` (C++ ``AvsChromaPlacement``) marked deprecated: never implemented,
+  use the ``_ChromaLocation`` frame property.
 - introduce ``AVS_RESTRICT`` to ``avs/config.h`` (compiler invariant c++ ``__restrict``)
 - AVX512: CMake to recognize ``*_avx512b.*`` and ``*_avx512.*`` file pattern, add compiler specific AVX512 
   compile flags accordingly (AVX512 Base and Ice Lake extensions)
@@ -296,13 +347,24 @@ Build environment, Interface
   Plus: wrap min/max/clamp in an anonymous namespace to prevent a theoretical translation unit mismatch across archs
   (e.g. when SSE2/AVX2/AVX512 specific ``.cpp`` files are built with different per-file compiler flags). 
   Part of our public headers, but no interface change was done.
-
-- "Expr": relative pixel load border modes: ``x[dx,dy]:c`` (clamp, clone the edge pixel; default,
-  same as without suffix), ``x[dx,dy]:m`` (mirror, edge pixel repeated; akarin.Expr compatible),
-  ``x[dx,dy]:r`` (mirror without repeating the edge pixel, like OpenCV ``BORDER_REFLECT_101``),
-  ``k x[dx,dy]:k`` (constant filler ``k`` from the stack, must be constant, e.g. ``range_half``;
-  like OpenCV ``BORDER_CONSTANT``) and ``x[dx,dy]:w`` (wrap around, like OpenCV ``BORDER_WRAP``).
-  All modes are JIT optimized (SSE2, AVX2).
+- Script parser, internal code correctness (no change in behavior, except the error message): the
+  identifier, number and name checks use ASCII-only tests instead of the C runtime character
+  classification functions, which are undefined for bytes >= 0x80 (UTF-8, or an ANSI code page national
+  character) and assert in debug builds. A non-ASCII character outside strings and comments now gives
+  an error showing its byte value.
+- Internal code correctness (no change in behavior): the same ASCII-only tests for other text parameters
+  and files: pixel type names, ``CombinePlanes`` plane strings, ``Expr`` ``scale_inputs``, ``ShowSMPTE``
+  ``offset``, ``AviSource`` fourCC, ``ConditionalReader`` files, ``SetMaxCPU``, ``SetFilterMTMode`` filter
+  names, ``Text`` font names, variable name hashing.
+- Internal code correctness (no change in behavior): 64 bit integer ``+``, ``-``, ``*``, unary minus
+  and ``Abs`` wrap around on overflow in a defined way (two's complement, computed as unsigned), instead
+  of relying on signed overflow, which is undefined behavior in C++. E.g. ``9223372036854775807 + 1``
+  is still -9223372036854775808.
+- Internal code correctness (no change in behavior): bit shift functions (``BitLShift``, ``BitRShiftL``,
+  ``BitRShiftA``, ``BitShl64``, ``BitShr64``, ``BitSar64`` and synonyms) and bit index functions (``BitSet``,
+  ``BitClr``, ``BitChg``, ``BitTst`` and 64 bit versions) take the count modulo the bit width (0..31, 0..63),
+  as x86 did at runtime anyway; a count out of range was undefined behavior in C++, as was a signed left
+  shift into the sign bit. Documented.
 
 Bugfixes
 ~~~~~~~~
@@ -460,6 +522,67 @@ Bugfixes
 - Fix #495 (debug builds only): ``VideoFrame::CheckMemory()`` ignored the allocation margin and
   reported a buffer overrun for every frame.
 - Fix #495 POSIX debug builds failed to compile (now forwards the error to ``stderr``).
+- Fix: runtime functions ``AverageLuma`` (and the other ``Average*``), ``LumaDifference`` (and the other
+  ``*Difference*`` functions) and ``PlaneMinMaxStats`` returned 32 bit float, so e.g. ``AverageLuma() < 2.6``
+  was true for an average of exactly 2.6 (script constants are 64 bit double). Now these computed results
+  are 64 bit double; the min and max of a 32 bit float clip stay 32 bit float pixel values. Existed since 3.7.4.
+- Fix: script floating point constants with many digits were parsed inexactly (e.g. ``3.14159265358979324``
+  gave 3.1415926535897927 instead of 3.1415926535897931); now they are parsed correctly rounded.
+  Existed since classic Avisynth.
+- Fix: ``Format`` with a large floating point value (e.g. ``Format("{}", 1e308)``) overflowed an internal
+  buffer and could crash. Existed since 3.6.0 (``Format`` was added).
+- Fix: ``String`` (without format string) with a large floating point value (e.g. ``String(1e308)``)
+  overflowed an internal buffer and could crash. Existed since classic Avisynth.
+- Fix: ``for`` loop with a limit near the end of the 64 bit range (e.g.
+  ``for (i = 9223372036854775805, 9223372036854775807, 5)``) never ended: the loop variable overflowed
+  and wrapped around to a value within the limit again. Now the loop ends. Existed since ``for`` was
+  added (before 3.7.4 with a limit near 2147483647, when the loop variable was 32 bit).
+- Fix: text rendering with bitmap fonts (``Text``, ``Info``, ``propShow``...) on invalid UTF-8: an incomplete
+  sequence at the end of the text was read past the end of the string, and a valid character following
+  an invalid byte was swallowed. Existed since 3.7.4.
+- Fix: external BDF fonts: characters above U+FFFF (e.g. emoji, unifont upper planes) were not displayed,
+  their codepoint was cut to 16 bits, so their glyph appeared for a wrong character instead (U+1F600 for
+  U+F600). Unencoded glyphs (``ENCODING -1``) are ignored. Existed since 3.5.1.
+- Fix: ``Floor``, ``Ceil``, ``Round``, ``Int``, ``IntI``, ``Long``: values out of the 64 bit integer range,
+  NaN and infinity returned garbage; now they are a script error. ``IntI`` of a floating-point value
+  outside the 32 bit range wraps around like for integers. Existed since classic Avisynth.
+- Fix: ``Round`` was inexact for values just below 0.5 and for odd values above 2^52; halves are still
+  rounded away from zero. ``Floor``, ``Ceil``, ``Round`` return an integer argument unchanged (lost precision
+  above 2^53). Existed since classic Avisynth (the integer argument case since 3.7.4).
+- Fix: script integer division and modulo of the smallest 64 bit integer by -1 froze or crashed the
+  host process. Now ``/`` throws an "integer overflow in division" error, ``%`` returns 0.
+  Existed since classic Avisynth (before 3.7.4 with the smallest 32 bit integer).
+- Fix: ``PlaneMinMaxStats`` on 32 bit float clips with threshold 0: the thresholded minimum and maximum
+  (elements 2 and 3) were wrong; now they equal the minimum and maximum, like for integer clips.
+  Existed since 3.7.3.
+- Fix: ``ConditionalReader`` ``Type float`` stored and returned 32 bit float values, so e.g. a value 0.7 read
+  from the file was not equal to the script constant 0.7 (64 bit double). Now the values are 64 bit double.
+  Existed since 3.7.4.
+- Fix: ``Frac`` returned 32 bit float for any (also 64 bit double) argument; now the result is 64 bit double,
+  32 bit float only for a 32 bit float argument. Existed since 3.7.4.
+  Values beyond the 64 bit integer range returned garbage instead of 0 (existed since classic Avisynth).
+- Fix: script comparison operators (``==``, ``!=``, ``<``, ``>``, ``<=``, ``>=``) of a 32 bit float and a
+  64 bit double compared in double, e.g. ``Floatf(2.6) == 2.6`` was false and ``Floatf(2.6) < 2.6`` was true;
+  for values rounded up in float, ``Floatf(0.1) > 0.1`` was true.
+  Now when either side is a 32 bit float (e.g. a plugin returning a 32 bit float), both are compared in
+  32 bit float precision, like before 3.7.4. Existed since 3.7.4.
+- Fix: ``ConditionalFilter`` compared integers truncated to 32 bit (e.g. ``4294967297 == 1`` was true) and
+  floats rounded to 32 bit float (e.g. ``16777217.0 == 16777216.0`` was true). Now integers are compared
+  in 64 bit and floats in double precision; when either side is a 32 bit float, both sides are
+  rounded to float as before. ``ConditionalSelect``: a 64 bit index out of the 32 bit range selected a
+  wrong clip instead of the default one. Existed since 3.7.4.
+- Fix: ``propGetAll``: string array properties returned only their first element; now the value is
+  an array, like for integer, float and clip arrays. Existed since 3.6.0.
+- Fix: ``propGetAsArray`` on a frame type property (set by plugins) returned an array of ``true`` values;
+  now it throws an error, like ``propGetAny``. Existed since 3.6.0.
+- Fix: ``propGetXXX`` (C++ and C API) with a NULL ``error`` parameter terminated the process on a failed
+  read (missing key, wrong type, index): now it throws ``AvisynthError`` (C API: returns, the reason is
+  in ``avs_get_error``). ``propGetClip`` and ``propGetFrame`` behave the same way. Existed since 3.6.0.
+- Fix: C API ``avs_prop_get_clip`` crashed on the first use of the returned clip
+  (returned a raw clip pointer instead of an ``AVS_Clip``). Existed since 3.6.0.
+- Fix: ``propGetClip``, ``propGetFrame`` (C++ and C API) did not report errors (missing key, wrong type,
+  index), ``*error`` was always 0. Script ``propGetClip`` now reports these errors like the other
+  ``propGetXXX`` functions, instead of returning an empty clip value. Regression since 3.7.4.
 - Fix #523: C++ API (``AVS_Linkage``), V13 test build regression: the new V13 ``VideoInfo`` entries
   shifted ``GetNeoEnv`` (plugins using ``PNeoEnv`` crashed); the original layout is restored.
   The linkage call macros now also check entries for null, so plugins built with the V13 header
@@ -557,6 +680,10 @@ Optimizations
 - "Expr": relative pixel load (``x[dx,dy]``): new AVX2 JIT version, ~2x faster on AVX2 CPUs
   (an expression with relative pixels ran on the SSE2 JIT before). The SSE2 JIT no longer requires
   SSSE3 (non-SSSE3 CPUs ran the whole expression in C) and is slightly quicker.
+- Bitmap fonts (``Text``, ``propShow``, ``Info``, ``ShowFrameNumber``, ``ApplyMessage`` and others) are created once per
+  ScriptEnvironment and shared, instead of building (or loading from a BDF file) a separate copy for each filter
+  instance and each runtime call. E.g. ``propShow`` 166 -> 52 microseconds per frame, ``ScriptClip`` with ``Text``
+  154 -> 37, ``Histogram("audiolevels")`` 231 -> 73, ``Text`` with a BDF font in ``ScriptClip`` 244 -> 35.
 
 Documentation
 ~~~~~~~~~~~~~
@@ -605,7 +732,7 @@ Documentation
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
 
-$Date: 2026/10/19 10:00:00 $
+$Date: 2026/10/20 17:15:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus

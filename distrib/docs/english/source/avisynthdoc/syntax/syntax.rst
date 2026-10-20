@@ -348,6 +348,9 @@ quotation mark.
   optional + or -. For example, +1. is treated as a floating-point number.
   Since 3.7.4 64-bit double is supported. In general 'float' covers
   any 32 or 64-bit floating point number.
+  Since 3.7.6 scientific notation is accepted as well: ``e`` or ``E``, an optional
+  + or - sign and the exponent digits, e.g. ``1.5e-5``, ``2E+3`` or ``.5e1``.
+  A number with an exponent is always floating point: ``2e3`` is 2000.0.
 - *val*: as type of a function argument where it does not matter if it is int or
   float
 - *bool*: can be TRUE or FALSE
@@ -446,6 +449,12 @@ Otherwise the result is stored into 64-bit long ``l``.
 When both operands are 32-bit float, arithmetic is done in 32-bits and the result is a 32-bit float.
 Otherwise the calculation is done in 64-bit double ``d`` precision.
 
+Comparisons (``==``, ``!=``, ``<``, ``>``, ``<=``, ``>=``) of two integers are done in 64-bit precision.
+When either operand is a 32-bit float, the comparison is done in 32-bit float precision: the 64-bit
+value is rounded to float first, so e.g. ``Floatf(2.6) == 2.6`` is true and ``Floatf(2.6) < 2.6``
+is false (since 3.7.6). Values outside the 32-bit float range are not rounded (they would become infinity).
+Otherwise the comparison is done in 64-bit double precision.
+
 | For string type:
 | ``+`` add
 | ``>=`` greater or equal than (case-insensitive)
@@ -479,10 +488,10 @@ Numerical functions
 ~~~~~~~~~~~~~~~~~~~
 
 Except ``MulDiv``, ``Rand`` and ``Spline`` the calculations are 64-bit (int or double) compatible.
-``HexValue`` has a special ``HexValue64`` variant.
+``HexValue`` and ``Hex`` have special 64 bit variants: ``HexValue64`` and ``Hex64``.
 
 See :doc:`AviSynth Syntax - Numeric functions <syntax_internal_functions_numeric>`, and
-:doc:`AviSynth Syntax - Numeric functions <syntax_internal_functions_conversion>`.
+:doc:`AviSynth Syntax - Type conversion functions <syntax_internal_functions_conversion>`.
 
 
 +----------------------------------------------------------+---------------------------------------------+
@@ -649,28 +658,15 @@ String functions
 Conversions
 ~~~~~~~~~~~
 
-+---------------------------------------------------------------+-------------------------------------------------------------------+
-| ``Value(string)``: Returns the value of an string.            | ``Value`` ( "-2.7" ) = -2.7                                       |
-+---------------------------------------------------------------+-------------------------------------------------------------------+
-| ``String(float / int / string, format_string)``:              || e.g. ``Subtitle`` ("Clip height is " + ``String`` (last.height) )|
-|   converts a number to a string. If the variable is           || ``String`` (1.23, "%f") = '1.23'                                 |
-|   float or integer, it converts it to a float and             || ``String`` (1.23, "%5.1f") = ' 1.2'                              |
-|   uses the format_string to convert it to a string.           || ``String`` (1.23, "%1.3f") = '1.230'                             |
-|                                                               |                                                                   |
-|   The syntax of the format_string is as follows:              |                                                                   |
-|                                                               |                                                                   |
-|   %[flags][width][.precision]f                                |                                                                   |
-|                                                               |                                                                   |
-||     width: the minimum width (the string is never truncated) |                                                                   |
-||     precision: the number of digits printed                  |                                                                   |
-||     flags:                                                   |                                                                   |
-||       ``-`` left align (instead right align)                 |                                                                   |
-||       ``+`` always print the +/- sign                        |                                                                   |
-||       ``0`` padding with leading zeros                       |                                                                   |
-||       ``' '`` print a blank instead of a "+"                 |                                                                   |
-||       ``#`` always print the decimal point                   |                                                                   |
-|                                                               |                                                                   |
-+---------------------------------------------------------------+-------------------------------------------------------------------+
+| ``Value(string)``, ``HexValue(string)``, ``HexValue64(string)``: string to number.
+| ``String(value [, format_string])``: number (or bool) to string, with an optional printf-like
+  format, e.g. ``String(1.23, "%5.1f")`` = ' 1.2', ``String(255, "%x")`` = 'ff'.
+| ``Hex(int [, width])``, ``Hex64(int [, width])``: integer to hexadecimal string, 32 or 64 bit.
+| ``Format(format_string, value1, ...)``: values inserted into a string, e.g.
+  ``Format("{} x {}", Width, Height)`` = '640 x 480'.
+
+See :doc:`AviSynth Syntax - Type conversion functions <syntax_internal_functions_conversion>` and
+:doc:`AviSynth Syntax - String functions <syntax_internal_functions_string>` (``Format``).
 
 Version checking functions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1115,6 +1111,9 @@ Changelog
 +----------------+------------------------------------------------------------+
 | Version        | Changes                                                    |
 +================+============================================================+
+| Avisynth 3.7.6 | | Floating point constants in scientific notation          |
+|                | | Add Hex64 function                                       |
++----------------+------------------------------------------------------------+
 | Avisynth 3.7.4 | | Added 64-bit types, integer long, floating point double  |
 |                | | Add "L" suffixed hexadecimal notation                    |
 |                | | Add HexValue64 function                                  |

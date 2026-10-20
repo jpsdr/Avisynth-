@@ -1237,6 +1237,9 @@ ApplyMessage writes text on a frame. For example:
 
 With ApplyMessageEx you can use UTF-8 encoded strings on Windows ANSI code pages. On Posix, or on Windows set to "utf8 (beta)" everything is UTF-8 already.
 
+C interface (v14): ``avs_apply_message``. Its message is always UTF-8 encoded, as there is no need
+for the C interface to carry over the legacy code page handling.
+
 
 .. _cplusplus_getavslinkage:
 
@@ -1382,6 +1385,13 @@ propGetInt, v8
 
 get property value as integer (int64).
 You can pass nullptr to error, but if given, the following error codes are set (0 = O.K.)
+
+With ``error`` = nullptr a failed read (missing key, wrong type, index out of range, map with error set)
+throws ``AvisynthError``, so pass nullptr only for properties known to exist.
+(VapourSynth API4 dies with a fatal error in this case.) The same applies to all ``propGetXXX``
+functions taking an ``error`` parameter, except the ``Saturated`` ones, which never throw.
+Before 3.7.6 the throw happened inside a ``noexcept`` function and terminated the process;
+``propGetClip`` and ``propGetFrame`` (3.7.4 and 3.7.5) neither threw nor set ``*error``.
 Though AVSValue in Avisynth does not support int64_t (as of December 2021), you can freely
 use int64_t frame property values in plugins. Internally there is no special 32 bit integer
 version, only 64 bit integer exists.
@@ -1674,7 +1684,14 @@ createMap, v8
 
     virtual AVSMap* __stdcall createMap() = 0;
 
-internal use only, creating frame property buffer.
+Creates a standalone, empty property map, not attached to a frame. Use it with the ``propXxx``
+functions, e.g. as a temporary key-value store; free it with ``freeMap``.
+C interface (v14): ``avs_create_map``.
+
+A map is the same container as the frame properties, modelled after VapourSynth's ``VSMap``:
+each key holds an array of values of one type (``int64_t``, ``double``, data (string or binary),
+``PClip`` or ``PVideoFrame``); a single value is a one-element array. Unlike ``AVSValue`` arrays,
+these arrays are flat: no nesting, no mixed types, no map inside a map, and no function type.
 
 
 .. _cplusplus_freemap:
@@ -1686,7 +1703,9 @@ freeMap, v8
 
     virtual void __stdcall freeMap(AVSMap* map) = 0;
 
-internal use only, frees up frame property buffer.
+Frees a map created by ``createMap``, with its content (clip and frame references stored in it
+are released). Do not call it on a frame's map (``getFramePropsRO``, ``getFramePropsRW``), that one
+is owned by the frame. C interface (v14): ``avs_free_map``.
 
 
 .. _cplusplus_clearmap:
@@ -2767,6 +2786,50 @@ despite the rather pessimistic "never be supported" note.
       VALUE_TYPE_FUNCTION = 'n',
       VALUE_TYPE_ARRAY = 'a'
     };
+
+
+.. _cplusplus_avsvalueasfunction:
+
+AsFunction V14
+^^^^^^^^^^^^^^
+
+::
+
+    PFunction AsFunction() const;
+
+
+Returns the function object of a function value (``'n'`` type, ``IsFunction()``), e.g. a script
+function passed to a plugin parameter of type ``n``. Call it with ``env->Invoke3`` or ``env->Invoke3Try``.
+Check ``IsFunction()`` first. On a runtime older than V14 it returns an empty ``PFunction``.
+
+A ``PFunction`` is reference counted: it keeps the function alive after the ``AVSValue`` is gone.
+
+A complete plugin example:
+
+::
+
+    #include "avisynth.h"
+
+    const AVS_Linkage* AVS_linkage = nullptr;
+
+    // script: ApplyInt(function(x) { return x + 1 }, 5)  # 6
+    AVSValue __cdecl ApplyInt(AVSValue args, void* user_data, IScriptEnvironment* env)
+    {
+      if (!args[0].IsFunction())
+        env->ThrowError("ApplyInt: not a function");
+      return env->Invoke3(AVSValue(), args[0].AsFunction(), AVSValue(args[1]), nullptr);
+    }
+
+    extern "C" __declspec(dllexport)
+    const char* __stdcall AvisynthPluginInit3(IScriptEnvironment* env, const AVS_Linkage* const vectors)
+    {
+      AVS_linkage = vectors;
+      env->AddFunction("ApplyInt", "ni", ApplyInt, nullptr); // "ni": a function and an int parameter
+      return "ApplyInt sample plugin";
+    }
+
+``Invoke3`` has no default for the implicit ``last``: pass an empty ``AVSValue()`` if none.
+``AVSValue(args[1])`` is the one-element argument list.
 
 
 .. _cplusplus_structures:

@@ -633,14 +633,13 @@ ShowFrameNumber::ShowFrameNumber(PClip _child, bool _scroll, int _offset, int _x
   bold(_bold), italic(_italic), noaa(_noaa)
 {
   chromaplacement = ChromaLocation_e::AVS_CHROMA_LEFT;
-  AVS_UNUSED(env);
 
   if (!use_gdi) {
-    current_font = GetBitmapFont(size, "Terminus", bold, false);
+    current_font = GetBitmapFont(size, "Terminus", bold, false, env);
     if (current_font == nullptr) {
-      current_font = GetBitmapFont(size, "", bold, false);
+      current_font = GetBitmapFont(size, "", bold, false, env);
       if (current_font == nullptr)
-        current_font = GetBitmapFont(size, "", !bold, false);
+        current_font = GetBitmapFont(size, "", !bold, false, env);
     }
   }
 }
@@ -775,7 +774,6 @@ ShowCRC32::ShowCRC32(PClip _child, PClip _crc_child, bool _scroll, int _offset, 
   halocolor(vi.IsYUV() || vi.IsYUVA() ? RGB2YUV_Rec601(_halocolor) : _halocolor),
   bold(_bold), italic(_italic), noaa(_noaa)
 {
-  AVS_UNUSED(env);
 
   doB = doG = doR = doA = doY = doU = doV = false;
   for (int k = 0; channels[k] != '\0'; ++k) {
@@ -794,12 +792,12 @@ ShowCRC32::ShowCRC32(PClip _child, PClip _crc_child, bool _scroll, int _offset, 
   build_crc32_table();
 
   if (!use_gdi) {
-    current_font = GetBitmapFont(size, "Terminus", bold, false);
+    current_font = GetBitmapFont(size, "Terminus", bold, false, env);
     chromaplacement = ChromaLocation_e::AVS_CHROMA_LEFT;
     if (current_font == nullptr) {
-      current_font = GetBitmapFont(size, "", bold, false);
+      current_font = GetBitmapFont(size, "", bold, false, env);
       if (current_font == nullptr)
-        current_font = GetBitmapFont(size, "", !bold, false);
+        current_font = GetBitmapFont(size, "", !bold, false, env);
     }
   }
 }
@@ -1082,12 +1080,12 @@ ShowSMPTE::ShowSMPTE(PClip _child, double _rate, const char* offset, int _offset
   bold(_bold), italic(_italic), noaa(_noaa)
 {
   if (!use_gdi) {
-    current_font = GetBitmapFont(_size, "Terminus", bold, false);
+    current_font = GetBitmapFont(_size, "Terminus", bold, false, env);
     chromaplacement = ChromaLocation_e::AVS_CHROMA_LEFT;
     if (current_font == nullptr) {
-      current_font = GetBitmapFont(_size, "", bold, false);
+      current_font = GetBitmapFont(_size, "", bold, false, env);
       if (current_font == nullptr)
-        current_font = GetBitmapFont(_size, "", !bold, false);
+        current_font = GetBitmapFont(_size, "", !bold, false, env);
     }
   }
   int off_f, off_sec, off_min, off_hour;
@@ -1121,8 +1119,8 @@ ShowSMPTE::ShowSMPTE(PClip _child, double _rate, const char* offset, int _offset
   if (offset) {
   if (strlen(offset)!=11 || offset[2] != ':' || offset[5] != ':' || offset[8] != ':')
     env->ThrowError("ShowSMPTE:  offset should be of the form \"00:00:00:00\" ");
-  if (!isdigit(offset[0]) || !isdigit(offset[1]) || !isdigit(offset[3]) || !isdigit(offset[4])
-   || !isdigit(offset[6]) || !isdigit(offset[7]) || !isdigit(offset[9]) || !isdigit(offset[10]))
+  if (!isAsciiDigit(offset[0]) || !isAsciiDigit(offset[1]) || !isAsciiDigit(offset[3]) || !isAsciiDigit(offset[4])
+   || !isAsciiDigit(offset[6]) || !isAsciiDigit(offset[7]) || !isAsciiDigit(offset[9]) || !isAsciiDigit(offset[10]))
     env->ThrowError("ShowSMPTE:  offset should be of the form \"00:00:00:00\" ");
 
   off_hour = atoi(offset);
@@ -1672,8 +1670,9 @@ SimpleText::SimpleText(PClip _child, const char _text[], int _x, int _y, int _fi
 
   if (*font_filename) {
     // external font file
+    // developer utility: negative size saves the loaded BDF font as embeddable C++ source, see BitmapFont::SaveAsC
     bool debugSave = size < 0;
-    current_font = GetBitmapFont(0, font_filename, false, debugSave); // 0: size n/a
+    current_font = GetBitmapFont(0, font_filename, false, debugSave, env); // 0: size n/a
     if (current_font == nullptr)
       env->ThrowError("SimpleText: file %s not found or unknown file format", font_filename);
   }
@@ -1681,13 +1680,13 @@ SimpleText::SimpleText(PClip _child, const char _text[], int _x, int _y, int _fi
   {
     // internal font
     if (fontname) {
-      current_font = GetBitmapFont(size, fontname, bold, false); // 12, "Terminus"
+      current_font = GetBitmapFont(size, fontname, bold, false, env); // 12, "Terminus"
       if (current_font == nullptr)
         env->ThrowError("SimpleText: internal font name %s in size %d not found", fontname, size);
     }
     else {
       // size
-      current_font = GetBitmapFont(size, "", bold, false); // 12, ""
+      current_font = GetBitmapFont(size, "", bold, false, env); // 12, ""
       if (current_font == nullptr)
         env->ThrowError("SimpleText: fixed font size %d not found", size);
     }
@@ -1867,15 +1866,14 @@ FilterInfo::FilterInfo( PClip _child, const char _fontname[], int _size, int _te
   bold(_bold), italic(_italic), noaa(_noaa),
   cpu(_cpu), x(_x), y(_y), align(_align)
 {
-  AVS_UNUSED(env);
 
   if (!use_gdi) {
     chromaplacement = ChromaLocation_e::AVS_CHROMA_LEFT;
-    current_font = GetBitmapFont(size, "Terminus", bold, false);
+    current_font = GetBitmapFont(size, "Terminus", bold, false, env);
     if (current_font == nullptr) {
-      current_font = GetBitmapFont(size, "", bold, false);
+      current_font = GetBitmapFont(size, "", bold, false, env);
       if (current_font == nullptr)
-        current_font = GetBitmapFont(size, "", !bold, false);
+        current_font = GetBitmapFont(size, "", !bold, false, env);
     }
   }
 }
@@ -2497,12 +2495,12 @@ Compare::Compare(PClip _child1, PClip _child2, const char* channels, const char 
   }
   if (!use_gdi) {
     const int size = 16;
-    current_font = GetBitmapFont(size, "Terminus", false, false);
+    current_font = GetBitmapFont(size, "Terminus", false, false, env);
     chromaplacement = ChromaLocation_e::AVS_CHROMA_LEFT;
     if (current_font == nullptr) {
-      current_font = GetBitmapFont(size, "", false, false);
+      current_font = GetBitmapFont(size, "", false, false, env);
       if (current_font == nullptr)
-        current_font = GetBitmapFont(size, "", true, false);
+        current_font = GetBitmapFont(size, "", true, false, env);
     }
   }
 }
@@ -3102,14 +3100,14 @@ bool GetTextBoundingBox(const char* text, const char* fontname, int size, bool b
 #endif
 
 bool GetTextBoundingBoxFixed(const char* text, const char* fontname, int size, bool bold,
-  bool italic, int align, int& width, int& height, bool utf8)
+  bool italic, int align, int& width, int& height, bool utf8, IScriptEnvironment* env)
 {
-  std::unique_ptr<BitmapFont> current_font;
+  std::shared_ptr<const BitmapFont> current_font;
   /*
   if (*font_filename) {
     // external font file
     const bool debugSave = false;
-    current_font = GetBitmapFont(0, font_filename, false, debugSave); // 0: size n/a
+    current_font = GetBitmapFont(0, font_filename, false, debugSave, env); // 0: size n/a
     if (current_font == nullptr)
       env->ThrowError("SimpleText: file %s not found or unknown file format", font_filename);
   }
@@ -3118,13 +3116,13 @@ bool GetTextBoundingBoxFixed(const char* text, const char* fontname, int size, b
   {
     // internal font
     if (fontname) {
-      current_font = GetBitmapFont(size, fontname, bold, false); // 12, "Terminus"
+      current_font = GetBitmapFont(size, fontname, bold, false, env); // 12, "Terminus"
       if (current_font == nullptr)
         return false; // ("internal font name %s in size %d not found", fontname, size
     }
     else {
       // size
-      current_font = GetBitmapFont(size, "", bold, false); // 12, ""
+      current_font = GetBitmapFont(size, "", bold, false, env); // 12, ""
       if (current_font == nullptr)
         return false; // "fixed font size %d not found", size
     }
@@ -3167,7 +3165,6 @@ void ApplyMessageEx(PVideoFrame* frame, const VideoInfo& vi, const char* message
   int textcolor, int halocolor, int bgcolor, bool utf8, IScriptEnvironment* env)
 {
   AVS_UNUSED(bgcolor);
-  AVS_UNUSED(env);
   if (vi.IsYUV() || vi.IsYUVA()) {
     textcolor = RGB2YUV_Rec601(textcolor);
     halocolor = RGB2YUV_Rec601(halocolor);
@@ -3207,18 +3204,18 @@ void ApplyMessageEx(PVideoFrame* frame, const VideoInfo& vi, const char* message
     antialiaser.Apply(vi, frame, (*frame)->GetPitch());
   }
 #else
-  std::unique_ptr<BitmapFont> current_font;
+  std::shared_ptr<const BitmapFont> current_font;
 
   size = size / 8; // size comes in GDI units (*8)
 
   // internal font
-  current_font = GetBitmapFont(size, "Terminus", bold, false);
+  current_font = GetBitmapFont(size, "Terminus", bold, false, env);
   if (current_font == nullptr)
   {
     // size
-    current_font = GetBitmapFont(size, "", bold, false);
+    current_font = GetBitmapFont(size, "", bold, false, env);
     if (current_font == nullptr)
-      current_font = GetBitmapFont(size, "", !bold, false);
+      current_font = GetBitmapFont(size, "", !bold, false, env);
     if (current_font == nullptr)
       return;
   }

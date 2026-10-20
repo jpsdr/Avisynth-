@@ -20,6 +20,7 @@
 
 #include "conditional_reader.h"
 #include "../core/internal.h"
+#include "../core/strings.h"
 #include "../core/parser/scriptparser.h"
 #include <cstdlib>
 
@@ -120,7 +121,7 @@ skipspaces(char *string)
 
   while (*string != '\0') {
     /* Test against space chars */
-    if (!isspace(*string)) return(string);
+    if (!isAsciiSpace(*string)) return(string);
     string++;
   }
   return(string);
@@ -136,7 +137,7 @@ findspace(char *string)
 
   while (*string != '\0') {
     /* Test against space chars */
-    if (isspace(*string)) return(string);
+    if (isAsciiSpace(*string)) return(string);
     string++;
   }
   return(string);
@@ -227,7 +228,7 @@ ConditionalReader::ConditionalReader(PClip _child, const char* filename, const c
               intVal = new int[vi.num_frames];
             } else if (!lstrcmpi(type, "float")) {
               mode = MODE_FLOAT;
-              floatVal = new float[vi.num_frames];
+              floatVal = new double[vi.num_frames];
             } else if (!lstrcmpi(type, "bool")) {
               mode = MODE_BOOL;
               boolVal = new bool[vi.num_frames];
@@ -362,8 +363,8 @@ AVSValue ConditionalReader::ConvertType(const char* content, int line, IScriptEn
       return AVSValue(ival);
 
     case MODE_FLOAT:
-      float fval;
-      fields = sscanf(content, "%e", &fval);
+      double fval;
+      fields = sscanf(content, "%le", &fval);
       if (fields != 1)
         ThrowLine("ConditionalReader: Could not find an expected float at line %d!", line, env);
 
@@ -427,7 +428,7 @@ void ConditionalReader::SetRange(int start_frame, int stop_frame, AVSValue v) {
   start_frame = max(start_frame+offset, 0);
   stop_frame = min(stop_frame+offset, vi.num_frames-1);
   int p;
-  float q;
+  double q;
   bool r;
   const char* s;
 
@@ -439,7 +440,7 @@ void ConditionalReader::SetRange(int start_frame, int stop_frame, AVSValue v) {
       }
       break;
     case MODE_FLOAT:
-      q = v.Defined() ? v.AsFloatf() : 0.0f;
+      q = v.Defined() ? v.AsFloat() : 0.0;
       for (i = start_frame; i <= stop_frame; i++) {
         floatVal[i] = q;
       }
@@ -471,7 +472,7 @@ void ConditionalReader::SetFrame(int framenumber, AVSValue v) {
       intVal[framenumber+offset] = v.AsInt();
       break;
     case MODE_FLOAT:
-      floatVal[framenumber+offset] = v.AsFloatf();
+      floatVal[framenumber+offset] = v.AsFloat();
       break;
     case MODE_BOOL:
       boolVal[framenumber+offset] = v.AsBool();
@@ -1680,7 +1681,7 @@ PVideoFrame __stdcall ShowProperties::GetFrame(int n, IScriptEnvironment* env)
           ss << "[";
         const double* arr = env->propGetFloatArray(avsmap, propName, &error);
         for (int i = 0; i < propNumElements; ++i) {
-          ss << std::to_string(arr[i]);
+          ss << double_to_string(arr[i]); // shortest exact form, like Format; locale independent
           if (i < propNumElements - 1)
             ss << ", ";
         }

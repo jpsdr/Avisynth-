@@ -43,6 +43,41 @@ bool replace(std::string &haystack, const std::string &needle, const std::string
 bool replace(std::string &haystack, char needle, char newChar);
 std::string trim(const std::string& s);
 
+// ASCII-only character classes for parsers, instead of <cctype>: no locale dependency,
+// and no undefined behavior for negative (signed char) values, e.g. UTF-8 bytes >= 0x80.
+static inline bool isAsciiDigit(char c) {
+  return c >= '0' && c <= '9';
+}
+
+static inline bool isAsciiAlpha(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static inline bool isAsciiAlnum(char c) {
+  return isAsciiAlpha(c) || isAsciiDigit(c);
+}
+
+static inline bool isAsciiSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static inline char asciiToLower(char c) {
+  return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+
+static inline char asciiToUpper(char c) {
+  return (c >= 'a' && c <= 'z') ? c - ('a' - 'A') : c;
+}
+
+// identifier start and continuation characters
+static inline bool isAlphaUnderscore(char c) {
+  return isAsciiAlpha(c) || c == '_';
+}
+
+static inline bool isAlphaNumUnderscore(char c) {
+  return isAsciiAlnum(c) || c == '_';
+}
+
 #ifdef AVS_WINDOWS
 std::unique_ptr<char[]> AnsiToUtf8(const char* input);
 std::unique_ptr<char[]> WideCharToUtf8(const wchar_t* w_string);
@@ -58,12 +93,14 @@ std::string Utf8ToAnsi(const char* s_utf8);
 
 std::string GetFullPathNameWrapUtf8(const std::string& f);
 
-// Converts a double to string using the "C" locale (always '.' as decimal
-// separator), matching the behaviour of String() and AVSValue_to_string().
+// Shortest representation which reads back to the same value, like Python's repr():
+// 1.5, 1.0, 0.0001, 1e-05, 1.5e+16, nan, inf. Locale independent ('.' as decimal separator).
+// The float version gives the shortest digits for the 32 bit value (0.1f -> "0.1").
 std::string double_to_string(double d);
+std::string float_to_string(float f);
 
 size_t str_utf8_size(const std::string& s);
-std::string U16_to_utf8(uint16_t u16);
+std::string U32_to_utf8(uint32_t cp); // empty for surrogates and above 10FFFF
 std::string charToUtf8(const char* text, bool utf8);
 
 #endif // AVSCORE_STRINGS_H
