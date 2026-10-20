@@ -367,6 +367,8 @@ Quick list
 +-------------------------------------+-----------------------+-------+
 | avs_get_as_bool                     | AVS_Value             | 11    |
 +-------------------------------------+-----------------------+-------+
+| avs_get_as_clip                     | AVS_Value             | 11    |
++-------------------------------------+-----------------------+-------+
 | avs_get_as_int                      | AVS_Value             | 11    |
 +-------------------------------------+-----------------------+-------+
 | avs_get_as_long                     | AVS_Value             | 11    |
@@ -420,6 +422,26 @@ Quick list
 | avs_is_411                          | AVS_VideoInfo         | 13    |
 +-------------------------------------+-----------------------+-------+
 | avs_is_ya                           | AVS_VideoInfo         | 13    |
++-------------------------------------+-----------------------+-------+
+| avs_val_is_function                 | AVS_Value             | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_val_get_type                    | AVS_Value             | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_invoke_try                      | AVS_ScriptEnvironment | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_invoke2                         | AVS_ScriptEnvironment | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_invoke2_try                     | AVS_ScriptEnvironment | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_invoke3                         | AVS_ScriptEnvironment | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_invoke3_try                     | AVS_ScriptEnvironment | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_create_map                      | AVS_Map               | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_free_map                        | AVS_Map               | 14    |
++-------------------------------------+-----------------------+-------+
+| avs_apply_message                   | AVS_ScriptEnvironment | 14    |
 +-------------------------------------+-----------------------+-------+
 
 
@@ -682,12 +704,130 @@ avs_invoke
 
 See also: :ref:`cplusplus_invoke`
 
+.. _c_avs_invoke_try:
+
+avs_invoke_try
+--------------
+
+::
+
+    int avs_invoke_try(AVS_ScriptEnvironment *, AVS_Value* result, const char * name,
+                       AVS_Value args, const char** arg_names);
+
+v14. No-throw variant of ``avs_invoke`` (C++ ``InvokeTry``).
+
+Return values of the ``_try`` variants (``avs_invoke_try``, ``avs_invoke2_try``, ``avs_invoke3_try``):
+
+- 1: success, the result is in ``*result``, release it with ``avs_release_value``.
+- 0 and ``avs_get_error`` returns NULL: the function cannot be called with the given arguments
+  (e.g. no such function name). ``*result`` is untouched.
+- 0 and ``avs_get_error`` is set: other error, e.g. an error inside the called function.
+
+.. _c_avs_invoke2:
+
+avs_invoke2
+-----------
+
+::
+
+    AVS_Value avs_invoke2(AVS_ScriptEnvironment *, AVS_Value implicit_last, const char * name,
+                          AVS_Value args, const char** arg_names);
+
+v14. ``avs_invoke`` with a value for the implicit ``last`` (C++ ``Invoke2``); pass ``avs_void`` if none.
+The returned value must be released with ``avs_release_value``. On error it returns an error value,
+``avs_get_error`` tells the reason.
+
+.. _c_avs_invoke2_try:
+
+avs_invoke2_try
+---------------
+
+::
+
+    int avs_invoke2_try(AVS_ScriptEnvironment *, AVS_Value* result, AVS_Value implicit_last,
+                        const char * name, AVS_Value args, const char** arg_names);
+
+v14. No-throw variant of ``avs_invoke2`` (C++ ``Invoke2Try``). Return values: see :ref:`avs_invoke_try<c_avs_invoke_try>`.
+
+.. _c_avs_invoke3:
+
+avs_invoke3
+-----------
+
+::
+
+    AVS_Value avs_invoke3(AVS_ScriptEnvironment *, AVS_Value implicit_last, AVS_Value func,
+                          AVS_Value args, const char** arg_names);
+
+v14. Calls a function value (C++ ``Invoke3``), e.g. a script function passed to a plugin parameter of type ``n``.
+``func`` must be a function value (``avs_val_is_function``), otherwise an error value is returned.
+Pass ``avs_void`` as ``implicit_last`` if none.
+The returned value must be released with ``avs_release_value``. On error it returns an error value,
+``avs_get_error`` tells the reason.
+
+The ``AVS_Value`` itself is the function handle, there is no separate function type:
+keep it with ``avs_copy_value``, free it with ``avs_release_value``.
+
+::
+
+    // script: ApplyInt(function(x) { return x + 1 }, 5)  # 6
+    static AVS_Value AVSC_CC apply_int(AVS_ScriptEnvironment* env, AVS_Value args, void* user_data)
+    {
+      AVS_Value i = avs_get_array_elt(args, 1);
+      AVS_Value fargs;
+      avs_set_to_array(&fargs, &i, 1);
+      AVS_Value res = avs_invoke3(env, avs_void, avs_get_array_elt(args, 0), fargs, NULL);
+      avs_release_value(fargs);
+      return res; // result or error value, goes back to the script
+    }
+    // in avisynth_c_plugin_init2:
+    avs_add_function(env, "ApplyInt", "ni", apply_int, NULL);
+
+.. _c_avs_invoke3_try:
+
+avs_invoke3_try
+---------------
+
+::
+
+    int avs_invoke3_try(AVS_ScriptEnvironment *, AVS_Value* result, AVS_Value implicit_last,
+                        AVS_Value func, AVS_Value args, const char** arg_names);
+
+v14. No-throw variant of ``avs_invoke3`` (C++ ``Invoke3Try``). Return values: see :ref:`avs_invoke_try<c_avs_invoke_try>`.
+A ``func`` which is not a function value returns 0 with ``avs_get_error`` set.
+
 .. _c_avs_make_writable:
 
 avs_make_writable
 -----------------
 
 See also: :ref:`cplusplus_makewritable`
+
+.. _c_avs_apply_message:
+
+avs_apply_message
+-----------------
+
+::
+
+    void avs_apply_message(AVS_ScriptEnvironment *, AVS_VideoFrame * * pvf, const AVS_VideoInfo * vi,
+                           const char * message, int size, int textcolor, int halocolor, int bgcolor);
+
+v14. Writes a text message onto the frame (C++ ``ApplyMessage``), e.g. to show an error on the output.
+The frame must be writable: call ``avs_make_writable`` first. ``size`` is the font size in GDI units
+(pixel size * 8), colors are ``0xRRGGBB`` (converted for YUV formats), ``bgcolor`` is not used.
+The message must be UTF-8 encoded on every platform. Unlike the C++ ``ApplyMessage``, the system code
+page is never assumed, so the result does not depend on the manifest or the code page of the host process.
+
+::
+
+    // in a C filter's get_frame callback: AVS_VideoFrame* AVSC_CC get_frame(AVS_FilterInfo* fi, int n)
+    AVS_VideoFrame* frame = avs_get_frame(fi->child, n);
+    avs_make_writable(fi->env, &frame);
+    avs_apply_message(fi->env, &frame, &fi->vi, "MyFilter: something went wrong", fi->vi.width / 4, 0xF0F080, 0, 0);
+    return frame;
+
+See also: :ref:`ApplyMessage<cplusplus_applymessage>`
 
 .. _c_avs_new_c_filter:
 
@@ -855,7 +995,9 @@ avs_set_to_clip
 ---------------
 
 Stuffs an AVS_Clip into an AVS_Value. Clip reference count is increased by one. After this, the original
-AVS_Clip can be released with avs_release_clip.
+AVS_Clip can be released with avs_release_clip. The value must be released with ``avs_release_value``.
+The inline ``avs_new_value_clip`` calls this API, the same rules apply.
+See also the common rules at :ref:`avs_set_to_xxx<c_avs_set_to_xxx>`.
 
 In C++ a simple direct assignment is done: ``PClip clip = ... ; AVSValue retval = clip;``
 
@@ -1188,6 +1330,13 @@ avs_prop_get_type
 avs_prop_get_int
 ----------------
 
+``error`` receives one of the ``AVS_GETPROPERROR_xxx`` codes (0: success). It can be NULL, but then
+a failed read (missing key, wrong type, index out of range) returns 0/NULL and sets the message
+for ``avs_get_error``; pass NULL only for properties known to exist. The same applies to all
+``avs_prop_get_xxx`` functions with an ``error`` parameter (the ``_saturated`` ones never set it).
+Before 3.7.6 a failed read with NULL ``error`` terminated the process.
+See also :ref:`propGetInt<cplusplus_propgetint>`.
+
 .. _c_avs_prop_get_float:
 
 avs_prop_get_float
@@ -1267,6 +1416,45 @@ avs_prop_set_float_array
 
 avs_clear_map
 -------------
+
+.. _c_avs_create_map:
+
+avs_create_map
+--------------
+
+::
+
+    AVS_Map* avs_create_map(AVS_ScriptEnvironment* p);
+
+v14. Creates a standalone, empty property map, not attached to a frame (C++ ``createMap``).
+Use it with the ``avs_prop_xxx`` functions, e.g. as a temporary key-value store.
+It must be freed with ``avs_free_map``.
+
+A map is the same container as the frame properties, modelled after VapourSynth's ``VSMap``:
+each key holds an array of values of one type (64-bit integer, double, data (string or binary), clip
+or frame); a single value is a one-element array. Unlike ``AVS_Value`` arrays, these arrays are flat:
+no nesting, no mixed types, no map inside a map, and no function type.
+
+.. _c_avs_free_map:
+
+avs_free_map
+------------
+
+::
+
+    void avs_free_map(AVS_ScriptEnvironment* p, AVS_Map* map);
+
+v14. Frees a map created by ``avs_create_map`` (C++ ``freeMap``), with its content: clip and frame
+references stored in it are released. Do not call it on a frame's map (``avs_get_frame_props_ro``,
+``avs_get_frame_props_rw``), that one is owned by the frame. NULL is allowed.
+
+::
+
+    AVS_Map* m = avs_create_map(env);
+    avs_prop_set_int(env, m, "count", 42, AVS_PROPAPPENDMODE_REPLACE);
+    int err;
+    int64_t count = avs_prop_get_int(env, m, "count", 0, &err);
+    avs_free_map(env, m);
 
 .. _c_avs_new_video_frame_p:
 
@@ -1358,95 +1546,330 @@ avs_set_channel_mask
 avs_get_channel_mask
 --------------------
 
+.. _c_avs_set_to_xxx:
+
+The ``avs_set_to_xxx`` setters are API calls (v11), the counterparts of the ``avs_new_value_xxx``
+inline helpers. They construct the value in place, through the pointer.
+
+Common rules:
+
+- The previous content of ``*v`` is overwritten, not released. Use them on a fresh value, or call
+  ``avs_release_value`` first if it held a clip, function, array, or a ``double``/``long`` value.
+- Resource-owning results must be released with ``avs_release_value``: clip, array, and on 32-bit (x86)
+  systems ``double`` and ``long`` (stored in separately allocated memory there; on 64-bit systems the
+  release is a no-op for them, portable code calls it anyway). For ``void``, ``bool``, ``int``, ``float``,
+  ``string`` and ``error`` the release is a no-op.
+- The whole ``AVS_Value`` is initialized, unlike in the inline helpers, which set only the type and
+  the data member.
+
+Differences from the inline helpers:
+
++-----------------------+-----------------------------+--------------------------------------------------------------+
+| API (allocates/owns)  | inline helper               | difference                                                   |
++=======================+=============================+==============================================================+
+| ``avs_set_to_bool``,  | ``avs_new_value_bool``,     | same result, no resources                                    |
+| ``_int``, ``_float``  | ``_int``, ``_float``        |                                                              |
++-----------------------+-----------------------------+--------------------------------------------------------------+
+| ``avs_set_to_string``,| ``avs_new_value_string``,   | same: only the pointer is stored, the string is not copied   |
+| ``_error``            | ``_error``                  |                                                              |
++-----------------------+-----------------------------+--------------------------------------------------------------+
+| ``avs_set_to_double``,| none                        | API only; must be released                                   |
+| ``_long``             |                             |                                                              |
++-----------------------+-----------------------------+--------------------------------------------------------------+
+| ``avs_set_to_array``  | ``avs_new_value_array``     | API deep copies (must be released); inline only points to    |
+|                       |                             | the caller's array (must not be released)                    |
++-----------------------+-----------------------------+--------------------------------------------------------------+
+| ``avs_set_to_clip``   | ``avs_new_value_clip``      | same: the inline one calls the API, both add a reference,    |
+|                       |                             | both must be released                                        |
++-----------------------+-----------------------------+--------------------------------------------------------------+
+| ``avs_set_to_void``   | ``avs_void`` constant       | same result                                                  |
++-----------------------+-----------------------------+--------------------------------------------------------------+
+
 .. _c_avs_set_to_void:
 
 avs_set_to_void
 ---------------
+
+::
+
+    void avs_set_to_void(AVS_Value*);
+
+Sets an undefined (``'v'``) value, like assigning the ``avs_void`` constant. Release is a no-op.
 
 .. _c_avs_set_to_error:
 
 avs_set_to_error
 ----------------
 
+::
+
+    void avs_set_to_error(AVS_Value*, const char* v0);
+
+Sets an error value. Only the pointer is stored, the message is not copied: it must outlive the value
+(use a string literal or ``avs_save_string``). Release is a no-op.
+Returned from a filter function (``avs_add_function`` callback), the error is thrown as a script error.
+
 .. _c_avs_set_to_bool:
 
 avs_set_to_bool
 ---------------
+
+::
+
+    void avs_set_to_bool(AVS_Value*, int v0);
+
+Any nonzero ``v0`` is stored as true. Release is a no-op.
 
 .. _c_avs_set_to_int:
 
 avs_set_to_int
 --------------
 
+::
+
+    void avs_set_to_int(AVS_Value*, int v0);
+
+32-bit integer. Release is a no-op.
+
 .. _c_avs_set_to_string:
 
 avs_set_to_string
 -----------------
+
+::
+
+    void avs_set_to_string(AVS_Value*, const char* v0);
+
+Only the pointer is stored, the string is not copied: it must outlive the value. For a string that
+lives as long as the script environment, store a copy made by ``avs_save_string``. Release is a no-op.
 
 .. _c_avs_set_to_float:
 
 avs_set_to_float
 ----------------
 
+::
+
+    void avs_set_to_float(AVS_Value*, float v0);
+
+32-bit float. Release is a no-op.
+
 .. _c_avs_set_to_double:
 
 avs_set_to_double
 -----------------
+
+::
+
+    void avs_set_to_double(AVS_Value*, double d);
+
+64-bit floating point. No inline counterpart. Must be released with ``avs_release_value``:
+on 32-bit (x86) systems the value is stored in separately allocated memory.
 
 .. _c_avs_set_to_long:
 
 avs_set_to_long
 ---------------
 
+::
+
+    void avs_set_to_long(AVS_Value*, int64_t l);
+
+64-bit integer. No inline counterpart. Must be released with ``avs_release_value``:
+on 32-bit (x86) systems the value is stored in separately allocated memory.
+
 .. _c_avs_set_to_array:
 
 avs_set_to_array
---------------------
+----------------
+
+::
+
+    void avs_set_to_array(AVS_Value*, AVS_Value* src, int size);
+
+Creates an array value from ``size`` elements of ``src``. The array and its elements are deep copied
+(nested arrays as well, clips and functions get an additional reference), so the result must be
+released with ``avs_release_value``. ``src`` itself is not touched, release its elements separately
+if they own resources.
+
+The inline helper ``avs_new_value_array`` is the non-allocating alternative::
+
+    AVS_Value avs_new_value_array(AVS_Value * v0, int size);
+
+It allocates nothing, only points to the caller's array of ``size`` elements:
+
+- do not call ``avs_release_value`` on it, that would free the caller's array;
+- elements are not copied or reference counted, the array must outlive the use of the returned value.
+
+Typical use is assembling ``args`` for ``avs_invoke``, ``avs_invoke2`` or ``avs_invoke3``:
+the core makes its own copy for the call.
+
+Example, calling ``StackHorizontal(clip, clip2)``, where ``clip`` and ``clip2`` are existing clip values.
+Both ways start from a plain C array of the arguments. It holds simple struct copies, never release it.
+Non-allocating way::
+
+    AVS_Value src[2] = { clip, clip2 };
+    AVS_Value res = avs_invoke(env, "StackHorizontal", avs_new_value_array(src, 2), NULL);
+    // no avs_release_value for the array
+    avs_release_value(res); // invoke's value must be released
+
+The same through the API::
+
+    AVS_Value src[2] = { clip, clip2 };
+    AVS_Value args;
+    avs_set_to_array(&args, src, 2);
+    AVS_Value res = avs_invoke(env, "StackHorizontal", args, NULL);
+    avs_release_value(args); // deep copy, must be released
+    avs_release_value(res); // invoke's value must be released
+
+.. _c_avs_new_value_array:
+
+avs_new_value_array
+-------------------
+
+::
+
+    AVS_Value avs_new_value_array(AVS_Value * v0, int size);
+
+Inline (non-API) helper from ``avisynth_c.h``, not an exported function: it is compiled into the plugin.
+Non-allocating array value, do not release it. See the description and examples
+at :ref:`avs_set_to_array<c_avs_set_to_array>`.
+
+.. _c_avs_get_as_xxx:
+
+The ``avs_get_as_xxx`` getters and the array accessors below are API calls (v11), the
+non-inline counterparts of the ``avs_as_xxx`` inline helpers.
+
+Releasing: except ``avs_get_as_clip``, they allocate nothing. They return a plain C value
+(``int``, ``int64_t``, ``double``) or a pointer into the source ``AVS_Value``, which stays owned by it.
+Nothing returned by them must be released.
+
+What must be released with ``avs_release_value`` is the *source* ``AVS_Value`` itself, when it owns
+resources: a clip, a function, an array created by ``avs_set_to_array`` (or returned by ``avs_invoke``),
+and 64-bit ``double`` and ``long`` values. On 32-bit (x86) systems ``double`` and ``long`` are stored
+in separately allocated memory; on 64-bit systems they are stored in the ``AVS_Value`` directly,
+releasing them is a no-op there, but portable code releases them anyway. Release the source only after
+the last use of the pointers obtained from it.
 
 .. _c_avs_get_as_bool:
 
 avs_get_as_bool
 ---------------
 
+::
+
+    int avs_get_as_bool(AVS_Value v);
+
+Returns 1 or 0. Nothing to release.
+
+.. _c_avs_get_as_clip:
+
+avs_get_as_clip
+---------------
+
+::
+
+    AVS_Clip* avs_get_as_clip(AVS_Value v, AVS_ScriptEnvironment* env);
+
+Like ``avs_take_clip``: the only getter which allocates. Returns a new ``AVS_Clip`` and increases
+the clip's reference count by one; release it with ``avs_release_clip``. The source ``AVS_Value``
+can be released independently. See also :ref:`c_avs_take_clip`.
+
 .. _c_avs_get_as_int:
 
 avs_get_as_int
 --------------
+
+::
+
+    int avs_get_as_int(AVS_Value v);
+
+Returns a 32-bit integer, also from a 64-bit ``long`` value (truncated). Nothing to release.
 
 .. _c_avs_get_as_long:
 
 avs_get_as_long
 ---------------
 
+::
+
+    int64_t avs_get_as_long(AVS_Value v);
+
+Returns a 64-bit integer, from an ``int`` or ``long`` value. The returned value is a plain
+``int64_t``, nothing to release; a source ``long`` value must be released (see above).
+
 .. _c_avs_get_as_string:
 
 avs_get_as_string
 -----------------
+
+::
+
+    const char* avs_get_as_string(AVS_Value v);
+
+Returns the string pointer stored in the value, not a copy. Do not free it.
+Strings coming from Avisynth (script, ``avs_save_string``) live as long as the script environment.
 
 .. _c_avs_get_as_float:
 
 avs_get_as_float
 ----------------
 
+::
+
+    double avs_get_as_float(AVS_Value v);
+
+Returns a ``double``, from an ``int``, ``long``, ``float`` or ``double`` value. The returned value is
+a plain ``double``, nothing to release; a source ``double`` or ``long`` value must be released (see above).
+
 .. _c_avs_get_as_error:
 
 avs_get_as_error
 ----------------
+
+::
+
+    const char* avs_get_as_error(AVS_Value v);
+
+Returns the error message of an error value, NULL if the value is not an error. Pointer, not a copy,
+do not free it.
 
 .. _c_avs_get_as_array:
 
 avs_get_as_array
 ----------------
 
+::
+
+    const AVS_Value* avs_get_as_array(AVS_Value v);
+
+Returns a pointer to the elements of an array value. Borrowed: owned by the array value, do not release
+it or its elements; it is valid until the array value is released.
+
 .. _c_avs_get_array_elt:
 
 avs_get_array_elt
 -----------------
 
+::
+
+    AVS_Value avs_get_array_elt(AVS_Value v, int index);
+
+Returns an element of an array value (or the value itself if it is not an array).
+A plain struct copy, no reference counting: do not release it. Use ``avs_copy_value`` on it
+to keep the element after the array value is released (and release that copy later).
+
 .. _c_avs_get_array_size:
 
 avs_get_array_size
 ------------------
+
+::
+
+    int avs_get_array_size(AVS_Value v);
+
+Returns the number of elements of an array value. Nothing to release.
+Call it on array values only (``avs_val_is_array``); a non-array value returns 1, but debug builds assert.
 
 .. _c_avs_val_defined:
 
@@ -1497,6 +1920,38 @@ avs_val_is_array
 
 avs_val_is_error
 ----------------
+
+.. _c_avs_val_is_function:
+
+avs_val_is_function
+-------------------
+
+v14. Returns 1 if the value is a function (``'n'`` type). See :ref:`avs_invoke3<c_avs_invoke3>`.
+
+.. _c_avs_val_get_type:
+
+avs_val_get_type
+----------------
+
+::
+
+    int avs_val_get_type(AVS_Value v);
+
+v14. Returns the type of the value as one of the ``AVS_VALUE_TYPE_xxx`` constants (C++ ``AVSValue::GetType``)::
+
+    AVS_VALUE_TYPE_UNDEFINED = 'v', // void, undefined value
+    AVS_VALUE_TYPE_BOOL = 'b',      // boolean
+    AVS_VALUE_TYPE_INT = 'i',       // 32 bit integer
+    AVS_VALUE_TYPE_LONG = 'l',      // 64 bit integer
+    AVS_VALUE_TYPE_FLOAT = 'f',     // 32 bit floating point
+    AVS_VALUE_TYPE_DOUBLE = 'd',    // 64 bit floating point
+    AVS_VALUE_TYPE_STRING = 's',    // string (const char *)
+    AVS_VALUE_TYPE_CLIP = 'c',      // clip
+    AVS_VALUE_TYPE_FUNCTION = 'n',  // function, call it with avs_invoke3 (v14)
+    AVS_VALUE_TYPE_ARRAY = 'a',     // array of AVS_Value
+    AVS_VALUE_TYPE_ERROR = 'e'      // error message string, C interface only
+
+Use it instead of reading the ``type`` field of ``AVS_Value`` directly.
 
 .. _c_avs_prop_get_int_saturated:
 
@@ -1754,4 +2209,4 @@ ____
 
 Back to :doc:`FilterSDK`
 
-$Date: 2026/08/25 22:52:00 $
+$Date: 2026/10/19 12:00:00 $

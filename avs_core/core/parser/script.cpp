@@ -37,6 +37,8 @@
 #include <time.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cfloat>
+#include <climits>
 #include <cmath>
 #include <vector>
 #include <fstream>
@@ -229,6 +231,7 @@ extern const AVSFunction Script_functions[] = {
   { "GetParity", BUILTIN_FUNC_PREFIX, "c[n]i", GetParity },
   { "String",    BUILTIN_FUNC_PREFIX, ".[]s", String },
   { "Hex",       BUILTIN_FUNC_PREFIX, "i[width]i", Hex }, // avs+ 20180222 new width parameter
+  { "Hex64",     BUILTIN_FUNC_PREFIX, "i[width]i", Hex64 }, // 3.7.6
   { "Func",    BUILTIN_FUNC_PREFIX, "n", Func },
   { "Format",  BUILTIN_FUNC_PREFIX, "s.*", FormatString },
 
@@ -392,10 +395,6 @@ ScriptFunction::ScriptFunction( const PExpression& _body, const bool* _param_flo
   memcpy(param_names, _param_names, param_count * sizeof(const char*));
 }
 
-static bool is_within_int_in_float32_range(int64_t value) {
-  return value >= -16777216 && value <= 16777216;
-}
-
 AVSValue ScriptFunction::Execute(AVSValue args, void* user_data, IScriptEnvironment* env)
 {
   ScriptFunction* self = (ScriptFunction*)user_data;
@@ -404,11 +403,9 @@ AVSValue ScriptFunction::Execute(AVSValue args, void* user_data, IScriptEnvironm
     env->SetVar(self->param_names[i], 
       // Same as in ScriptFunction::Execute and AVSValue FunctionInstance::Execute
 
-      // force float args that are actually long/int (int64) to be float/double (depending on the range)
-      // opportunity to fit into the smaller float size
-      (self->param_floats[i] && args[i].IsInt()) ?
-      is_within_int_in_float32_range(args[i].AsLong()) ? (float)args[i].AsLong() : (double)args[i].AsLong() :
-      args[i]
+      // int/long args passed to float parameters are converted to 64 bit double.
+      // Not to 32 bit float: then arithmetic between two such parameters would be done in float.
+      (self->param_floats[i] && args[i].IsInt()) ? AVSValue((double)args[i].AsLong()) : args[i]
     );
 
   AVSValue result;
@@ -764,26 +761,47 @@ AVSValue Muldiv(AVSValue args, void*, IScriptEnvironment* ) {
   return (int)result;
 }
 
-// v11: up to int64 range
-AVSValue Floor(AVSValue args, void*, IScriptEnvironment* ) { 
-  int64_t result = static_cast<int64_t>(floor(args[0].AsFloat()));
+// Converts an integer valued double to int64; NaN, infinity and values out of the
+// 64 bit range are a script error (a plain cast would be undefined behavior).
+static int64_t DoubleToInt64(double d, const char* name, IScriptEnvironment* env)
+{
+  // 2^63 is exact in double, INT64_MAX is not
+  if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) // false for NaN as well
+    env->ThrowError("%s: the value is out of the 64 bit integer range", name);
+  return static_cast<int64_t>(d);
+}
+
+// keep the smaller type
+static AVSValue IntOrLong(int64_t result)
+{
   if (result >= INT_MIN && result <= INT_MAX)
     return (int)result;
   return result;
 }
+
+// Rounds half away from zero, exactly. x - trunc(x) is exact, unlike trunc(x + 0.5), which
+// gives 1 for 0.49999999999999994 and rounds odd values above 2^52 one up.
+// Not std::round: it is not exact either in every runtime (mingw-w64 x64 msvcrt).
+static double RoundHalfAway(double x)
+{
+  const double t = std::trunc(x);
+  return std::fabs(x - t) >= 0.5 ? t + std::copysign(1.0, x) : t;
+}
+
 // v11: up to int64 range
-AVSValue Ceil(AVSValue args, void*, IScriptEnvironment* ) { 
-  int64_t result = static_cast<int64_t>(ceil(args[0].AsFloat()));
-  if (result >= INT_MIN && result <= INT_MAX)
-    return (int)result;
-  return result;
+AVSValue Floor(AVSValue args, void*, IScriptEnvironment* env) {
+  if (args[0].IsInt()) return args[0]; // no precision loss through double
+  return IntOrLong(DoubleToInt64(std::floor(args[0].AsFloat()), "Floor", env));
 }
 // v11: up to int64 range
-AVSValue Round(AVSValue args, void*, IScriptEnvironment* ) { 
-  int64_t result = args[0].AsFloat() < 0 ? -static_cast<int64_t>(-args[0].AsFloat() + .5) : static_cast<int64_t>(args[0].AsFloat() + .5);
-  if (result >= INT_MIN && result <= INT_MAX)
-    return (int)result;
-  return result;
+AVSValue Ceil(AVSValue args, void*, IScriptEnvironment* env) {
+  if (args[0].IsInt()) return args[0];
+  return IntOrLong(DoubleToInt64(std::ceil(args[0].AsFloat()), "Ceil", env));
+}
+// v11: up to int64 range
+AVSValue Round(AVSValue args, void*, IScriptEnvironment* env) {
+  if (args[0].IsInt()) return args[0];
+  return IntOrLong(DoubleToInt64(RoundHalfAway(args[0].AsFloat()), "Round", env));
 }
 
 AVSValue Acos(AVSValue args, void* , IScriptEnvironment* ) { return acos(args[0].AsFloat()); }
@@ -805,7 +823,9 @@ AVSValue Sqrt(AVSValue args, void* , IScriptEnvironment* ) { return sqrt(args[0]
 
 // v11: up to int64 range
 AVSValue Abs(AVSValue args, void* , IScriptEnvironment* ) { 
-  int64_t result = std::abs(args[0].AsLong());
+  const int64_t v = args[0].AsLong();
+  // std::abs(INT64_MIN) is undefined behavior; wraps to INT64_MIN like the - operator
+  const int64_t result = v < 0 ? (int64_t)(0 - (uint64_t)v) : v;
   if (result >= INT_MIN && result <= INT_MAX)
     return (int)result;
   return result;
@@ -829,13 +849,19 @@ AVSValue BitNot64(AVSValue args, void*, IScriptEnvironment*) { return ~args[0].A
 AVSValue BitOr64(AVSValue args, void*, IScriptEnvironment*) { return args[0].AsLong() | args[1].AsLong(); }
 AVSValue BitXor64(AVSValue args, void*, IScriptEnvironment*) { return args[0].AsLong() ^ args[1].AsLong(); }
 
-AVSValue BitLShift(AVSValue args, void*, IScriptEnvironment* ) { return args[0].AsInt() << args[1].AsInt(); }
-AVSValue BitRShiftL(AVSValue args, void*, IScriptEnvironment* ) { return int(unsigned(args[0].AsInt()) >> unsigned(args[1].AsInt())); }
-AVSValue BitRShiftA(AVSValue args, void*, IScriptEnvironment* ) { return args[0].AsInt() >> args[1].AsInt(); }
+// Shift and bit index counts are masked to the bit width (0..31 or 0..63), like x86 does at runtime
+// (and like the rotate functions): a count >= the width or negative is undefined behavior in C++.
+// Left shifts are done unsigned, a signed left shift into or over the sign bit is undefined behavior as well.
+static inline unsigned Mask32(int n) { return unsigned(n) & 31; }
+static inline unsigned Mask64(int n) { return unsigned(n) & 63; }
 
-AVSValue BitLShift64(AVSValue args, void*, IScriptEnvironment*) { return args[0].AsLong() << args[1].AsInt(); }
-AVSValue BitRShift64L(AVSValue args, void*, IScriptEnvironment*) { return int64_t(uint64_t(args[0].AsLong()) >> unsigned(args[1].AsInt())); }
-AVSValue BitRShift64A(AVSValue args, void*, IScriptEnvironment*) { return args[0].AsLong() >> args[1].AsInt(); }
+AVSValue BitLShift(AVSValue args, void*, IScriptEnvironment* ) { return int(unsigned(args[0].AsInt()) << Mask32(args[1].AsInt())); }
+AVSValue BitRShiftL(AVSValue args, void*, IScriptEnvironment* ) { return int(unsigned(args[0].AsInt()) >> Mask32(args[1].AsInt())); }
+AVSValue BitRShiftA(AVSValue args, void*, IScriptEnvironment* ) { return args[0].AsInt() >> Mask32(args[1].AsInt()); }
+
+AVSValue BitLShift64(AVSValue args, void*, IScriptEnvironment*) { return int64_t(uint64_t(args[0].AsLong()) << Mask64(args[1].AsInt())); }
+AVSValue BitRShift64L(AVSValue args, void*, IScriptEnvironment*) { return int64_t(uint64_t(args[0].AsLong()) >> Mask64(args[1].AsInt())); }
+AVSValue BitRShift64A(AVSValue args, void*, IScriptEnvironment*) { return args[0].AsLong() >> Mask64(args[1].AsInt()); }
 
 static unsigned int a_rol(unsigned int value, int shift) {
   if ((shift &= sizeof(value)*8 - 1) == 0)
@@ -859,38 +885,33 @@ static uint64_t a_ror(uint64_t value, int shift) {
   return (value >> shift) | (value << (sizeof(value) * 8 - shift));
 }
 
+// bit index masked like the shift counts
 static int a_btc(int value, int bit) {
-  value ^= 1 << bit;
-  return value;
+  return int(unsigned(value) ^ (1u << Mask32(bit)));
 }
 static int64_t a_btc(int64_t value, int bit) {
-  value ^= static_cast<int64_t>(1) << bit;
-  return value;
+  return int64_t(uint64_t(value) ^ (uint64_t(1) << Mask64(bit)));
 }
 
 static int a_btr(int value, int bit) {
-  value &= ~(1 << bit);
-  return value;
+  return int(unsigned(value) & ~(1u << Mask32(bit)));
 }
 static int64_t a_btr(int64_t value, int bit) {
-  value &= ~(static_cast<int64_t>(1) << bit);
-  return value;
+  return int64_t(uint64_t(value) & ~(uint64_t(1) << Mask64(bit)));
 }
 
 static int a_bts(int value, int bit) {
-  value |= (1 << bit);
-  return value;
+  return int(unsigned(value) | (1u << Mask32(bit)));
 }
 static int64_t a_bts(int64_t value, int bit) {
-  value |= (static_cast<int64_t>(1) << bit);
-  return value;
+  return int64_t(uint64_t(value) | (uint64_t(1) << Mask64(bit)));
 }
 
 static bool a_bt(int value, int bit) {
-  return (value & (1 << bit)) ? true : false;
+  return (unsigned(value) & (1u << Mask32(bit))) != 0;
 }
 static bool a_bt(int64_t value, int bit) {
-  return (value & (static_cast<int64_t>(1)<< bit)) ? true : false;
+  return (uint64_t(value) & (uint64_t(1) << Mask64(bit))) != 0;
 }
 
 AVSValue BitRotateL(AVSValue args, void*, IScriptEnvironment* ) { return (int)a_rol((unsigned int)args[0].AsInt(), args[1].AsInt()); }
@@ -1364,24 +1385,24 @@ AVSValue Exist(AVSValue args, void*, IScriptEnvironment*nv) {
 //WE ->
 
 // Spline functions to generate and evaluate a natural bicubic spline
-void spline(float x[], float y[], int n, float y2[])
+void spline(double x[], double y[], int n, double y2[])
 {
   int i, k;
-  float p, qn, sig, un, * u;
+  double p, qn, sig, un, * u;
 
-  u = new float[n];
+  u = new double[n];
 
-  y2[1] = u[1] = 0.0f;
+  y2[1] = u[1] = 0.0;
 
   for (i = 2; i <= n - 1; i++) {
     sig = (x[i] - x[i - 1]) / (x[i + 1] - x[i - 1]);
-    p = sig * y2[i - 1] + 2.0f;
-    y2[i] = (sig - 1.0f) / p;
+    p = sig * y2[i - 1] + 2.0;
+    y2[i] = (sig - 1.0) / p;
     u[i] = (y[i + 1] - y[i]) / (x[i + 1] - x[i]) - (y[i] - y[i - 1]) / (x[i] - x[i - 1]);
-    u[i] = (6.0f * u[i] / (x[i + 1] - x[i - 1]) - sig * u[i - 1]) / p;
+    u[i] = (6.0 * u[i] / (x[i + 1] - x[i - 1]) - sig * u[i - 1]) / p;
   }
-  qn = un = 0.0f;
-  y2[n] = (un - qn * u[n - 1]) / (qn * y2[n - 1] + 1.0f);
+  qn = un = 0.0;
+  y2[n] = (un - qn * u[n - 1]) / (qn * y2[n - 1] + 1.0);
   for (k = n - 1; k >= 1; k--) {
     y2[k] = y2[k] * y2[k + 1] + u[k];
   }
@@ -1389,10 +1410,10 @@ void spline(float x[], float y[], int n, float y2[])
   delete[] u;
 }
 
-int splint(float xa[], float ya[], float y2a[], int n, float x, float& y, bool cubic)
+int splint(double xa[], double ya[], double y2a[], int n, double x, double& y, bool cubic)
 {
   int klo, khi, k;
-  float h, b, a;
+  double h, b, a;
 
   klo = 1;
   khi = n;
@@ -1402,15 +1423,15 @@ int splint(float xa[], float ya[], float y2a[], int n, float x, float& y, bool c
     else klo = k;
   }
   h = xa[khi] - xa[klo];
-  if (h == 0.0f) {
-    y = 0.0f;
+  if (h == 0.0) {
+    y = 0.0;
     return -1;	// all x's have to be different
   }
   a = (xa[khi] - x) / h;
   b = (x - xa[klo]) / h;
 
   if (cubic) {
-    y = a * ya[klo] + b * ya[khi] + ((a * a * a - a) * y2a[klo] + (b * b * b - b) * y2a[khi]) * (h * h) / 6.0f;
+    y = a * ya[klo] + b * ya[khi] + ((a * a * a - a) * y2a[klo] + (b * b * b - b) * y2a[khi]) * (h * h) / 6.0;
   }
   else {
     y = a * ya[klo] + b * ya[khi];
@@ -1482,17 +1503,17 @@ AVSValue AVSTime(AVSValue args, void*, IScriptEnvironment* env)
   return env->SaveString(s);
 }
 
-// FIXME: to v11 64 bit support
+// v11: 64 bit double precision
 AVSValue Spline(AVSValue args, void*, IScriptEnvironment* env)
 {
   int n;
-  float x, y;
+  double x, y;
   int i;
   bool cubic;
 
   AVSValue coordinates;
 
-  x = args[0].AsFloatf(0);
+  x = args[0].AsFloat(0);
   coordinates = args[1];
   cubic = args[2].AsBool(true);
 
@@ -1503,14 +1524,14 @@ AVSValue Spline(AVSValue args, void*, IScriptEnvironment* env)
   n = n / 2;
 
   const size_t work_array_stride = static_cast<size_t>(n) + 1;
-  std::vector<float> buf(work_array_stride * 3);
-  float* xa = buf.data();
-  float* ya = xa + work_array_stride;
-  float* y2a = ya + work_array_stride;
+  std::vector<double> buf(work_array_stride * 3);
+  double* xa = buf.data();
+  double* ya = xa + work_array_stride;
+  double* y2a = ya + work_array_stride;
 
   for (i = 1; i <= n; i++) {
-    xa[i] = coordinates[(i - 1) * 2 + 0].AsFloatf(0);
-    ya[i] = coordinates[(i - 1) * 2 + 1].AsFloatf(0);
+    xa[i] = coordinates[(i - 1) * 2 + 0].AsFloat(0);
+    ya[i] = coordinates[(i - 1) * 2 + 1].AsFloat(0);
   }
 
   for (i = 1; i < n; i++) {
@@ -1699,7 +1720,7 @@ const char *GetPixelTypeName(const int pixel_type)
 int GetPixelTypeFromName(const char *pixeltypename)
 {
   std::string name_to_find = pixeltypename;
-  for (auto & c: name_to_find) c = toupper(c); // uppercase input string
+  for (auto & c: name_to_find) c = asciiToUpper(c); // uppercase input string
   for (auto it = pixel_format_table.begin(); it != pixel_format_table.end(); it++)
   {
     if ((it->second).compare(name_to_find) == 0)
@@ -1778,26 +1799,74 @@ AVSValue GetParity(AVSValue args, void*, IScriptEnvironment*) {  return args[0].
 AVSValue HasVideo(AVSValue args, void*, IScriptEnvironment*) {  return VI(args[0]).HasVideo(); }
 AVSValue HasAudio(AVSValue args, void*, IScriptEnvironment*) {  return VI(args[0]).HasAudio(); }
 
+// printf-like formatting of a single number, for String(x, format) and Format's {x:spec}.
+// The argument type passed to printf must follow the conversion letter, not the value type:
+// the documented use is an integer value with a float format, e.g. String(frame, "%05.0f").
+// Exactly one conversion is allowed. The user's C type size prefix (h, l, ll, L, I64...) is dropped,
+// the value's own type decides: int32 or int64 (PRId64 prefix inserted), floating point as double.
+// v must be a number (IsFloat). Returns a string saved by env.
+static const char* FormatNumber(const AVSValue& v, const char* fmt, bool require_conversion, const char* fname, IScriptEnvironment* env)
+{
+  std::string newfmt;
+  char conversion = 0;
+  size_t conversion_pos = 0; // where the conversion letter goes in newfmt
+  for (const char* p = fmt; *p; ) {
+    if (*p != '%') { newfmt += *p++; continue; }
+    if (p[1] == '%') { newfmt += "%%"; p += 2; continue; }
+    if (conversion)
+      env->ThrowError("%s: only one conversion is allowed in the format string \"%s\"", fname, fmt);
+    newfmt += *p++; // '%'
+    while (*p && strchr("-+ #0", *p)) newfmt += *p++; // flags
+    while (isAsciiDigit(*p)) newfmt += *p++; // width
+    if (*p == '.') {
+      newfmt += *p++;
+      while (isAsciiDigit(*p)) newfmt += *p++; // precision
+    }
+    while (*p && strchr("hlLqjztIw", *p)) { // C type size prefix: dropped
+      if (*p == 'I' && ((p[1] == '6' && p[2] == '4') || (p[1] == '3' && p[2] == '2')))
+        p += 2;
+      p++;
+    }
+    if (!*p || !strchr("diuoxXfFeEgGaA", *p))
+      env->ThrowError("%s: invalid format string \"%s\", a single numeric conversion is allowed: "
+        "%%[flags][width][.precision] and one of d i u o x X f F e E g G a A", fname, fmt);
+    conversion = *p++;
+    conversion_pos = newfmt.size();
+    newfmt += conversion;
+  }
+
+  if (!conversion) {
+    if (require_conversion)
+      env->ThrowError("%s: no numeric conversion in the format \"%s\"", fname, fmt);
+    return env->Sprintf(newfmt.c_str()); // text only, "%%" -> "%"
+  }
+
+  if (strchr("fFeEgGaA", conversion)) {
+    // a 32 bit float is passed with its exact value (promoted to double anyway)
+    const double d = v.IsFloatfStrict() ? (double)v.AsFloatf() : v.AsFloat();
+    return env->Sprintf(newfmt.c_str(), d);
+  }
+
+  // integer conversion; a floating point value is truncated like Int()
+  const bool is_integer = v.IsInt() || v.IsLongStrict();
+  const int64_t i = is_integer ? v.AsLong() : DoubleToInt64(std::trunc(v.AsFloat()), fname, env);
+  if (v.IsLongStrict() || i < INT_MIN || i > INT_MAX) {
+    // 64 bit: insert the length modifier of PRId64 ("ll" or "I64", compiler dependent)
+    newfmt.insert(conversion_pos, std::string(PRId64, sizeof(PRId64) - 2));
+    return env->Sprintf(newfmt.c_str(), i);
+  }
+  return env->Sprintf(newfmt.c_str(), (int)i); // e.g. String(-1, "%x") = "ffffffff", like Hex
+}
+
 AVSValue String(AVSValue args, void*, IScriptEnvironment* env)
 {
   if (args[0].IsString()) return args[0];
   if (args[0].IsBool()) return (args[0].AsBool() ? "true" : "false");
   if (args[0].IsFunction()) return args[0].AsFunction()->ToString(env);
   if (args[1].Defined()) {
-    // WE --> when a format parameter is present
-    // order! if it is an Int: IsFloat gives True
-    // If parameter exists, always convert to float
-    if (args[0].GetType() == AvsValueType::VALUE_TYPE_FLOAT) // real 32 bit float
-    {
-      return env->Sprintf(args[1].AsString("%f"), args[0].AsFloatf());
-      // AsFloatf returns 32 bit float
-    }
-    else if (args[0].IsFloat()) // 32 or 64 bit integer or double
-    {
-      return env->Sprintf(args[1].AsString("%lf"), args[0].AsFloat());
-      // AsFloat returns double
-    }
-    return "";
+    if (!args[0].IsFloat()) // IsFloat: any integer or floating point
+      return "";
+    return FormatNumber(args[0], args[1].AsString(), false, "String", env);
   }
   else {
     // standard behaviour
@@ -1812,7 +1881,8 @@ AVSValue String(AVSValue args, void*, IScriptEnvironment* env)
       return env->SaveString(s);
     }
     if (args[0].IsFloat()) { // for double as well.
-      char s[50]; // safe size for double
+      // "%lf" prints all integer digits: up to 309 for DBL_MAX, plus sign, '.', 6 decimals and '\0'
+      char s[DBL_MAX_10_EXP + 1 + 1 + 1 + 6 + 1 + 16]; // was 50 (too small -> crash)
 #ifdef MSVC
       _locale_t locale = _create_locale(LC_NUMERIC, "C"); // decimal point: dot
       _sprintf_l(s, "%lf", locale, args[0].AsFloat());
@@ -1836,11 +1906,23 @@ AVSValue Hex(AVSValue args, void*, IScriptEnvironment* env)
   return env->SaveString(buf);
 }
 
+// 64 bit pair of Hex, like HexValue64 for HexValue: Hex(-1) = "FFFFFFFF", Hex64(-1) = "FFFFFFFFFFFFFFFF"
+AVSValue Hex64(AVSValue args, void*, IScriptEnvironment* env)
+{
+  const int64_t n = args[0].AsLong();
+  int wid = args[1].AsInt(0); // 0..16 is the minimum width of the returned string
+  wid = (wid < 0) ? 0 : (wid > 16) ? 16 : wid;
+  char buf[16 + 1];
+  snprintf(buf, sizeof(buf), "%0*" PRIX64, wid, (uint64_t)n);
+  return env->SaveString(buf);
+}
+
 static std::string AVSValue_to_string(AVSValue v, IScriptEnvironment* env) {
   if (v.IsString()) return v.AsString();
   if (v.IsBool()) return v.AsBool() ? "true" : "false";
   if (v.IsFunction()) return v.AsFunction()->ToString(env);
   if (v.IsInt()) return std::to_string(v.AsLong()); // AsLong handles both 32 and 64-bit int
+  if (v.IsFloatfStrict()) return float_to_string(v.AsFloatf()); // 32 bit float: its own shortest digits
   if (v.IsFloat()) return double_to_string(v.AsFloat());
   return "";
 }
@@ -1853,15 +1935,29 @@ AVSValue FormatString(AVSValue args, void*, IScriptEnvironment* env)
   // max_pixel_value = 255
   // Format("max pixel value = {max_pixel_value}!")
   // Format("Pi={1} x={0} y={0}!", 12, Pi())
+  // Format("{:.2f} {w:05d}", Pi(), ["w", 12]) // since 3.7.6: optional printf-like spec after ':'
   std::string format = args[0].AsString();
   int numargs = args[1].ArraySize();
 
+  // value to text, with the optional spec: numbers only, "%" prefix optional ("{x:.3f}", "{x:%.3f}")
+  auto value_to_text = [env](const AVSValue& v, const std::string& spec) -> std::string {
+    if (spec.empty())
+      return AVSValue_to_string(v, env); // simple, type dependent formatting
+    if (!v.IsFloat()) // any integer or floating point
+      env->ThrowError("Format: format specification \"%s\" is allowed only for numbers", spec.c_str());
+    const std::string fmt = spec[0] == '%' ? spec : "%" + spec;
+    // exactly one conversion, no text around it: one '%', ends with the conversion letter
+    if (fmt.find('%', 1) != std::string::npos || !strchr("diuoxXfFeEgGaA", fmt.back()))
+      env->ThrowError("Format: invalid format specification \"%s\", it must be a single numeric conversion: "
+        "[%%][flags][width][.precision] and one of d i u o x X f F e E g G a A", spec.c_str());
+    return FormatNumber(v, fmt.c_str(), true /* require_conversion */, "Format" /* who gives the error*/, env);
+  };
+
   // (name), value pairs, name can be empty
-  std::vector<std::pair<std::string, std::string>> sv;
+  std::vector<std::pair<std::string, AVSValue>> sv;
   for (int i = 0; i < numargs; i++)
   {
     std::string name; // can be empty
-    std::string val_as_s;
 
     AVSValue v = args[1][i];
     // ["name", value] support
@@ -1871,10 +1967,9 @@ AVSValue FormatString(AVSValue args, void*, IScriptEnvironment* env)
       name = v[0].AsString();
       v = v[1];
     }
-
-    val_as_s = AVSValue_to_string(v, env);
-
-    sv.push_back(std::make_pair(name, val_as_s));
+    // gather only values, not the final formatted result strings
+    // formatting is done later (optional specifiers)
+    sv.push_back(std::make_pair(name, v));
   }
 
   size_t supplied_params_count = sv.size();
@@ -1933,13 +2028,20 @@ AVSValue FormatString(AVSValue args, void*, IScriptEnvironment* env)
       break;
 
     last_param_section = format.substr(last_pos, x - last_pos); // name, order number or empty
+    // optional format specification after ':' e.g. {:.2f} {0:x} {name:05d}
+    std::string spec;
+    const size_t colon = last_param_section.find(':');
+    if (colon != std::string::npos) {
+      spec = last_param_section.substr(colon + 1);
+      last_param_section.erase(colon);
+    }
 
     if (last_param_section.empty()) {
       // simple {}, insert next parameter, consume one from the list
       // in c++20 you cannot mix
       if (param_counter >= supplied_params_count)
         env->ThrowError("Format: more parameter sections than parameters supplied");
-      ss += sv[param_counter++].second;
+      ss += value_to_text(sv[param_counter++].second, spec);
     }
     else {
       // name or number
@@ -1947,12 +2049,12 @@ AVSValue FormatString(AVSValue args, void*, IScriptEnvironment* env)
       bool validName = true;
       // check for a valid identifier name
       auto ch = last_param_section[0];
-      if (ch != '_' && !isalpha(ch))
+      if (!isAlphaUnderscore(ch))
         validName = false;
       else {
         for (size_t i = 1; i < last_param_section.length(); i++) {
           const char ch = last_param_section[i];
-          if (!(ch == '_' || isalnum(ch))) {
+          if (!isAlphaNumUnderscore(ch)) {
             validName = false;
             break;
           }
@@ -1973,23 +2075,21 @@ AVSValue FormatString(AVSValue args, void*, IScriptEnvironment* env)
         if (index < 0 || index >= (int)supplied_params_count)
           env->ThrowError("Format: parameter index is out of range: %d", index);
 
-        ss += sv[index].second;
+        ss += value_to_text(sv[index].second, spec);
       }
       else {
         // find among the named parameters
         auto it = std::find_if(sv.begin(), sv.end(),
-          [&last_param_section](const std::pair<std::string, std::string>& element) { return element.first == last_param_section; });
+          [&last_param_section](const std::pair<std::string, AVSValue>& element) { return element.first == last_param_section; });
         if (it != sv.end())
-          ss += it->second; // name was found
+          ss += value_to_text(it->second, spec); // name was found
         else {
           // last resort: variable with the given name
           AVSValue v;
           if (!env->GetVarTry(last_param_section.c_str(), &v))
             env->ThrowError("Format: no parameter or variable found with name \"%s\".", last_param_section.c_str());
 
-          std::string val_as_s = AVSValue_to_string(v, env);
-
-          ss += val_as_s;
+          ss += value_to_text(v, spec);
         }
       }
     }
@@ -2100,35 +2200,32 @@ AVSValue IsVersionOrGreater(AVSValue args, void*, IScriptEnvironment* env)
 }
 
 AVSValue Frac(AVSValue args, void*, IScriptEnvironment*) {
-  if (args[0].IsInt()) return 0.f;
-  double result = args[0].AsFloat() - int64_t(args[0].AsFloat());
-  if (args[0].IsFloat())
+  if (args[0].IsInt()) return 0.0;
+  const double x = args[0].AsFloat();
+  const double result = x - std::trunc(x); // no int64 overflow on big values
+  if (args[0].IsFloatfStrict()) // keep 32 bit float type, like Min, Max
     return (float)result;
   return result;
 }
 
-AVSValue Int(AVSValue args, void*, IScriptEnvironment*) {  
+AVSValue Int(AVSValue args, void*, IScriptEnvironment* env) {
   if (args[0].IsLongStrict()) return args[0].AsLong();
   if (args[0].IsInt()) return args[0].AsInt();
-  
-  int64_t result = int64_t(args[0].AsFloat());
-  if (result >= INT_MIN && result <= INT_MAX)
-    return (int)result;
-  return result;
+
+  return IntOrLong(DoubleToInt64(std::trunc(args[0].AsFloat()), "Int", env));
 }
 
-AVSValue IntI(AVSValue args, void*, IScriptEnvironment*) {
+// Always 32 bit: wraps around like for integer input, IntI(x) == IntI(Long(x))
+AVSValue IntI(AVSValue args, void*, IScriptEnvironment* env) {
   if (args[0].IsInt()) return static_cast<int>(args[0].AsLong());
 
-  int result = static_cast<int>(args[0].AsFloat());
-  return result;
+  return static_cast<int>(DoubleToInt64(std::trunc(args[0].AsFloat()), "IntI", env));
 }
 
-AVSValue Long(AVSValue args, void*, IScriptEnvironment*) {
+AVSValue Long(AVSValue args, void*, IScriptEnvironment* env) {
   if (args[0].IsInt()) return args[0].AsLong();
 
-  int64_t result = static_cast<int64_t>(args[0].AsFloat());
-  return result;
+  return DoubleToInt64(std::trunc(args[0].AsFloat()), "Long", env);
 }
 
 AVSValue Float(AVSValue args, void*, IScriptEnvironment*) {
@@ -2599,7 +2696,7 @@ AVSValue BuildPixelType(AVSValue args, void*, IScriptEnvironment* env)
   }
   else {
     family = args[0].AsString();
-    for (auto & c : family) c = toupper(c); // uppercase input string
+    for (auto & c : family) c = asciiToUpper(c); // uppercase input string
   }
 
   const bool isYUV = family == "YUV";
@@ -2720,12 +2817,12 @@ AVSValue VarExist(AVSValue args, void*, IScriptEnvironment* env)
 
   bool validName = true;
   // check for a valid identifier name
-  if (*name != '_' && !isalpha(*name))
+  if (!isAlphaUnderscore(*name))
     validName = false;
   else {
     for (int i = 1; i < len; i++) {
       const char ch = name[i];
-      if (!(ch == '_' || isalnum(ch))) {
+      if (!isAlphaNumUnderscore(ch)) {
         validName = false;
         break;
       }

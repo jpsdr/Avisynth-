@@ -54,6 +54,7 @@
 
 #include <stdlib.h>
 #include "../../core/internal.h"
+#include "../../core/strings.h" // isAlphaUnderscore, isAlphaNumUnderscore
 #include "../../convert/convert_planar.h" // fill_plane
 #include "../../convert/convert_helper.h"
 #include "avs/alignment.h"
@@ -4057,7 +4058,7 @@ AVSValue __cdecl Exprfilter::Create(AVSValue args, void* , IScriptEnvironment* e
   next_paramindex++;
 
   std::string scale_inputs = args[next_paramindex].Defined() ? args[next_paramindex].AsString("none") : "none";
-  transform(scale_inputs.begin(), scale_inputs.end(), scale_inputs.begin(), ::tolower);
+  transform(scale_inputs.begin(), scale_inputs.end(), scale_inputs.begin(), asciiToLower);
   next_paramindex++;
 
   const bool clamp_float = args[next_paramindex].AsBool(false);
@@ -5508,14 +5509,6 @@ static SOperation getStoreOp(const VideoInfo *vi) {
 #define LOAD_OP_NOTOKEN(op,v,req) do { if (stackSize < req) env->ThrowError("Expr: Not enough elements on stack to perform a load operation"); ops.push_back(ExprOp(op, (v))); maxStackSize = std::max(++stackSize, maxStackSize); } while(0)
 #define GENERAL_OP_NOTOKEN(op, v, req, dec) do { if (stackSize < req) env->ThrowError("Expr: Not enough elements on stack to perform an operation"); ops.push_back(ExprOp(op, (v))); stackSize-=(dec); } while(0)
 #define TWO_ARG_OP_NOTOKEN(op) GENERAL_OP_NOTOKEN(op, 0, 2, 1)
-
-static inline bool isAlphaUnderscore(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
-}
-
-static inline bool isAlphaNumUnderscore(char c) {
-  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
-}
 
 static bool isValidVarName(const std::string& s) {
   size_t len = s.length();

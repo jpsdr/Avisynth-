@@ -9,8 +9,213 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20261019 3.7.5.rXXXX (pre 3.7.6)
+20261020 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
+- Fix: runtime functions AverageLuma (and the other Average*), LumaDifference (and the other *Difference*,
+  *DifferenceFromPrevious, *DifferenceToNext) and PlaneMinMaxStats returned 32 bit float, so the result
+  did not compare equal to the same value written as a (64 bit double) script constant:
+  e.g. AverageLuma() == 2.6 was false and AverageLuma() < 2.6 was true for an average of exactly 2.6.
+  Now these computed results are 64 bit double. The min and max of a 32 bit float clip (YPlaneMin, YPlaneMax,
+  PlaneMinMaxStats) are real pixel values and stay 32 bit float. Existed since 3.7.4.
+- Spline: calculation and result in 64 bit double (were 32 bit float), e.g. Spline(0.1, 0, 0, 1, 1, false)
+  equals 0.1, and integer x values above 2^24 are not rounded any more.
+- Script: floating point constants in scientific notation: digits with an optional decimal point, then
+  e or E, an optional + or - sign and the exponent digits, e.g. 1.5e-5, 2E+3, .5e1, 1e308.
+  A number with an exponent is always floating point (2e3 is 2000.0, 64 bit double).
+  Expr already accepted this form, so e.g. a constant can be written the same way in both.
+- Format: floating point values are inserted with the shortest representation which reads back to exactly
+  the same value, like Python's repr() (VapourSynth scripts build Expr strings the same way with f-strings).
+  Was: 6 fixed decimals ("%lf"), so Format("{}", 1.0/65535) gave "0.000015" (2 significant digits) and
+  Format("{}", 0.0000001) gave "0.000000". This made the usual use case, building an expression with Format,
+  e.g. Expr(Format("x {a} *")) or Eval(Format(...)), silently inaccurate or plain wrong, without any error:
+  a coefficient of 1.0/65535 became 0.000015 (1.7% off), and any value below 5e-7 became 0.
+  Rules: positional notation between 0.0001 and 1e16, otherwise scientific ("1e-07", "1.5e+16"); a whole
+  value keeps ".0" (read back as float); '.' decimal separator regardless of locale; a 32 bit float gets its
+  own shortest digits (Floatf(0.1) -> "0.1"); nan, inf, -inf.
+  Examples: 1.5 -> "1.5" (was "1.500000"), 1.0 -> "1.0", 1.0/3 -> "0.3333333333333333",
+  1.0/65535 -> "1.5259021896696422e-05", Pow(2.0,70) -> "1.1805916207174113e+21".
+  Note: scripts using Format("{}", x) for display now get more (or fewer) digits; use String(x, "%.2f")
+  for a fixed number of decimals. String() is unchanged. GetFilterProps() JSON uses the same output.
+- String(x, format): the value is passed to the format according to its conversion letter, not according
+  to the value type. Was: always passed as float (the documented format is %[flags][width][.precision]f),
+  so an integer conversion printed garbage: String(5, "%d") = "0", String(255, "%x") = "0",
+  String(2.7, "%d") = "-1717986918"; %s, %n and %Lf crashed; "%f %f" printed stack garbage.
+  Now:
+  - floating point conversions f F e E g G a A: as before, integer values are converted to float.
+  - integer conversions d i u o x X: integer values directly, 64 bit longs with all digits
+    (String(9007199254740993, "%d") = "9007199254740993"); a 32 bit int stays 32 bit
+    (String(-1, "%x") = "ffffffff", like Hex). Floating point values are truncated like Int(),
+    out of the 64 bit range is an error.
+  - C type size prefixes before the conversion letter (h, l, ll, L, I64..., e.g. the l in %lf or %lld)
+    are accepted and ignored: the value's own type decides (32 or 64 bit integer; floating point always
+    with double precision). So "%lf" works as before, and "%d" or "%x" prints a 64 bit long exactly,
+    without the compiler and OS dependent "%lld" or "%I64d": the same format string works everywhere.
+  - exactly one conversion; "%%" prints "%"; a format without conversion prints its text.
+    Anything else (%s %c %p %n, '*' width/precision, a second conversion, a lone '%') is a script error.
+  All 119 distinct format strings found in a large script collection (UniversalPluginsFolders) work as before.
+- Format: optional format specification for numbers after a colon in the replacement field, like in Python
+  and C#: {:.2f}, {0:x}, {name:05d}, {my_variable:.8f}. The specification is a single printf-like numeric
+  conversion, the leading % is optional: [%][flags][width][.precision] and one of d i u o x X f F e E g G a A.
+  Handled exactly like the format string of String(x, format): converted according to the conversion
+  letter (Format("{:.0f}", 123) = "123", Format("{:d}", 2.7) = "2"), 64 bit integers exact, no C type
+  size prefixes needed. Allowed only for numbers, and no other text may be in it (error otherwise).
+  {a:} (empty specification) is the same as {a}. Text outside {} is not printf: Format("{:d}%", 5) = "5%".
+  Examples: Format("{:.2f}", Pi()) = "3.14", Format("{:05d}|{:x}|{:#06X}", 42, 255, 255) = "00042|ff|0X00FF".
+  So display text no longer needs a separate String(x, "%.2f") call.
+- New script function Hex64(int [, int width]): 64 bit pair of Hex, like HexValue64 for HexValue.
+  Hex is 32 bit (a negative value gives 8 digits, a 64 bit value is cut to 32 bits: Hex(4294967297) = "1"),
+  so 64 bit values had no hex string conversion. Hex64(-1) = "FFFFFFFFFFFFFFFF", Hex64(4294967297) = "100000001",
+  Hex64(255, 4) = "00FF". Width is 0 to 16. HexValue64(Hex64(x)) == x for any integer.
+  The Hex documentation said width 0 to 16 and "16 digits for 64 bit numbers"; corrected: 32 bit, width 0 to 8.
+- propShow: floating point property values in the same shortest exact form as Format: 0.1, 0.3333333333333333,
+  1e-07, [1.5, 2.0, 1e+20] instead of 0.100000, 0.333333, 0.000000, [1.500000, 2.000000, 100000000000000000000.000000].
+  Locale independent ('.' decimal separator).
+- Fix: script floating point constants with many digits were parsed inexactly (up to a few units in the
+  last place), e.g. 3.14159265358979324 gave 3.1415926535897927 instead of 3.1415926535897931 (Pi),
+  0.49999999999999994 gave 0.5. Now they are parsed correctly rounded. Existed since classic Avisynth.
+- Fix: Format with a large floating point value overflowed an internal stack buffer: all integer digits are
+  printed ("%lf"), e.g. Format("{}", 1e60) gives 67 characters into a 50 byte buffer, Format("{}", 1e308)
+  crashed. Existed since 3.6.0 (Format was added; the buffer was 30 bytes then).
+- Fix: String (without format string) with a large floating point value overflowed an internal stack buffer,
+  the same way as Format: e.g. String(1e60) gives 67 characters into a 50 byte buffer, String(1e308) crashed.
+  Existed since classic Avisynth (30 byte buffer; String(3e38) was already 46 characters with 32 bit float).
+- Fix: for loop with a limit near the end of the 64 bit range never ended (host freeze), e.g.
+  for (i = 9223372036854775805, 9223372036854775807, 5) { ... } or any step going over INT64_MAX
+  (or below INT64_MIN for negative steps): the loop variable overflowed and wrapped around to a value
+  within the limit again. Now the loop ends when the next value would overflow. Existed since for was added
+  (before 3.7.4 with a limit near 2147483647, when the loop variable was 32 bit).
+- Fix: text rendering with bitmap fonts (Text, Info, propShow...) on invalid UTF-8 text (e.g. ANSI text with
+  utf8=true): an incomplete multi-byte sequence at the end of the text was read past the end of the string,
+  and a lead byte followed by ASCII swallowed the next characters (byte 0xE9 then "xy" showed one box, "xy" was lost).
+  Now each invalid byte or incomplete sequence is one empty character and the text goes on. Existed since 3.7.4.
+- Fix: external BDF fonts (font="path/to/font.bdf"): characters above U+FFFF (e.g. emoji, unifont upper
+  planes, 4 byte UTF-8 sequences) were not displayed: the codepoint was stored as 16 bit, so U+1F600 became
+  U+F600 and its glyph appeared for that (private use) character instead, possibly replacing a real one.
+  Now codepoints are 32 bit. Glyphs with ENCODING -1 (unencoded, by BDF spec) are ignored; before they
+  were all mapped to U+FFFF. Built-in fonts (Terminus, info_h) are not affected. Existed since 3.5.1.
+- Internal code correctness (no change in behavior): 64 bit integer +, -, *, unary minus and Abs wrap
+  around on overflow in a defined way (two's complement, computed as unsigned), instead of relying on
+  signed overflow, which is undefined behavior in C++ (the compiler may assume it never happens).
+  The results are the same as before, e.g. 9223372036854775807 + 1 = -9223372036854775808,
+  Abs(-9223372036854775808) = -9223372036854775808.
+- Internal code correctness (no change in behavior): the bit shift functions (BitLShift, BitRShiftL, BitRShiftA,
+  BitShl64, BitShr64, BitSar64 and their synonyms) and the bit index functions (BitSet, BitClr, BitChg, BitTst
+  and their 64 bit versions) take the shift count / bit index modulo the bit width: 0..31 for 32 bit, 0..63
+  for 64 bit, the same as the rotate functions already did. A count >= the bit width or negative was undefined
+  behavior in C++ (x86 masks the count at runtime, so the results were the same; a compiler could have folded
+  it differently), and so was a signed left shift into the sign bit (BitLShift(1, 31), BitSet(0, 31)); these
+  are done unsigned now. E.g. BitLShift(1, 32) = 1, BitLShift(1, 33) = 2, BitLShift(1, -1) = -2147483648,
+  BitSet64(0, 64) = 1. All 46 tested cases give the same result as before. Documented in the bit functions page.
+- Bitmap font cache: the built-in (Terminus, info_h) and external BDF bitmap fonts are created once per
+  ScriptEnvironment and shared by all filters, instead of a separate copy (about 150 KB: bitmap, character
+  lookup table) for each filter instance, and a new one on every frame for propShow, ApplyMessage (e.g.
+  ConditionalFilter show=true, error messages, C plugins' avs_apply_message), Histogram("audiolevels")
+  labels and Text inside ScriptClip. A BDF file was even read and parsed again each time.
+  Measured (640x360, per frame): propShow 166 -> 52 us, ScriptClip("Text(String(current_frame))") 154 -> 37 us
+  (with Prefetch(4): 42 -> 18 us), Histogram("audiolevels") 231 -> 73 us, Text with a BDF font in ScriptClip
+  244 -> 35 us. The cache is freed with the ScriptEnvironment. A BDF file is read once per environment:
+  a change of the file is seen after reloading the script (a new environment). Rendering is unchanged.
+- Script parser, internal code correctness (no change in behavior, except the error message):
+  identifiers, numbers and the variable name checks (VarExist, function names) use ASCII-only tests,
+  the same as Expr and the frame property key check, instead of the C runtime isdigit/isalpha/isalnum.
+  Those are undefined for negative char values, i.e. bytes >= 0x80 (a byte of an UTF-8 sequence, or an
+  ANSI code page national character like á, ő, ü), assert in debug builds and depend on the locale.
+  A non-ASCII character outside strings and comments now gives
+  "unexpected non-ASCII character (byte 0xC3), allowed only in strings and comments".
+- Internal code correctness (no change in behavior): the same ASCII-only helpers instead of
+  isspace/isdigit/tolower/toupper for other text parameters and files: pixel type names (BlankClip pixel_type,
+  BuildPixelType), CombinePlanes plane strings, Expr scale_inputs, ShowSMPTE offset, AviSource fourCC,
+  ConditionalReader file whitespace, SetMaxCPU feature names, SetFilterMTMode filter names, Text font names
+  and the case-insensitive variable name hash.
+- Fix: Floor, Ceil, Round, Int, IntI, Long: values out of the 64 bit integer range, NaN and infinity
+  returned garbage (e.g. Int(Pow(10.0, 30)) = -9223372036854775808); now they are a script error.
+  IntI of a floating-point value outside the 32 bit range wraps around like for integers
+  (IntI(4294967297.0) = 1, was -2147483648). Existed since classic Avisynth.
+- Fix: Round was inexact: values just below 0.5 rounded up (0.5 - 2^-54 gave 1), odd values above 2^52
+  were rounded one up. Halves are still rounded away from zero. Floor, Ceil and Round return an integer
+  argument unchanged; it lost precision above 2^53 (through double).
+  Existed since classic Avisynth (the integer argument case since 3.7.4).
+- Fix: script integer division and modulo of the smallest 64 bit integer by -1 (e.g.
+  (-9223372036854775807 - 1) / -1) froze or crashed the host process (CPU divide exception).
+  Now "/" throws an "integer overflow in division" script error, "%" returns 0.
+  Existed since classic Avisynth (before 3.7.4 with the smallest 32 bit integer, -2147483648).
+- Fix: PlaneMinMaxStats on 32 bit float clips with threshold 0: the thresholded minimum and maximum
+  (elements 2 and 3) were wrong, e.g. 0.0000001 instead of 0.0078 (luma), -0.5 instead of 0 (chroma).
+  Now they equal the minimum and maximum, like for integer clips. Existed since 3.7.3.
+- Fix: ConditionalReader "Type float" stored and returned 32 bit float values, so e.g. a value 0.7 read
+  from the file was not equal to the script constant 0.7 (64 bit double). Now the values are 64 bit double.
+  Existed since 3.7.4.
+- Fix: Frac returned 32 bit float for any (also 64 bit double) argument; now the result is 64 bit double,
+  32 bit float only for a 32 bit float argument (like Min, Max). Existed since 3.7.4.
+  Values beyond the 64 bit integer range returned garbage instead of 0 (existed since classic Avisynth).
+- Fix: script comparison operators (==, !=, <, >, <=, >=) of a 32 bit float and a 64 bit double compared in
+  double, so a 32 bit float value was not equal to the same value written as a script constant:
+  e.g. Floatf(2.6) == 2.6 was false and Floatf(2.6) < 2.6 was true; for values rounded up in float,
+  Floatf(0.1) > 0.1 was true. Now when either side is a 32 bit float (e.g. a plugin returning
+  a 32 bit float), both are compared in 32 bit float precision, like before 3.7.4 and like
+  ConditionalFilter. Existed since 3.7.4.
+- Fix: ConditionalFilter compared integers truncated to 32 bit (e.g. 4294967297 == 1 was true) and
+  floats rounded to 32 bit float (e.g. 16777217.0 == 16777216.0 was true). Now integers are compared
+  in 64 bit and floats in double precision; when either side is a 32 bit float, both sides are
+  rounded to float as before. ConditionalSelect: a 64 bit index out of the 32 bit range selected a
+  wrong clip instead of the default one. Existed since 3.7.4.
+- Fix: propGetAll: string array properties returned only their first element; now the value is
+  an array, like for integer, float and clip arrays. Existed since 3.6.0.
+- Fix: propGetAsArray on a frame type property (set by plugins) returned an array of true values
+  (PVideoFrame was implicitly converted to bool); now it throws an error, like propGetAny. Existed since 3.6.0.
+- Fix: propGetXXX (C++ and C API) with a NULL error parameter terminated the process on a failed read
+  (missing key, wrong type, index): the AvisynthError was thrown inside a noexcept function.
+  Now it throws AvisynthError (C API: returns 0/NULL, the reason is in avs_get_error).
+  propGetClip and propGetFrame behave the same way. VapourSynth API4 dies with a fatal error here.
+  Existed since 3.6.0.
+- Fix: C API avs_prop_get_clip crashed on the first use of the returned clip (returned a raw clip
+  pointer instead of an AVS_Clip). Existed since 3.6.0.
+- Fix: propGetClip, propGetFrame (C++ and C API) did not report errors (missing key, wrong type, index),
+  *error was always 0. Script propGetClip now reports these errors like the other propGetXXX functions,
+  instead of returning an empty clip value. Regression since 3.7.4.
+- Hardening: C API avs_set_to_array (C++ AVSValue(const AVSValue*, int)): a NULL source with nonzero
+  (or negative) size gives an empty array, array_size matches the allocation.
+- Interface v14 (AVISYNTH_INTERFACE_VERSION = 14): C API additions; C++: AVSValue::AsFunction exported.
+  - C++: AVSValue::AsFunction (was internal): get the PFunction of a function value, call it with
+    Invoke3/Invoke3Try. New AVS_Linkage entry, returns an empty PFunction on older runtimes.
+  - Function values ('n' type, e.g. a script function passed to a plugin parameter of type "n"):
+    avs_val_is_function, avs_invoke3, avs_invoke3_try (like C++ Invoke3, Invoke3Try).
+    The AVS_Value itself is the function handle: copy it with avs_copy_value, free it with avs_release_value.
+  - avs_val_get_type: returns the type of an AVS_Value as AVS_VALUE_TYPE_xxx (like C++ AVSValue::GetType).
+  - avs_invoke_try, avs_invoke2, avs_invoke2_try (like C++ InvokeTry, Invoke2, Invoke2Try):
+    no-throw invoke, invoke with implicit 'last' (pass avs_void if none).
+  - The _try variants return 1 on success, with the result in *result (release it with avs_release_value).
+    They return 0 if the function cannot be called with the given arguments (avs_get_error returns NULL),
+    or on other errors (avs_get_error tells the reason).
+  - avs_create_map, avs_free_map: standalone property map, not attached to a frame (like C++ createMap, freeMap).
+    Use it with the avs_prop_xxx functions; free every created map with avs_free_map.
+  - avs_apply_message: write a UTF-8 text message onto a writable frame, e.g. an error (like C++ ApplyMessageEx with utf8=true).
+  - AVS_CS_RGBP8, AVS_CS_RGBAP8 aliases (like C++ CS_RGBP8, CS_RGBAP8).
+  - AVS_VALUE_TYPE_xxx constants (like C++ AvsValueType), plus the C-only AVS_VALUE_TYPE_ERROR.
+  Example:
+    // script: ApplyInt(function(x) { return x + 1 }, 5)  # 6
+    static AVS_Value AVSC_CC apply_int(AVS_ScriptEnvironment* env, AVS_Value args, void* user_data)
+    {
+      AVS_Value i = avs_get_array_elt(args, 1);
+      AVS_Value fargs;
+      avs_set_to_array(&fargs, &i, 1);
+      AVS_Value res = avs_invoke3(env, avs_void, avs_get_array_elt(args, 0), fargs, NULL);
+      avs_release_value(fargs);
+      return res; // result or error value, goes back to the script
+    }
+    // in avisynth_c_plugin_init2:
+    avs_add_function(env, "ApplyInt", "ni", apply_int, NULL);
+- Fix: avisynth_c.h dynamic loader (#define AVSC_NO_DECLSPEC, avs_load_library, Windows):
+  - the 8 deprecated entries avs_is_yuv444p16, avs_is_yuv422p16, avs_is_yuv420p16, avs_is_y16,
+    avs_is_yuv444ps, avs_is_yuv422ps, avs_is_yuv420ps, avs_is_y32 were in the AVS_Library struct but never
+    loaded; since the struct was malloc'ed, they contained garbage: calling one crashed. Now loaded
+    (optional, NULL when missing). The struct is zero filled (calloc), so a not loaded entry is NULL.
+  - a failed load (e.g. a required function missing) freed the struct but not the loaded DLL (FreeLibrary).
+  - the loader part did not compile without including <windows.h> and <stdlib.h> before avisynth_c.h
+    (HMODULE, LoadLibraryA, GetProcAddress, malloc); it includes them now itself.
+  Existed since r2487 (2016).
+- C++ API: CS_xxx_CHROMA_PLACEMENT (AvsChromaPlacement) marked deprecated: never implemented,
+  use the _ChromaLocation frame property.
 - Interface v13.1 (AVISYNTHPLUS_INTERFACE_BUGFIX_VERSION = 1): user defined cache hints passed upstream
   by the core, for communication between plugins (#521).
   New CachePolicyHint range CACHE_USER_FORWARD_BEGIN (0x40000000) .. CACHE_USER_FORWARD_END (0x7FFFFFFF,

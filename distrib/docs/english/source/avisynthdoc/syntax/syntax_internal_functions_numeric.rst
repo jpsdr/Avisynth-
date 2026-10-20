@@ -15,7 +15,7 @@ Otherwise the result is stored into 64-bit long ``l``.
 When both operands are 32-bit float, arithmetic is done in 32-bits and the result is a 32-bit float.
 Otherwise the calculation is done in 64-bit double ``d`` precision.
 
-Except ``MulDiv``, ``Rand`` and ``Spline`` the calculations are 64-bit (int or double) compatible.
+Except ``MulDiv`` and ``Rand`` the calculations are 64-bit (int or double) compatible.
 
 Max
 ~~~
@@ -88,6 +88,7 @@ Floor
     Floor(float)
 
 Converts from float to int (round down on any fractional amount).
+An integer argument is returned unchanged. A value out of the 64 bit integer range, NaN or infinity is an error (since 3.7.6).
 
 *Examples:*
 ::
@@ -104,12 +105,13 @@ Ceil
     Ceil(float)
 
 Converts from float to int (round up on any fractional amount).
+An integer argument is returned unchanged. A value out of the 64 bit integer range, NaN or infinity is an error (since 3.7.6).
 
 *Examples:*
 ::
 
-    Ceil(1.2) = 2.0
-    Ceil(1.6) = 2.0
+    Ceil(1.2) = 2
+    Ceil(1.6) = 2
     Ceil(-1.2) = -1
     Ceil(-1.6) = -1
 
@@ -119,7 +121,9 @@ Round
 
     Round(float)
 
-Converts from float to int (round off to nearest integer).
+Converts from float to int (round off to nearest integer). Halves are rounded away from zero
+(``Round(2.5) = 3``, ``Round(-2.5) = -3``), exactly, also for large values (since 3.7.6).
+An integer argument is returned unchanged. A value out of the 64 bit integer range, NaN or infinity is an error (since 3.7.6).
 
 *Examples:*
 ::
@@ -137,6 +141,7 @@ Int
 
 Converts from single-precision, `floating-point`_ or any integer value to int (round towards
 zero). If the result fit into 32 bit integer, the result type is integer, else 64 bit long.
+A value out of the 64 bit integer range, NaN or infinity is an error (since 3.7.6).
 
 *Examples:*
 ::
@@ -153,16 +158,19 @@ IntI
     IntI(float)
 
 Converts from a `floating-point`_ or any integer value to 32 bit int (round towards zero).
+Values outside the 32 bit range wrap around, the same way for integer and floating-point
+arguments: ``IntI(4294967297) = IntI(4294967297.0) = 1``.
+A value out of the 64 bit integer range, NaN or infinity is an error (since 3.7.6).
 
 Since v3.7.4.
 
 *Examples:*
 ::
 
-    Int(1.2) = 1
-    Int(1.6) = 1
-    Int(-1.2) = -1
-    Int(-1.6) = -1
+    IntI(1.2) = 1
+    IntI(1.6) = 1
+    IntI(-1.2) = -1
+    IntI(-1.6) = -1
 
 Long
 ~~~~
@@ -171,6 +179,7 @@ Long
     Long(float)
 
 Converts from a `floating-point`_ or any integer value to 64 bit int (round towards zero).
+A value out of the 64 bit integer range, NaN or infinity is an error (since 3.7.6).
 
 Since v3.7.4.
 
@@ -180,7 +189,7 @@ Since v3.7.4.
     Long(1.2) = 1
     Long(1.6) = 1
     Long(-1.2) = -1
-    Int(-1.6) = -1
+    Long(-1.6) = -1
 
 Float
 ~~~~~
@@ -359,6 +368,7 @@ Frac
     Frac(float)
 
 Returns the fractional portion of the value provided.
+The result is 32-bit float for a 32-bit float argument, otherwise 64-bit double (since 3.7.6).
 
 *Examples:*
 ::
@@ -402,12 +412,13 @@ Spline
 Interpolates the Y value at point X using the control points x1/y1, ... There
 have to be at least 2 x/y-pairs. The interpolation can be cubic (the result
 is a spline) or linear (the result is a polygon). Default is cubic.
+The calculation is done in 64-bit double precision, the result is 64-bit double (since 3.7.6).
 
 *Examples:*
 ::
 
     Spline(5, 0, 0, 10, 10, 20, 0, false) = 5
-    Spline(5, 0, 0, 10, 10, 20, 0, true) = 7
+    Spline(5, 0, 0, 10, 10, 20, 0, true) = 6.875
 
 ContinuedNumerator, ContinuedDenominator
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -443,6 +454,12 @@ Changelog
 +-----------------+-----------------------------------+
 | Version         | Changes                           |
 +=================+===================================+
+| 3.7.6           | | Spline: 64 bit double           |
+|                 | | Frac: double for double input   |
+|                 | | Floor, Ceil, Round, Int, IntI,  |
+|                 |   Long: out of range is an error  |
+|                 | | Round: exact halves             |
++-----------------+-----------------------------------+
 | 3.7.4           | | Changed Float, Int              |
 |                 | | Add IntI, Long, FloatF, Double  |
 +-----------------+-----------------------------------+
@@ -455,7 +472,7 @@ Changelog
 
 Back to :doc:`Internal functions <syntax_internal_functions>`.
 
-$Date: 2024/01/15 16:26:00 $
+$Date: 2026/10/20 13:00:00 $
 
 .. _wikipedia: http://en.wikipedia.org/wiki/Hyperbolic_function
 .. _floating-point: http://en.wikipedia.org/wiki/Floating_point

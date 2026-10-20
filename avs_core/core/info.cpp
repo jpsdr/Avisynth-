@@ -45,6 +45,7 @@
 // chroma location, overlay-like weighted chroma handling
 
 #include "info.h"
+#include "InternalEnvironment.h"
 #include <cstring>
 #include <sstream>
 #include <fstream>
@@ -63,41 +64,46 @@
 #include "../filters/overlay/blend_common.h" // chromaLocationToMaskPlacement
 
 // helper function for remapping an utf8 string to font index entry list
-std::vector<int> BitmapFont::remap(const std::string& s_utf8)
+// Invalid UTF-8 gives one empty character (index 0), then decoding goes on, so that a following valid
+// character is not lost (like the Unicode/WHATWG replacement recommendation): one for each stray
+// continuation byte or 0xF8..0xFF byte, and one for an incomplete sequence (a lead byte with fewer
+// continuation bytes than needed, also at the end of the string: no reading past it).
+std::vector<int> BitmapFont::remap(const std::string& s_utf8) const
 {
   // new vector with characters remapped to font table indexes
   std::vector<int> s_remapped;
-  const size_t real_len = str_utf8_size(s_utf8);
-  s_remapped.resize(real_len);
+  s_remapped.reserve(str_utf8_size(s_utf8));
 
-  size_t index = 0;
   const char* p = s_utf8.data();
   const char* end = p + s_utf8.size();
   while (p < end) {
     // Get the lead byte of the current UTF-8 character
-    unsigned char lb = static_cast<unsigned char>(*p);
+    const unsigned char lb = static_cast<unsigned char>(*p);
     // Determine the number of bytes in the current UTF-8 character
     int n = 0;
     if ((lb & 0x80) == 0) n = 1; // 0xxxxxxx
     else if ((lb & 0xE0) == 0xC0) n = 2; // 110xxxxx
     else if ((lb & 0xF0) == 0xE0) n = 3; // 1110xxxx
     else if ((lb & 0xF8) == 0xF0) n = 4; // 11110xxx
-    else {
-      // Invalid lead byte, skip
+    // else: invalid lead byte (continuation byte 10xxxxxx or 0xF8..0xFF), n = 0
+    if (n == 0) {
+      s_remapped.push_back(0); // empty neutral character (space) for the bad byte
       ++p;
       continue;
     }
-    // Create a buffer to store the UTF-8 character code
-    char utf8_char_buf[5] = { 0 };
-    // Copy the bytes from the string to the buffer
-    std::memcpy(utf8_char_buf, p, n);
+    // the whole sequence must be within the string, with continuation bytes 10xxxxxx
+    int k = 1;
+    while (k < n && p + k < end && (static_cast<unsigned char>(p[k]) & 0xC0) == 0x80)
+      k++;
+    if (k < n) {
+      // incomplete sequence: one empty character for it (the lead byte and its continuation bytes)
+      s_remapped.push_back(0);
+      p += k;
+      continue;
+    }
     // finds by utf8 character sequence in font index table
-    auto it = charReMapUtf8.find(utf8_char_buf);
-    if (it != charReMapUtf8.end())
-      s_remapped[index] = it->second;
-    else
-      s_remapped[index] = 0; // empty neutral character (space)
-    index++;
+    auto it = charReMapUtf8.find(std::string(p, n));
+    s_remapped.push_back(it != charReMapUtf8.end() ? it->second : 0); // 0: empty neutral character (space)
     // Advance the pointer by the number of bytes
     p += n;
   }
@@ -106,7 +112,13 @@ std::vector<int> BitmapFont::remap(const std::string& s_utf8)
 
 // Internal function! For creating source code from a previously LoadBDF'd font file
 // see fixedfonts.cpp
-void BitmapFont::SaveAsC(const uint16_t* _codepoints)
+// Developer utility to generate the embeddable C++ source of the built-in fonts from the Terminus
+// BDF font family (ter-u*.bdf). Triggered by the Text filter (class SimpleText) with an external font file
+// and a negative size, e.g. Text("x", font_filename="ter-u16n.bdf", size=-1); output: <font_filename>.cpp_sample
+// in the current directory, to be pasted into fixedfonts.cpp.
+// The built-in fonts are BMP-only: the generated codepoint array is uint16_t, codepoints above U+FFFF
+// would be truncated. Terminus has no such characters.
+void BitmapFont::SaveAsC(const uint32_t* _codepoints)
 {
   if (font_filename == "") return; // no GUS no sound :)
 
@@ -205,7 +217,7 @@ void BitmapFont::SaveAsC(const uint16_t* _codepoints)
 
 typedef struct CharInfo { // STARTCHAR charname
   std::string friendly_name;
-  uint16_t encoding;
+  int encoding; // unicode codepoint, can be above U+FFFF; -1: unencoded glyph
   int dwidth_x, dwidth_y;
   // DWIDTH not supported, same as main PIXELSIZE
   // font properties can be overridden.
@@ -240,7 +252,7 @@ public:
   std::string font_filename;
   FontInfo font_info;
   FontProperties font_properties;
-  std::vector<uint16_t> codepoints_array;
+  std::vector<uint32_t> codepoints_array; // -1 (unencoded) becomes 0xFFFFFFFF, not a valid codepoint
   std::vector<std::string> charnames_array;
   // each character can have different bounding box dimensions from global one
   std::vector<BBX> bbx_array;
@@ -592,7 +604,7 @@ static BdfFont LoadBMF(std::string name, bool bold) {
           0000
           ENDCHAR
         */
-        fnt.codepoints_array[char_counter] = current_char.encoding;
+        fnt.codepoints_array[char_counter] = static_cast<uint32_t>(current_char.encoding);
         fnt.charnames_array[char_counter] = current_char.friendly_name;
         fnt.bbx_array[char_counter] = current_char.bbx;
         char_counter++;
@@ -2096,7 +2108,7 @@ static bool strequals_i(const std::string& a, const std::string& b)
   return std::equal(a.begin(), a.end(),
     b.begin(), b.end(),
     [](char a, char b) {
-      return tolower(a) == tolower(b);
+      return asciiToLower(a) == asciiToLower(b);
     });
 }
 
@@ -2105,7 +2117,7 @@ extern const uint16_t *font_bitmaps[];
 extern const uint16_t *font_codepoints[];
 extern const FixedFont_info_t *font_infos[];
 
-std::unique_ptr<BitmapFont> GetBitmapFont(int size, const char *name, bool bold, bool debugSave) {
+std::unique_ptr<BitmapFont> CreateBitmapFont(int size, const char *name, bool bold, bool debugSave) {
 
   BitmapFont* current_font = nullptr;
 
@@ -2124,7 +2136,8 @@ std::unique_ptr<BitmapFont> GetBitmapFont(int size, const char *name, bool bold,
         font_bitmaps[i], // internal one
         nullptr, // not a byte array from external BDF
         sizeof(uint16_t), // sizeof(*font_bitmaps) 2: uint16_t
-        font_codepoints[i],
+        font_codepoints[i], // internal one
+        nullptr, // not a codepoint array from external BDF
         nullptr, // Individual BBX for each character. For our internal characters it comes from global bbx
         global_bbx,
         fi->fontname,
@@ -2163,7 +2176,8 @@ std::unique_ptr<BitmapFont> GetBitmapFont(int size, const char *name, bool bold,
         font_bitmaps[found_index], // internal one
         nullptr, // not a byte array from external BDF
         sizeof(uint16_t), // sizeof(*font_bitmaps) 2: uint16_t
-        font_codepoints[found_index],
+        font_codepoints[found_index], // internal one
+        nullptr, // not a codepoint array from external BDF
         nullptr,  // Individual BBX for each character. For our internal characters it comes from global bbx
         global_bbx,
         fi->fontname,
@@ -2186,6 +2200,7 @@ std::unique_ptr<BitmapFont> GetBitmapFont(int size, const char *name, bool bold,
       nullptr, // not an internal one
       bdf.font_bitmaps.data(), // a byte array from external BDF
       bdf.font_info.fontline_bytes,
+      nullptr, // not an internal one
       bdf.codepoints_array.data(),
       &bdf.bbx_array, // Individual BBX for each character, nullptr if not available for our internal fonts
       bdf.font_info.bbx, // from FONTBOUNDINGBOX, max WIDTH, HEIGHT, offset_x, offset_y
@@ -2197,7 +2212,14 @@ std::unique_ptr<BitmapFont> GetBitmapFont(int size, const char *name, bool bold,
   return std::unique_ptr<BitmapFont>(current_font);
 }
 
-static void DrawString_internal(BitmapFont* current_font, const VideoInfo& vi, PVideoFrame& dst, int x, int y, std::string& s_utf8,
+std::shared_ptr<const BitmapFont> GetBitmapFont(int size, const char* name, bool bold, bool debugSave, IScriptEnvironment* env)
+{
+  if (env == nullptr || debugSave)
+    return CreateBitmapFont(size, name, bold, debugSave);
+  return GetAndRevealCamouflagedEnv(env)->GetCachedBitmapFont(size, name, bold);
+}
+
+static void DrawString_internal(const BitmapFont* current_font, const VideoInfo& vi, PVideoFrame& dst, int x, int y, std::string& s_utf8,
   int color, int halocolor, bool useHalocolor, int align, bool fadeBackground, int chromalocation)
 {
   //static BitmapFont_10_20 infoFont1020; // constructor runs once, single instance
@@ -2360,14 +2382,14 @@ static void DrawString_internal(BitmapFont* current_font, const VideoInfo& vi, P
   }
 }
 
-void SimpleTextOutW(BitmapFont *current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
+void SimpleTextOutW(const BitmapFont *current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
   bool fadeBackground, int textcolor, int halocolor, bool useHaloColor, int align, int chromalocation)
 {
   DrawString_internal(current_font, vi, frame, real_x, real_y, text_utf8, textcolor, halocolor, useHaloColor, align, fadeBackground, chromalocation); // fully transparent background
 }
 
 // additional parameter: lsp line spacing
-void SimpleTextOutW_multi(BitmapFont *current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
+void SimpleTextOutW_multi(const BitmapFont *current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
   bool fadeBackground, int textcolor, int halocolor, bool useHaloColor,
   int align, int lsp, int chromalocation)
 {
@@ -2410,7 +2432,7 @@ void SimpleTextOutW_multi(BitmapFont *current_font, const VideoInfo& vi, PVideoF
 // Old legacy info.h functions, but with utf8 mode
 // w/o outline, originally with ASCII input, background fading
 // Despite name Planar, it works for all formats
-void DrawStringPlanar(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s)
+void DrawStringPlanar(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env)
 {
   int color;
   if (vi.IsRGB())
@@ -2424,7 +2446,7 @@ void DrawStringPlanar(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char*
 
   int halocolor = 0;
 
-  std::unique_ptr<BitmapFont> current_font = GetBitmapFont(20, "info_h", false, false); // 10x20
+  std::shared_ptr<const BitmapFont> current_font = GetBitmapFont(20, "info_h", false, false, env); // 10x20
 
   if (current_font == nullptr)
     return;
@@ -2440,19 +2462,19 @@ void DrawStringPlanar(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char*
 
 }
 
-void DrawStringYUY2(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s)
+void DrawStringYUY2(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env)
 {
-  DrawStringPlanar(vi, dst, x, y, s);
+  DrawStringPlanar(vi, dst, x, y, s, env);
 }
 
 // legacy function w/o outline, originally with ASCII input, background fading
-void DrawStringRGB24(VideoInfo &vi, PVideoFrame& dst, int x, int y, const char* s)
+void DrawStringRGB24(VideoInfo &vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env)
 {
-  DrawStringPlanar(vi, dst, x, y, s);
+  DrawStringPlanar(vi, dst, x, y, s, env);
 }
 
 // legacy function w/o outline, originally with ASCII input, background fading
-void DrawStringRGB32(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s)
+void DrawStringRGB32(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env)
 {
-  DrawStringPlanar(vi, dst, x, y, s);
+  DrawStringPlanar(vi, dst, x, y, s, env);
 }

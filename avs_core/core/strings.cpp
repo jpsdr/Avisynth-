@@ -41,18 +41,16 @@
 
 #include "strings.h"
 #include <cassert>
+#include <cfloat>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <algorithm>
 #include <codecvt>
 #include <locale>
 #include <vector>
 
-
-static inline char tolower(char c)
-{
-  // Works for letters of the english alphabet in ASCII
-  return ((c >=65) && (c <=90)) ? c + 32 : c;
-}
 
 bool streqi(const char* s1, const char* s2)
 {
@@ -65,7 +63,7 @@ bool streqi(const char* s1, const char* s2)
     if ((*s1 == 0) && (*s2 == 0))
       return true;
 
-    if (tolower(*s1) != tolower(*s2))
+    if (asciiToLower(*s1) != asciiToLower(*s2))
       return false;
 
     ++s1;
@@ -124,8 +122,8 @@ const char* ws = " \t\n\r\f\v";
 
 std::string trim(const std::string& s)
 {
-  auto wsfront = std::find_if_not(s.begin(), s.end(), [](int c) {return isspace(c); });
-  auto wsback = std::find_if_not(s.rbegin(), s.rend(), [](int c) {return isspace(c); }).base();
+  auto wsfront = std::find_if_not(s.begin(), s.end(), [](char c) {return isAsciiSpace(c); });
+  auto wsback = std::find_if_not(s.rbegin(), s.rend(), [](char c) {return isAsciiSpace(c); }).base();
   return (wsback <= wsfront ? std::string() : std::string(wsfront, wsback));
 }
 
@@ -232,17 +230,91 @@ std::string Utf8ToAnsi(const char* s_utf8)
 
 #endif
 
+// Shortest decimal digits which read back to the same value, laid out like Python's repr().
+// min_digits: 15 for double (DBL_DIG), 6 for float (FLT_DIG); max_digits: 17 for double, 9 for float;
+// is_float: round-trip check in 32 bit float precision.
+// Starting at DBL_DIG/FLT_DIG is enough: when the shortest form has k <= DBL_DIG digits, printing with
+// DBL_DIG digits gives the same k digits followed by zeros (the value is closer to its shortest decimal
+// than half a unit in the DBL_DIG-th digit), and the trailing zeros are stripped below.
+// So at most 3 (float: 4) print + read back rounds instead of up to 17.
+// Not for subnormals (below DBL_MIN / FLT_MIN): they have fewer significant bits, so they start from 1 digit.
+static std::string shortest_to_string(double d, int min_digits, int max_digits, bool is_float)
+{
+  if (std::isnan(d))
+    return "nan";
+  if (std::isinf(d))
+    return d < 0 ? "-inf" : "inf";
+  if (d == 0)
+    return std::signbit(d) ? "-0.0" : "0.0";
+
+  // find the shortest precision which round-trips
+  std::string digits; // significant digits, without the decimal point
+  int exponent = 0; // decimal exponent of the first digit
+  const bool subnormal = std::fabs(d) < (is_float ? (double)FLT_MIN : DBL_MIN);
+  for (int precision = subnormal ? 1 : min_digits; precision <= max_digits; precision++) {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%.*e", precision - 1, std::fabs(d)); // e.g. "1.5e-05"
+    // collect the digits, skipping the decimal point (which can be locale dependent)
+    digits.clear();
+    const char* p = buf;
+    for (; *p && *p != 'e' && *p != 'E'; p++)
+      if (isAsciiDigit(*p))
+        digits += *p;
+    exponent = (int)strtol(p + 1, nullptr, 10);
+    // read back without a decimal point, so locale independent
+    const std::string number = digits + "e" + std::to_string(exponent - (int)(digits.size() - 1));
+    const bool same = is_float ?
+      std::strtof(number.c_str(), nullptr) == (float)std::fabs(d) :
+      std::strtod(number.c_str(), nullptr) == std::fabs(d);
+    if (same)
+      break;
+  }
+  while (digits.size() > 1 && digits.back() == '0')
+    digits.pop_back();
+
+  std::string s = d < 0 ? "-" : "";
+  const int ndigits = (int)digits.size();
+  if (exponent < -4 || exponent >= 16) {
+    // 1e-05, 1.5e+16
+    s += digits[0];
+    if (ndigits > 1) {
+      s += '.';
+      s += digits.substr(1);
+    }
+    char e[8];
+    snprintf(e, sizeof(e), "e%c%02d", exponent < 0 ? '-' : '+', std::abs(exponent));
+    s += e;
+  }
+  else if (exponent < 0) {
+    // 0.0001, 0.015
+    s += "0.";
+    s += std::string(-exponent - 1, '0');
+    s += digits;
+  }
+  else {
+    // 1.0, 1.5, 100.0, 1234567890123456.0
+    if (ndigits > exponent + 1) {
+      s += digits.substr(0, exponent + 1);
+      s += '.';
+      s += digits.substr(exponent + 1);
+    }
+    else {
+      s += digits;
+      s += std::string(exponent + 1 - ndigits, '0');
+      s += ".0";
+    }
+  }
+  return s;
+}
+
 std::string double_to_string(double d)
 {
-  char s[50]; // safe size for a double
-#ifdef MSVC
-  _locale_t locale = _create_locale(LC_NUMERIC, "C"); // force '.' as decimal separator
-  _sprintf_l(s, "%lf", locale, d);
-  _free_locale(locale);
-#else
-  sprintf(s, "%lf", d);
-#endif
-  return s;
+  return shortest_to_string(d, DBL_DIG, 17, false);
+}
+
+std::string float_to_string(float f)
+{
+  return shortest_to_string(f, FLT_DIG, 9, true);
 }
 
 std::string GetFullPathNameWrapUtf8(const std::string& f)
@@ -274,29 +346,39 @@ size_t str_utf8_size(const std::string& s) {
   return len;
 }
 
-// converts a 16 bit unicode codepoint to its utf8 string representation
-std::string U16_to_utf8(uint16_t u16)
+// converts a unicode codepoint to its utf8 string representation
+// empty string for a value which is not a valid codepoint: surrogates D800-DFFF, above 10FFFF
+std::string U32_to_utf8(uint32_t cp)
 {
-  uint8_t bytes[3];
+  if ((cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+    return std::string();
+  uint8_t bytes[4];
   int size = 0;
-  // check the range of the UTF-16 code point
-  if (u16 <= 0x007F) {
+  if (cp <= 0x007F) {
     // one byte, 0xxxxxxx
-    bytes[0] = static_cast<uint8_t>(u16);
+    bytes[0] = static_cast<uint8_t>(cp);
     size = 1;
   }
-  else if (u16 <= 0x07FF) {
+  else if (cp <= 0x07FF) {
     // two bytes, 110xxxxx 10xxxxxx
-    bytes[0] = static_cast<uint8_t>(0xC0 | ((u16 >> 6) & 0x1F));
-    bytes[1] = static_cast<uint8_t>(0x80 | (u16 & 0x3F));
+    bytes[0] = static_cast<uint8_t>(0xC0 | ((cp >> 6) & 0x1F));
+    bytes[1] = static_cast<uint8_t>(0x80 | (cp & 0x3F));
     size = 2;
   }
-  else {
+  else if (cp <= 0xFFFF) {
     // three bytes, 1110xxxx 10xxxxxx 10xxxxxx
-    bytes[0] = static_cast<uint8_t>(0xE0 | ((u16 >> 12) & 0x0F));
-    bytes[1] = static_cast<uint8_t>(0x80 | ((u16 >> 6) & 0x3F));
-    bytes[2] = static_cast<uint8_t>(0x80 | (u16 & 0x3F));
+    bytes[0] = static_cast<uint8_t>(0xE0 | ((cp >> 12) & 0x0F));
+    bytes[1] = static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3F));
+    bytes[2] = static_cast<uint8_t>(0x80 | (cp & 0x3F));
     size = 3;
+  }
+  else {
+    // four bytes, 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+    bytes[0] = static_cast<uint8_t>(0xF0 | ((cp >> 18) & 0x07));
+    bytes[1] = static_cast<uint8_t>(0x80 | ((cp >> 12) & 0x3F));
+    bytes[2] = static_cast<uint8_t>(0x80 | ((cp >> 6) & 0x3F));
+    bytes[3] = static_cast<uint8_t>(0x80 | (cp & 0x3F));
+    size = 4;
   }
   // convert the array of bytes to a string
   std::string u8str(bytes, bytes + size);

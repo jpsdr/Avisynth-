@@ -44,6 +44,10 @@
 #include <avs/posix.h>
 #endif
 #include <cassert>
+#include <cfloat>
+#include <climits>
+#include <cstdint>
+#include <cmath>
 #include <vector>
 
 
@@ -54,6 +58,14 @@ class BreakStmtException
 class ContinueStmtException
 {
 };
+
+// 64 bit integer arithmetic with defined wrap-around on overflow (two's complement), through unsigned.
+// Signed overflow is undefined behavior in C++, the compiler may assume it never happens.
+// unsigned integer overflow is 100% well-defined
+static inline int64_t WrapAdd(int64_t a, int64_t b) { return (int64_t)((uint64_t)a + (uint64_t)b); }
+static inline int64_t WrapSub(int64_t a, int64_t b) { return (int64_t)((uint64_t)a - (uint64_t)b); }
+static inline int64_t WrapMul(int64_t a, int64_t b) { return (int64_t)((uint64_t)a * (uint64_t)b); }
+static inline int64_t WrapNeg(int64_t a) { return (int64_t)(0 - (uint64_t)a); }
 
 AVSValue ExpRootBlock::Evaluate(IScriptEnvironment* env)
 {
@@ -253,7 +265,12 @@ AVSValue ExpForLoop::Evaluate(IScriptEnvironment* env)
     AVSValue idVal = env->GetVar(id); // may have been updated in body
     if (!idVal.IsInt())
       env->ThrowError("for: loop variable '%s' has been assigned a non-int value", id);
-    i = idVal.AsLong() + iStep;
+    i = idVal.AsLong();
+    // the next value would overflow: it would be beyond any limit, the loop is finished
+    // (a wrapped-around value would be within the limit again: endless loop)
+    if (iStep > 0 ? i > INT64_MAX - iStep : i < INT64_MIN - iStep)
+      break;
+    i += iStep;
     // store back to smaller type
     if (i >= INT_MIN && i <= INT_MAX)
       env->SetVar(id, (int)i);
@@ -320,6 +337,22 @@ AVSValue ExpAnd::Evaluate(IScriptEnvironment* env)
 }
 
 
+// Float compare operands for == and <.
+// When either side is a 32 bit float, both are rounded to float, so that e.g. 2.6f (a plugin result)
+// equals the 64 bit double script constant 2.6 and 2.6f < 2.6 is not true. Rounding never reverses
+// the order, it only can make two close values equal.
+// Values out of the float range (and NaN) are not rounded, they would become inf: compared in double.
+// Otherwise (double, int, long) the compare is done in double.
+static void GetCompareFloats(const AVSValue& x, const AVSValue& y, double& fx, double& fy)
+{
+  fx = x.AsFloat();
+  fy = y.AsFloat();
+  if ((x.IsFloatfStrict() || y.IsFloatfStrict()) && std::fabs(fx) <= FLT_MAX && std::fabs(fy) <= FLT_MAX) {
+    fx = (float)fx;
+    fy = (float)fy;
+  }
+}
+
 AVSValue ExpEqual::Evaluate(IScriptEnvironment* env)
 {
   AVSValue x = a->Evaluate(env);
@@ -330,11 +363,10 @@ AVSValue ExpEqual::Evaluate(IScriptEnvironment* env)
   else if (x.IsInt() && y.IsInt()) { // true for any 32/64 bit data
     return x.AsLong() == y.AsLong(); // work with 64 bits
   }
-  else if (x.IsFloatfStrict() && y.IsFloatfStrict()) {
-    return x.AsFloatf() == y.AsFloatf();
-  }
   else if (x.IsFloat() && y.IsFloat()) {
-    return x.AsFloat() == y.AsFloat(); // AsFloat returns double
+    double fx, fy;
+    GetCompareFloats(x, y, fx, fy);
+    return fx == fy;
   }
   else if (x.IsClip() && y.IsClip()) {
     return x.AsClip() == y.AsClip();
@@ -359,11 +391,10 @@ AVSValue ExpLess::Evaluate(IScriptEnvironment* env)
   if (x.IsInt() && y.IsInt()) { // true for any 32/64 bit data
     return x.AsLong() < y.AsLong(); // work with 64 bits
   }
-  else if (x.IsFloatfStrict() && y.IsFloatfStrict()) {
-    return x.AsFloatf() < y.AsFloatf();
-  }
   else if (x.IsFloat() && y.IsFloat()) {
-    return x.AsFloat() < y.AsFloat();
+    double fx, fy;
+    GetCompareFloats(x, y, fx, fy);
+    return fx < fy;
   }
   else if (x.IsString() && y.IsString()) {
     return _stricmp(x.AsString(),y.AsString()) < 0 ? true : false;
@@ -383,7 +414,7 @@ AVSValue ExpPlus::Evaluate(IScriptEnvironment* env)
     return env->Invoke("UnalignedSplice", AVSValue(arg, 3));
   }
   else if (x.IsInt() && y.IsInt()) { // they are true for any 32/64 bits inside
-    int64_t result = x.AsLong() + y.AsLong();
+    int64_t result = WrapAdd(x.AsLong(), y.AsLong());
     // keep the smaller type
     if (result >= INT_MIN && result <= INT_MAX)
       return (int)result;
@@ -422,7 +453,7 @@ AVSValue ExpMinus::Evaluate(IScriptEnvironment* env)
   AVSValue x = a->Evaluate(env);
   AVSValue y = b->Evaluate(env);
   if (x.IsInt() && y.IsInt()) { // they are true for any 32/64 bits inside
-    int64_t result = x.AsLong() - y.AsLong();
+    int64_t result = WrapSub(x.AsLong(), y.AsLong());
     // keep the smaller type
     if (result >= INT_MIN && result <= INT_MAX)
       return (int)result;
@@ -444,7 +475,7 @@ AVSValue ExpMult::Evaluate(IScriptEnvironment* env)
   AVSValue x = a->Evaluate(env);
   AVSValue y = b->Evaluate(env);
   if (x.IsInt() && y.IsInt()) { // they are true for any 32/64 bits inside
-    int64_t result = x.AsLong() * y.AsLong();
+    int64_t result = WrapMul(x.AsLong(), y.AsLong());
     // keep the smaller type
     if (result >= INT_MIN && result <= INT_MAX)
       return (int)result;
@@ -468,6 +499,8 @@ AVSValue ExpDiv::Evaluate(IScriptEnvironment* env)
   if (x.IsInt() && y.IsInt()) { // they are true for any 32/64 bits inside
     if (y.AsLong() == 0)
       env->ThrowError("Evaluate: division by zero");
+    if (x.AsLong() == INT64_MIN && y.AsLong() == -1) // UB, a hardware exception on x86
+      env->ThrowError("Evaluate: integer overflow in division");
     int64_t result = x.AsLong() / y.AsLong();
     // keep the smaller type
     if (result >= INT_MIN && result <= INT_MAX)
@@ -492,6 +525,8 @@ AVSValue ExpMod::Evaluate(IScriptEnvironment* env)
   if (x.IsInt() && y.IsInt()) { // they are true for any 32/64 bits inside
     if (y.AsLong() == 0)
       env->ThrowError("Evaluate: division by zero");
+    if (y.AsLong() == -1) // x % -1 is always 0; INT64_MIN % -1 would be UB, a hardware exception on x86
+      return 0;
     int64_t result = x.AsLong() % y.AsLong();
     // keep the smaller type
     if (result >= INT_MIN && result <= INT_MAX)
@@ -512,7 +547,7 @@ AVSValue ExpNegate::Evaluate(IScriptEnvironment* env)
     // Note: In the old 32-bit integer case, the special value -(INT_MIN) resulted in a negative value
     // instead of a positive number.
     // This change in version 11 is not 100% compatible with the old behavior.
-    int64_t result = -x.AsLong();
+    int64_t result = WrapNeg(x.AsLong()); // -INT64_MIN wraps to INT64_MIN
     // keep the smaller type
     if (result >= INT_MIN && result <= INT_MAX)
       return (int)result;
@@ -815,11 +850,6 @@ const char* FunctionInstance::ToString(IScriptEnvironment* env)
   }
 }
 
-static bool is_within_int_in_float32_range(int64_t value) {
-  // 2^24
-  return value >= -16777216 && value <= 16777216;
-}
-
 AVSValue FunctionInstance::Execute(const AVSValue& args, IScriptEnvironment* env)
 {
   env->PushContext();
@@ -830,11 +860,9 @@ AVSValue FunctionInstance::Execute(const AVSValue& args, IScriptEnvironment* env
     env->SetVar(pdef->param_names[i],
       // Same as in ScriptFunction::Execute and AVSValue FunctionInstance::Execute
           
-      // force float args that are actually long/int (int64) to be float/double (depending on the range)
-      // opportunity to fit into the smaller float size
-      (pdef->param_floats[i] && args[i].IsInt()) ?
-      is_within_int_in_float32_range(args[i].AsLong()) ? (float)args[i].AsLong() : (double)args[i].AsLong() :
-      args[i]
+      // int/long args passed to float parameters are converted to 64 bit double.
+      // Not to 32 bit float: then arithmetic between two such parameters would be done in float.
+      (pdef->param_floats[i] && args[i].IsInt()) ? AVSValue((double)args[i].AsLong()) : args[i]
     );
 
   AVSValue result;

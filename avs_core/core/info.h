@@ -44,6 +44,7 @@
 #include <array>
 #include <iomanip>
 #include <vector>
+#include <memory>
 #include <cstring>
 #include "strings.h"
 
@@ -131,13 +132,14 @@ public:
 
   std::unordered_map<std::string, int> charReMapUtf8; // utf8 vs. font image index
 
-  void SaveAsC(const uint16_t* _codepoints);
+  void SaveAsC(const uint32_t* _codepoints);
 
   BitmapFont(int _number_of_chars,
     const uint16_t* _src_font_bitmaps_internaluint16, 
     const uint8_t* _src_font_bitmaps, 
     const int _fontline_bytes, 
-    const uint16_t* _codepoints,
+    const uint16_t* _codepoints_internaluint16, // unicode codepoints of an internal, predefined font
+    const uint32_t* _codepoints, // unicode codepoints from external BDF, can be above U+FFFF
     const std::vector<BBX>* bbx_array_ptr,
     const BBX& _global_bbx,
     std::string _font_name, std::string _font_filename, bool _bold, bool debugSave) :
@@ -169,9 +171,12 @@ public:
 
     // We always display utf8 strings, so the reverse lookup must be utf8 character based,
     // which returns the index to the font bitmap and bbx array.
+    // Either the internal 16 bit or the external (BDF) 32 bit codepoint array is given, the other is nullptr.
     for (int i = 0; i < _number_of_chars; i++) {
-      std::string s_utf8 = U16_to_utf8(_codepoints[i]);
-      charReMapUtf8[s_utf8] = i;
+      const uint32_t cp = _codepoints != nullptr ? _codepoints[i] : _codepoints_internaluint16[i];
+      std::string s_utf8 = U32_to_utf8(cp);
+      if (!s_utf8.empty()) // not for an invalid codepoint, e.g. BDF ENCODING -1 (unencoded glyph)
+        charReMapUtf8[s_utf8] = i;
     }
 
 
@@ -194,25 +199,32 @@ public:
       bbx_array.assign(_number_of_chars, global_bbx);
     }
 
-    if (debugSave)
+    if (debugSave && _codepoints != nullptr) // only for external BDF
       SaveAsC(_codepoints);
   }
 
+  // true when loaded from an external BDF file (built-in fonts have no file name)
+  bool IsFromFile() const { return !font_filename.empty(); }
+
   // helper function for remapping an utf8 string to font index entry list
-  std::vector<int> remap(const std::string& s_utf8);
+  std::vector<int> remap(const std::string& s_utf8) const;
 };
 
-std::unique_ptr<BitmapFont> GetBitmapFont(int size, const char* name, bool bold, bool debugSave);
+// creates a new font instance (uncached)
+std::unique_ptr<BitmapFont> CreateBitmapFont(int size, const char* name, bool bold, bool debugSave);
+// Returns a shared, immutable font from the per-ScriptEnvironment font cache, created on first use.
+// Uncached (new instance) when env is nullptr or for debugSave.
+std::shared_ptr<const BitmapFont> GetBitmapFont(int size, const char* name, bool bold, bool debugSave, IScriptEnvironment* env);
 
-void SimpleTextOutW(BitmapFont* current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
+void SimpleTextOutW(const BitmapFont* current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
   bool fadeBackground, int textcolor, int halocolor, bool useHaloColor, int align, int chromaplacement);
-void SimpleTextOutW_multi(BitmapFont* current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
+void SimpleTextOutW_multi(const BitmapFont* current_font, const VideoInfo& vi, PVideoFrame& frame, int real_x, int real_y, std::string& text_utf8,
   bool fadeBackground, int textcolor, int halocolor, bool useHaloColor, int align, int lsp, int chromaplacement);
 
 // legacy function w/o outline, originally with ASCII input, background fading
-void DrawStringPlanar(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s);
-void DrawStringYUY2(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s);
-void DrawStringRGB32(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s);
-void DrawStringRGB24(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s);
+void DrawStringPlanar(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env);
+void DrawStringYUY2(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env);
+void DrawStringRGB32(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env);
+void DrawStringRGB24(VideoInfo& vi, PVideoFrame& dst, int x, int y, const char* s, IScriptEnvironment* env);
 
 #endif  // __INFO_H__
