@@ -441,64 +441,13 @@ static size_t GetNumPhysicalCPUs()
 #endif
 }
 
-#ifdef MSVC
+// '.' decimal point regardless of the process locale. A host program or a plugin may call
+// setlocale(LC_ALL, "") (e.g. Qt and GTK do on Linux), which switches the whole process to the
+// environment's locale, possibly with a decimal comma.
 static std::string FormatString(const char* fmt, va_list args)
 {
-  va_list args2;
-  va_copy(args2, args);
-  _locale_t locale = _create_locale(LC_NUMERIC, "C"); // decimal point: dot
-
-  int count = _vscprintf_l(fmt, locale, args2);
-  // don't use _vsnprintf_l(NULL, 0, fmt, locale, args) here,
-  // it returns -1 instead of the buffer size under Wine (February, 2017)
-  std::vector<char> buf(count + 1);
-  _vsnprintf_l(buf.data(), buf.size(), fmt, locale, args2);
-
-  _free_locale(locale);
-  va_end(args2);
-
-  return std::string(buf.data());
+  return vsprintf_c(fmt, args);
 }
-#else
-static std::string FormatString(const char* fmt, va_list args)
-{
-  va_list args2;
-  va_copy(args2, args);
-
-  // There is no locale specific version of vsnprintf under Linux/gcc.
-  // During program startup, the equivalent of setlocale(LC_ALL, "C")
-  // is executed before any user code is run. But Avisynth is just a dll/shared object.
-  // If the host program calls std::setlocale(LC_ALL, "") - typically in its 'main()'
-  // then it sets current locale by the environment variables.
-  // Unfortunately setlocale is not thread safe and modifies global state which
-  // affects execution of locale-dependent functions, it is undefined behavior to call
-  // it from one thread, while another thread is executing any of such functions (e.g. sprintf)
-  // It can happen that a plugin sets setlocale(LC_ALL, ""). The effect is global,
-  // other formatting functions in the same program will start using the new
-  // (environment) setting.
-  // One must set LC_NUMERIC part of the locale to "C" before the host executable,
-  // to be sure that after such unsafe setlocale(LC_ALL, "") then formatting to dot
-  // remains O.K.
-
-#if 0
-  // Finally we don't do that. Not 100% safe.
-  std::string prev_loc = std::setlocale(LC_NUMERIC, nullptr);
-  setlocale(LC_NUMERIC, "C"); // Set C locale for '.' and no thousand sep
-#endif
-
-  int count = vsnprintf(NULL, 0, fmt, args);
-  std::vector<char> buf(count + 1);
-  vsnprintf(buf.data(), buf.size(), fmt, args2);
-
-  va_end(args2);
-
-#if 0
-  std::setlocale(LC_NUMERIC, prev_loc.c_str()); // Restore the previous locale.
-#endif
-
-  return std::string(buf.data());
-}
-#endif
 
 void* VideoFrame::operator new(size_t size) {
   return ::operator new(size);
@@ -1962,15 +1911,13 @@ public:
     // which would (if unchanged) result in a 64 bit type, like Pi() returns double.
     // Example call: 
     // AVS_Value ver = avs_invoke(Env, "Pi", avs_new_value_array(NULL, 0), NULL);
-    // We convert only basic types, and not handling array type return values here,
-    // to look into whether it contains 64 bit elements accidentally.
-    // Neither is an old C plugin expected to handle array return values.
-    // Anyway, proper dyn array support comes only from v11 on C API.
-    if (result.GetType() == AvsValueType::VALUE_TYPE_LONG) // real 64 bit integer
-      result = result.AsInt(); // to 32 bit integer
-    else if (result.GetType() == AvsValueType::VALUE_TYPE_DOUBLE) // real 64 bit double
-      result = result.AsFloatf(); // to 32 bit float
-
+    // Array results are converted at any depth: one level e.g. propGetAsArray (frame properties
+    // are flat, like VapourSynth maps), nested ones from script arrays (Eval("[[1.0/3]]")).
+    // Only C callers get here (pre-V11 C plugin, or C host requesting a version below 11):
+    // they reach the elements without an API call, the old avisynth_c.h inline avs_array_elt
+    // reads v.d.array[index] directly.
+    // Converted in place, result is our own deep copied value (see ValueTo32bit).
+    ValueTo32bit(result, true);
     return result;
   }
 
@@ -3140,8 +3087,8 @@ void ScriptEnvironment::SetMaxCPU(const char* features)
     else if (streqi(t, "sve2")) cpulevel = CL_SVE2;
     else if (streqi(t, "i8mm")) cpulevel = CL_I8MM;
     else if (streqi(t, "sve2.1")) cpulevel = CL_SVE2_1;
-    // i8mm is just an optional level may not dependent on sve2 and vice versa
-    else ThrowError("SetMaxCPU error: cpu level must be empty or none, neon, dotprod or sve2 (%s)", t);
+    // i8mm is an optional feature, independent of sve2 and of the architecture level
+    else ThrowError("SetMaxCPU error: cpu level must be empty or none, neon, dotprod, sve2, i8mm or sve2.1 (%s)", t);
 #elif defined(X86_32) || defined(X86_64)
     else if (streqi(t, "mmx")) cpulevel = CL_MMX;
     else if (streqi(t, "sse")) cpulevel = CL_SSE;
@@ -3160,37 +3107,36 @@ void ScriptEnvironment::SetMaxCPU(const char* features)
 #endif
 
     if (0 == mode) { // limit
-      // always switch off the more advanced features compared to previous check if limiting
+      // A limit only switches off features, the ones above the given level; it never adds any.
 #if defined(ARM64)
-      if (cpulevel <= CL_SVE2_1) {
-        // already max level, nothing to do
+      // ARM features do not form a strict level hierarchy like x86: i8mm can be present or not
+      // at different architecture levels. So i8mm is independent of the dotprod/sve2 chain, only the
+      // "neon" (no extensions) and "none" limits switch it off; otherwise use "i8mm-".
+      if (cpulevel == CL_I8MM) {
+        // i8mm as a limit: no level meaning, nothing to switch off
       }
-      if (cpulevel <= CL_SVE2) {
-        cpu_flags &= ~CPUF_ARM_SVE2_1;
-      }
-      if (cpulevel <= CL_DOTPROD) {
-        cpu_flags &= ~CPUF_ARM_SVE2;
-      }
-      if (cpulevel <= CL_NEON) {
-        cpu_flags &= ~CPUF_ARM_DOTPROD;
-      }
-      if (cpulevel <= CL_NONE) {
-        cpu_flags &= ~CPUF_ARM_NEON; // switch off the most minimal feature
+      else {
+        if (cpulevel <= CL_SVE2) {
+          cpu_flags &= ~CPUF_ARM_SVE2_1;
+        }
+        if (cpulevel <= CL_DOTPROD) {
+          cpu_flags &= ~CPUF_ARM_SVE2;
+        }
+        if (cpulevel <= CL_NEON) {
+          cpu_flags &= ~(CPUF_ARM_DOTPROD | CPUF_ARM_I8MM);
+        }
+        if (cpulevel <= CL_NONE) {
+          cpu_flags &= ~CPUF_ARM_NEON; // switch off the most minimal feature
+        }
       }
 
 #elif defined(X86_32) || defined(X86_64)
-      // group feature
-      if (cpulevel <= CL_AVX512_FAST) {
-        // disable all avx512, re-enable the whole mask up to "fast"
-        cpu_flags &= ~CPUF_AVX512_MASK;
-        cpu_flags |= CPUF_AVX512_FAST_ALL;
-      }
-      // group feature
-      if (cpulevel <= CL_AVX512_BASE) {
-        // disable all avx512, re-enable the whole mask up to "base"
-        cpu_flags &= ~CPUF_AVX512_MASK;
-        cpu_flags |= CPUF_AVX512_BASE_ALL;
-      }
+      // group features: keep only the avx512 features of the group which are present
+      // (setting the group bits would report features the CPU or an earlier limit does not have)
+      if (cpulevel <= CL_AVX512_FAST)
+        cpu_flags &= ~(CPUF_AVX512_MASK & ~CPUF_AVX512_FAST_ALL);
+      if (cpulevel <= CL_AVX512_BASE)
+        cpu_flags &= ~(CPUF_AVX512_MASK & ~CPUF_AVX512_BASE_ALL);
       // individual features
       if (cpulevel <= CL_AVX2) // just disable all avx512
         cpu_flags &= ~CPUF_AVX512_MASK;
@@ -5526,6 +5472,10 @@ bool ScriptEnvironment::Invoke_(AVSValue *result, const AVSValue& implicit_last,
   if(is_runtime) {
     // Invoked by a thread or GetFrame
     AVSValue funcArgs(args3.data(), (int)args3.size());
+
+    // 2.5 and pre-V11 C plugins get long and double converted, like in FilterConstructor
+    if (f->isPluginAvs25 || f->isPluginPreV11C)
+      ArgsTo32bit(funcArgs, f->isPluginPreV11C);
 
     if (f->isPluginAvs25) // like GRunT's AverageLuma wrapper
       *result = f->apply(funcArgs, f->user_data, (IScriptEnvironment*)((IScriptEnvironment_Avs25*)env_thread));

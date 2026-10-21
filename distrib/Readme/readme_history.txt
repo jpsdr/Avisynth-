@@ -9,8 +9,67 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20261020 3.7.5.rXXXX (pre 3.7.6)
+20261021 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
+- Fix: SetMaxCPU limited the CPU flags of the whole process until the DLL was unloaded: a script reload
+  in VirtualDub, with a new ScriptEnvironment, kept the earlier limit (#440). Since 3d7c1a8e (2025-05)
+  the limit is stored per ScriptEnvironment; now documented, and the unused singleton setter removed.
+  Existed since 3.6.0.
+- SetMaxCPU: a limit only switches features off: "avx512fast" and "avx512base" keep the AVX-512
+  features of the group which are present (after an earlier "avx2" limit, or on a CPU without them,
+  none). ARM64: "neon" (NEON without extensions) and "none" switch off i8mm as well; i8mm stays
+  independent of the dotprod/sve2/sve2.1 limits (no strict ARM level hierarchy), use "i8mm-".
+  The error message lists i8mm and sve2.1.
+  Documented the environment lifetime and the '+' behavior.
+- Fix: String() and everything formatted by env->Sprintf on Linux, macOS, BSD and MinGW builds with
+  UCRT: '.' decimal point regardless of the process locale. Windows MSVC builds did so since 2016
+  (_l functions); the others used plain vsnprintf, so when a host or plugin switched the locale to a
+  decimal comma one (setlocale, e.g. Qt or GTK on Linux), String(3.5) gave "3,500000".
+  The new Format specifications ({:.2f}) go through the same formatting.
+  New helper vsprintf_c: MSVC and UCRT: _vsnprintf_l with a "C" numeric locale; POSIX: uselocale,
+  which is per thread, unlike setlocale (tested on Linux under hu_HU.UTF-8, another thread kept its ',').
+  MinGW builds with the old msvcrt.dll keep following the locale: its _vsnprintf_l formats differently
+  (3 digit exponent, 1e+020) and it has no per-thread locale.
+- Fix: Value(), ConditionalReader float values, GeneralConvolution matrix: the decimal point is always '.'.
+  They followed the C locale of the process (strtod, sscanf, atof): with the default "C" locale no
+  difference, but when a host or plugin switched it to a decimal comma one (setlocale, e.g. Qt or GTK
+  hosts on Linux), the '.' stopped the number. Under such a locale (all releases, tested r2294 .. 3.7.5):
+  Value("3.5") gave 3, Value("-1.25e2") gave -1, a ConditionalReader float 1.75 gave 1,
+  GeneralConvolution(matrix="0 0 0 0 0.5 0 0 0 0") on a 32 bit float clip gave black.
+  Now parsed like the script tokenizer, independent of the locale. Hex, inf, nan as before.
+  Existed since classic AviSynth.
+- C API avs_create_script_environment: a refused request (version newer than the AviSynth, e.g. 15 on
+  V14) is reported by avs_get_error: "avs_create_script_environment: requested interface version is
+  newer than this AviSynth". Until now the wrapper held no environment and no error, any call through
+  it crashed. The wrapper is still non-NULL, delete it with avs_delete_script_environment.
+  avisynth_c_loader.h's avs_library_env_failed checks avs_get_error first, the NULL core pointer for
+  older versions.
+- Fix: C plugins without avisynth_c_plugin_init2 (pre-V11): avs_invoke called inside
+  avisynth_c_plugin_init returned unconverted double and long (int64) values, e.g. Eval("Pi()") gave
+  'd' 3.1415926535897931, now 'f' 3.1415927410125732. The init gets the same pre-V11 environment as
+  the plugin's functions. Existed since 3.7.4.
+- Fix: C plugins without avisynth_c_plugin_init2 (pre-V11) got unconverted double and long (int64)
+  values in three cases; an old avisynth_c.h does not know these types (its inline avs_is_float sees
+  'i' and 'f' only). Now converted to float and 32 bit int, like the top-level filter arguments were:
+  - function called at runtime, e.g. LdrTest(1.0/3) inside ScriptClip got 'd' 0.33333333333333331,
+    now 'f' 0.3333333432674408; LdrTest(4294967297) got 'l', now 'i' 1
+  - array arguments, at any depth: LdrTest([[[4294967297]]]) element was 'l', now 'i'
+  - array results of avs_invoke: Eval("[[1.0/3]]") element was 'd', now 'f'
+    (also for C hosts which requested a version below 11 in avs_create_script_environment)
+  AviSynth 2.5 C++ plugins: top-level arguments are now converted at runtime as well.
+  Existed since 3.7.4.
+- Optimization (under the hood, no visible change): filter construction copies the function arguments
+  (deep copy of arrays) once instead of twice, for 2.5 and pre-V11 C plugins once instead of three times;
+  the 64 bit conversion is in place. Matters only for big (nested) array arguments.
+- C API dynamic loading: new header avisynth_c_loader.h (Windows, Linux, macOS, ...), replaces the
+  Windows-only loader of avisynth_c.h. Loads all C API functions, those missing from an older AviSynth
+  are NULL; each is commented with the interface version from which it is reliably usable.
+  avs_library_create_script_environment (hosts) and avs_library_detect_plugin_env (plugins) fill the
+  interface version, has_at_least_v8 .. _v14 feature steps and has_64bit_values.
+  Removed from avisynth_c.h: the old avs_load_library, AVS26_FALLBACK_SIMULATION, EXTERNAL_AVS_C_API_LOADER.
+  See https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/FilterSDK/C_api.html
+- avisynth_c.h: list of API functions fixed later than they appeared, with the interface version
+  of the fix (frame properties: V9, avs_prop_get_data, avs_new_video_frame_p: V9.1, avs_prop_get_clip: V14...).
 - Fix: runtime functions AverageLuma (and the other Average*), LumaDifference (and the other *Difference*,
   *DifferenceFromPrevious, *DifferenceToNext) and PlaneMinMaxStats returned 32 bit float, so the result
   did not compare equal to the same value written as a (64 bit double) script constant:

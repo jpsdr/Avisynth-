@@ -50,6 +50,11 @@
 #include <codecvt>
 #include <locale>
 #include <vector>
+#include <clocale>
+#include <cstdarg>
+#ifdef AVS_MACOS
+#include <xlocale.h> // newlocale, uselocale
+#endif
 
 
 bool streqi(const char* s1, const char* s2)
@@ -281,9 +286,12 @@ static std::string shortest_to_string(double d, int min_digits, int max_digits, 
       s += '.';
       s += digits.substr(1);
     }
-    char e[8];
-    snprintf(e, sizeof(e), "e%c%02d", exponent < 0 ? '-' : '+', std::abs(exponent));
-    s += e;
+    // "e", sign, at least two digits (like printf %e)
+    const int abs_exponent = std::abs(exponent);
+    s += exponent < 0 ? "e-" : "e+";
+    if (abs_exponent < 10)
+      s += '0';
+    s += std::to_string(abs_exponent);
   }
   else if (exponent < 0) {
     // 0.0001, 0.015
@@ -315,6 +323,144 @@ std::string double_to_string(double d)
 std::string float_to_string(float f)
 {
   return shortest_to_string(f, FLT_DIG, 9, true);
+}
+
+// The digits are passed to strtod as "<digits>e<exponent - fraction_digits>", without a decimal point,
+// so the result is correctly rounded and does not depend on the locale.
+// The former d = d * 10 + digit, then d / 10^n method of the script parser was exact only up to ~15 digits:
+// above 2^53 each step rounds, and the final division rounds again.
+const char* scan_decimal(const char* p, double* value)
+{
+  const char* const start = p;
+  std::string digits;
+  int fraction_digits = 0;
+  while (isAsciiDigit(*p))
+    digits += *p++;
+  if (*p == '.') {
+    p++;
+    while (isAsciiDigit(*p)) {
+      digits += *p++;
+      fraction_digits++;
+    }
+  }
+  if (digits.empty()) { // no number (a lone '.' is not one)
+    *value = 0.0;
+    return start;
+  }
+
+  // optional exponent: e or E, optional sign, at least one digit
+  int exponent = 0;
+  if ((*p == 'e' || *p == 'E') &&
+    (isAsciiDigit(p[1]) || ((p[1] == '+' || p[1] == '-') && isAsciiDigit(p[2])))) {
+    p++;
+    const bool negative_exponent = *p == '-';
+    if (*p == '+' || *p == '-')
+      p++;
+    while (isAsciiDigit(*p)) {
+      if (exponent < 100000) // saturate, the result is 0 or inf way before that
+        exponent = exponent * 10 + (*p - '0');
+      p++;
+    }
+    if (negative_exponent)
+      exponent = -exponent;
+  }
+
+  const std::string number = digits + "e" + std::to_string(exponent - fraction_digits);
+  *value = std::strtod(number.c_str(), nullptr);
+  return p;
+}
+
+double strtod_c(const char* s, const char** end)
+{
+  const char* p = s;
+  while (isAsciiSpace(*p))
+    p++;
+  const char* const number_start = p;
+  const bool negative = *p == '-';
+  if (*p == '+' || *p == '-')
+    p++;
+
+  // hex, inf, nan: no decimal point issue (hex fraction aside), keep the strtod behavior
+  if ((p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) || asciiToLower(*p) == 'i' || asciiToLower(*p) == 'n') {
+    char* e;
+    const double d = std::strtod(number_start, &e);
+    if (end)
+      *end = e == number_start ? s : e;
+    return d;
+  }
+
+  double d;
+  const char* const number_end = scan_decimal(p, &d);
+  if (number_end == p) { // no digits: nothing used, 0 (not -0 for a lone '-'), like strtod
+    if (end)
+      *end = s;
+    return 0.0;
+  }
+  if (end)
+    *end = number_end;
+  return negative ? -d : d;
+}
+
+// The locale object is created per call: a function-local static would need thread-safe static
+// initialization, which is off for the XP builds (/Zc:threadSafeInit-).
+// MSVC and MinGW with UCRT (_UCRT): the _l functions of the UCRT.
+// MinGW with the old msvcrt.dll: its _vsnprintf_l formats differently (3 digit exponent: 1e+020)
+// and it has no per-thread locale, so the plain vsnprintf stays: follows the process locale.
+// POSIX: uselocale, per thread.
+std::string vsprintf_c(const char* fmt, va_list args)
+{
+  va_list args_count, args_print; // one copy for each pass
+  va_copy(args_count, args);
+  va_copy(args_print, args);
+  std::string result;
+#if defined(AVS_WINDOWS) && (defined(MSVC) || defined(_UCRT))
+  _locale_t c_locale = _create_locale(LC_NUMERIC, "C");
+  // don't use _vsnprintf_l(NULL, 0, ...) for the size, it returns -1 instead under Wine (February, 2017)
+  const int count = c_locale ? _vscprintf_l(fmt, c_locale, args_count) : _vscprintf(fmt, args_count);
+  if (count >= 0) {
+    std::vector<char> buf(count + 1);
+    if (c_locale)
+      _vsnprintf_l(buf.data(), buf.size(), fmt, c_locale, args_print);
+    else
+      vsnprintf(buf.data(), buf.size(), fmt, args_print);
+    result.assign(buf.data(), count);
+  }
+  if (c_locale)
+    _free_locale(c_locale);
+#elif defined(AVS_WINDOWS)
+  const int count = vsnprintf(nullptr, 0, fmt, args_count);
+  if (count >= 0) {
+    std::vector<char> buf(count + 1);
+    vsnprintf(buf.data(), buf.size(), fmt, args_print);
+    result.assign(buf.data(), count);
+  }
+#else
+  // uselocale is per thread, unlike setlocale, which would change the whole process unsafely
+  locale_t c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+  locale_t prev_locale = c_locale ? uselocale(c_locale) : (locale_t)0;
+  const int count = vsnprintf(nullptr, 0, fmt, args_count);
+  if (count >= 0) {
+    std::vector<char> buf(count + 1);
+    vsnprintf(buf.data(), buf.size(), fmt, args_print);
+    result.assign(buf.data(), count);
+  }
+  if (c_locale) {
+    uselocale(prev_locale);
+    freelocale(c_locale);
+  }
+#endif
+  va_end(args_count);
+  va_end(args_print);
+  return result;
+}
+
+std::string sprintf_c(const char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  std::string result = vsprintf_c(fmt, args);
+  va_end(args);
+  return result;
 }
 
 std::string GetFullPathNameWrapUtf8(const std::string& f)

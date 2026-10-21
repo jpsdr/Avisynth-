@@ -514,8 +514,10 @@ CWDChanger::CWDChanger(const char* new_cwd)
 
 CWDChanger::~CWDChanger(void)
 {
-  if (restore)
-    chdir(old_working_directory);
+  if (restore) {
+    // nothing to do on failure in a destructor; the if only consumes the warn_unused_result value
+    if (chdir(old_working_directory) != 0) {}
+  }
 }
 #endif
 
@@ -1882,15 +1884,8 @@ AVSValue String(AVSValue args, void*, IScriptEnvironment* env)
     }
     if (args[0].IsFloat()) { // for double as well.
       // "%lf" prints all integer digits: up to 309 for DBL_MAX, plus sign, '.', 6 decimals and '\0'
-      char s[DBL_MAX_10_EXP + 1 + 1 + 1 + 6 + 1 + 16]; // was 50 (too small -> crash)
-#ifdef MSVC
-      _locale_t locale = _create_locale(LC_NUMERIC, "C"); // decimal point: dot
-      _sprintf_l(s, "%lf", locale, args[0].AsFloat());
-      _free_locale(locale);
-#else
-      sprintf(s, "%lf", args[0].AsFloat());
-#endif
-      return env->SaveString(s);
+      // '.' decimal point regardless of the process locale
+      return env->SaveString(sprintf_c("%lf", args[0].AsFloat()).c_str());
     }
   }
   return "";
@@ -2246,7 +2241,7 @@ AVSValue Floatf(AVSValue args, void*, IScriptEnvironment*) {
   return args[0].AsFloatf();
 }
 
-AVSValue Value(AVSValue args, void*, IScriptEnvironment*) {  char *stopstring; return strtod(args[0].AsString(),&stopstring); }
+AVSValue Value(AVSValue args, void*, IScriptEnvironment*) { return strtod_c(args[0].AsString()); } // '.' regardless of the locale
 
 AVSValue HexValue(AVSValue args, void*, IScriptEnvironment*)
 {

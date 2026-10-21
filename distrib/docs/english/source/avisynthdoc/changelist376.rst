@@ -67,7 +67,8 @@ Additions, changes
   * Add ArmV8-A cpu feature detection (NEON, DOTPROD, SVE2) on ARM64 Windows/Linux/macOS builds.
     On Windows, only up-to DOTPROD can be detected due to OS limitations.
   * New CPU flags in ``cpuid.h`` and ``avisynth_c.h``: CPUF_ARM_NEON, CPUF_ARM_DOTPROD, CPUF_ARM_SVE2
-  * "SetMaxCPU": add "neon", "dotprod", "sve2" options to enable/disable ARM64 (aarch64) features.
+  * "SetMaxCPU": add "neon", "dotprod", "sve2", "i8mm", "sve2.1" options to enable/disable ARM64
+    (aarch64) features.
 - "ConvertToPlanarRGB(A)": ``bits`` parameter: on-the-fly bit-depth conversions to YUV->RGB conversion.
   See :doc:`ConvertToPlanarRGB <./corefilters/convert>`.
 - ``ConvertToPlanarRGB(A)``: added ``quality`` parameter: forces 32-bit float
@@ -281,10 +282,14 @@ Build environment, Interface
   * ``AVS_CS_RGBP8``, ``AVS_CS_RGBAP8`` aliases
 
   See :ref:`API v14 changes<api_v14_whats_new>` for more details.
-- Fix: avisynth_c.h dynamic loader (``AVSC_NO_DECLSPEC``, ``avs_load_library``): the deprecated
-  ``avs_is_yuv444p16`` .. ``avs_is_y32`` entries (8 functions) were never loaded and contained garbage
-  (the struct was not zero filled); a failed load did not free the DLL. The header now includes
-  ``<windows.h>`` and ``<stdlib.h>`` itself for the loader. Existed since r2487.
+- C API ``avs_create_script_environment``: a refused request (version newer than the AviSynth) is
+  reported by ``avs_get_error``. The returned wrapper holds no environment, as before.
+- C API dynamic loading: new header ``avisynth_c_loader.h`` for all platforms, replaces the Windows-only
+  loader in ``avisynth_c.h`` (which had uninitialized entries and leaked the DLL on a failed load).
+  Loads all C API functions (missing ones are NULL), creates or detects the environment with the
+  highest common interface version, and tells the available feature steps and 64 bit value support.
+  See :ref:`Dynamic loading<c_api_dynamic_loading>`.
+- avisynth_c.h: list of API functions fixed later than they appeared, with the interface version of the fix.
 - avisynth.h: ``CS_xxx_CHROMA_PLACEMENT`` (C++ ``AvsChromaPlacement``) marked deprecated: never implemented,
   use the ``_ChromaLocation`` frame property.
 - introduce ``AVS_RESTRICT`` to ``avs/config.h`` (compiler invariant c++ ``__restrict``)
@@ -368,6 +373,23 @@ Build environment, Interface
 
 Bugfixes
 ~~~~~~~~
+- Fix: ``SetMaxCPU`` limited the CPU flags of the whole process until the AviSynth DLL was unloaded, e.g. a
+  script reload in VirtualDub kept the earlier limit (#440). Now the limit belongs to the script environment.
+  See :ref:`SetMaxCPU <setmaxcpu>`. Existed since 3.6.0.
+- Fix: ``String`` and filter texts formatted by ``env->Sprintf`` on Linux, macOS, BSD and MinGW (UCRT)
+  builds: the decimal point is always ``.``, also when a host or plugin switched the process locale to a
+  decimal comma one. Windows MSVC builds did so since 2016. The new ``Format`` specifications use the same.
+  See :doc:`String <./syntax/syntax_internal_functions_conversion>`.
+- Fix: ``Value``, "ConditionalReader" float values, "GeneralConvolution" ``matrix``: the decimal point
+  is always ``.``. When a host or plugin switched the process locale to a decimal comma one
+  (``setlocale``), ``Value("3.5")`` gave 3. See :doc:`Value <./syntax/syntax_internal_functions_conversion>`.
+  Existed since classic AviSynth.
+- Fix: C plugins without ``avisynth_c_plugin_init2`` (pre-V11): ``avs_invoke`` inside
+  ``avisynth_c_plugin_init`` returned unconverted double and 64 bit int values. Existed since 3.7.4.
+- Fix: C plugins without ``avisynth_c_plugin_init2`` (pre-V11) got unconverted double and 64 bit int
+  values when their function was called at runtime (e.g. from ScriptClip), in array arguments, and in
+  array results of ``avs_invoke``; such plugins cannot read them. Now converted to float and 32 bit int
+  there as well (2.5 C++ plugins: top-level runtime arguments). Existed since 3.7.4.
 - Fix: "CombinePlanes" with a single clip and a target of different chroma subsampling (e.g. YV12 to
   YV24, planes="Y"): the zero-copy path returned a malformed frame (chroma planes of the source size).
   Existed since r2487 (2017).
@@ -611,6 +633,9 @@ Bugfixes
 
 Optimizations
 ~~~~~~~~~~~~~
+- Under the hood, no visible change: filter construction copies the function arguments (deep copy
+  of arrays) once instead of twice (2.5 and pre-V11 C plugins: three times). Matters only for big
+  (nested) array arguments.
 - "Layer" YUVA/YUV/RGBP "add", "subtract", "mul", "darken", "lighten": refactor
   chroma placement calculation and function dispatchers; main algorithm SIMD
   vectorization is now possible for non-444 chroma placements by precalculating
@@ -687,6 +712,8 @@ Optimizations
 
 Documentation
 ~~~~~~~~~~~~~
+- :ref:`Global lock <cplusplus_acquiregloballock>`: warning on the local mutex fallback, destructor
+  examples (C++ with a saved ``env``, C ``free_filter`` with ``fi->env``), example fixes.
 - Build on Raspbian, Raspberry Pi 5 and llvm/gcc :doc:`This page <./contributing/posix>` 
   describes linux builds process.
 - Add to :ref:`SIMD in ARM64 (aarch64) section <aarch64_simd_tiers>`
