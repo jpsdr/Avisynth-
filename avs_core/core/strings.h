@@ -35,6 +35,7 @@
 #include <string>
 #include <memory>
 #include <cstdint>
+#include <cstdarg>
 
 bool streqi(const char* s1, const char* s2);
 std::string concat(const std::string &s1, const std::string &s2);
@@ -98,6 +99,21 @@ std::string GetFullPathNameWrapUtf8(const std::string& f);
 // The float version gives the shortest digits for the 32 bit value (0.1f -> "0.1").
 std::string double_to_string(double d);
 std::string float_to_string(float f);
+
+// Decimal number: digits [. digits] [e|E [+|-] digits], correctly rounded, '.' as the decimal point
+// whatever the process locale. No whitespace, sign, hex, inf, nan (script parser, strtod_c).
+// Returns the end of the number; p itself if there were no digits (value 0).
+const char* scan_decimal(const char* p, double* value);
+
+// printf-like formatting with '.' as the decimal point, whatever the process locale
+// (a host or plugin may call setlocale)
+std::string vsprintf_c(const char* fmt, va_list args);
+std::string sprintf_c(const char* fmt, ...);
+
+// strtod with '.' as the decimal point, whatever the process locale (a host or plugin may call
+// setlocale). Leading ASCII whitespace, sign, digits, '.', digits, e/E exponent; hex, inf, nan as strtod.
+// end (optional): the first character not used; s itself if no number was found (result 0).
+double strtod_c(const char* s, const char** end = nullptr);
 
 size_t str_utf8_size(const std::string& s);
 std::string U32_to_utf8(uint32_t cp); // empty for surrogates and above 10FFFF
