@@ -278,15 +278,27 @@ ColorKeyMask::ColorKeyMask(PClip _child, int _color, int _tolB, int _tolG, int _
 }
 
 
+// IsClose(a, b, tol) in the pixel type: |a - b| <= tol. Same result (tol fits pixel_t), but the
+// vectorized compare stays at pixel width instead of 32 bit lanes.
+template<typename pixel_t>
+static AVS_FORCEINLINE bool is_close_absdiff(pixel_t a, pixel_t b, pixel_t tol) {
+  const pixel_t diff = a > b ? (pixel_t)(a - b) : (pixel_t)(b - a);
+  return diff <= tol;
+}
+
 template<typename pixel_t>
 static void colorkeymask_c(BYTE* pf8, int pitch, int R, int G, int B, int height, int rowsize, int tolB, int tolG, int tolR) {
   pixel_t* pf = reinterpret_cast<pixel_t*>(pf8);
   rowsize /= sizeof(pixel_t);
   pitch /= sizeof(pixel_t);
+  const pixel_t r = (pixel_t)R, g = (pixel_t)G, b = (pixel_t)B;
+  const pixel_t tol_r = (pixel_t)tolR, tol_g = (pixel_t)tolG, tol_b = (pixel_t)tolB;
   for (int y = 0; y < height; y++) {
+    // Vectorized by GCC and Clang: '&' instead of '&&' (short-circuit is control flow), and alpha is
+    // always rewritten through an AND mask (a conditional store or 'key ? 0 : alpha' stayed scalar).
     for (int x = 0; x < rowsize; x += 4) {
-      if (IsClose(pf[x], B, tolB) && IsClose(pf[x + 1], G, tolG) && IsClose(pf[x + 2], R, tolR))
-        pf[x + 3] = 0;
+      const bool key = is_close_absdiff(pf[x], b, tol_b) & is_close_absdiff(pf[x + 1], g, tol_g) & is_close_absdiff(pf[x + 2], r, tol_r);
+      pf[x + 3] = pf[x + 3] & (pixel_t)(key - 1); // key: 0, else unchanged
     }
     pf += pitch;
   }
@@ -299,10 +311,13 @@ static void colorkeymask_planar_c(const BYTE* pfR8, const BYTE* pfG8, const BYTE
   const pixel_t* pfB = reinterpret_cast<const pixel_t*>(pfB8);
   pixel_t* pfA = reinterpret_cast<pixel_t*>(pfA8);
   pitch /= sizeof(pixel_t);
+  const pixel_t r = (pixel_t)R, g = (pixel_t)G, b = (pixel_t)B;
+  const pixel_t tol_r = (pixel_t)tolR, tol_g = (pixel_t)tolG, tol_b = (pixel_t)tolB;
   for (int y = 0; y < height; y++) {
+    // see colorkeymask_c
     for (int x = 0; x < width; x++) {
-      if (IsClose(pfB[x], B, tolB) && IsClose(pfG[x], G, tolG) && IsClose(pfR[x], R, tolR))
-        pfA[x] = 0;
+      const bool key = is_close_absdiff(pfB[x], b, tol_b) & is_close_absdiff(pfG[x], g, tol_g) & is_close_absdiff(pfR[x], r, tol_r);
+      pfA[x] = pfA[x] & (pixel_t)(key - 1);
     }
     pfR += pitch;
     pfG += pitch;
@@ -319,9 +334,10 @@ static void colorkeymask_planar_float_c(const BYTE* pfR8, const BYTE* pfG8, cons
   pixel_t* pfA = reinterpret_cast<pixel_t*>(pfA8);
   pitch /= sizeof(pixel_t);
   for (int y = 0; y < height; y++) {
+    // see colorkeymask_c
     for (int x = 0; x < width; x++) {
-      if (IsCloseFloat(pfB[x], B, tolB) && IsCloseFloat(pfG[x], G, tolG) && IsCloseFloat(pfR[x], R, tolR))
-        pfA[x] = 0;
+      const bool key = IsCloseFloat(pfB[x], B, tolB) & IsCloseFloat(pfG[x], G, tolG) & IsCloseFloat(pfR[x], R, tolR);
+      pfA[x] = key ? 0.0f : pfA[x];
     }
     pfR += pitch;
     pfG += pitch;
@@ -378,6 +394,10 @@ PVideoFrame __stdcall ColorKeyMask::GetFrame(int n, IScriptEnvironment* env)
     else if ((pixelsize == 1) && (env->GetCPUFlags() & CPUF_SSE2))
     {
       colorkeymask_sse2(pf, pitch, color, vi.height, rowsize, tolB, tolG, tolR);
+    }
+    else if ((pixelsize == 2) && (env->GetCPUFlags() & CPUF_SSE2))
+    {
+      colorkeymask_uint16_sse2(pf, pitch, color64, vi.height, tolB16, tolG16, tolR16);
     }
     else
 #endif
@@ -1153,6 +1173,11 @@ static void packed_to_planarrgb(uint8_t* dstp_r, uint8_t* dstp_g, uint8_t* dstp_
   srcp += (height - 1) * src_pitch;
 
   for (int i = 0; i < height; ++i) {
+    // 4 destination planes (with alpha): too many pointer pairs for GCC's runtime alias checks, the loop stayed
+    // scalar on aarch64. Safe: j reads source pixel j and writes element j of each plane only.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
     for (int j = 0; j < width; ++j) {
       const int pixel = reinterpret_cast<const pixel_t*>(srcp)[j * source_rgb_step + channel];
       reinterpret_cast<pixel_t*>(dstp_g)[j] =
@@ -2602,7 +2627,12 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
       layer_yuv_lighten_darken_f_c_t* layer_f_fn = nullptr;
 
       // fills layer_yuv_lighten_darken_c_t or layer_yuv_lighten_darken_f_c_t depending on video format, and bits_per_pixel.
-      get_layer_yuv_lighten_darken_functions(isLighten, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+#ifdef NEON_INTRINSICS
+      if (env->GetCPUFlags() & CPUF_ARM_NEON)
+        get_layer_yuv_lighten_darken_functions_neon(isLighten, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+      else
+#endif
+        get_layer_yuv_lighten_darken_functions(isLighten, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
 
       // ThresholdParam was scaled from the 8 bit world
       if (layer_fn && bits_per_pixel != 32) {
@@ -2647,7 +2677,12 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
       layer_yuv_mulovr_c_t*   layer_fn   = nullptr;
       layer_yuv_mulovr_f_c_t* layer_f_fn = nullptr;
-      get_layer_yuv_mulovr_functions(hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+#ifdef NEON_INTRINSICS
+      if (env->GetCPUFlags() & CPUF_ARM_NEON)
+        get_layer_yuv_mulovr_functions_neon(hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
+      else
+#endif
+        get_layer_yuv_mulovr_functions(hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
 
       if (layer_fn)
         layer_fn(src1p, src1p_u, src1p_v, src2p, maskp,
@@ -2726,6 +2761,10 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
             // no SIMD yet, wrapper for the avx2 module, which calls its local scoped get_layer_yuv_mul_functions the included layer.hpp
             get_layer_yuv_mul_functions_avx2(is_chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
           }
+          else
+#elif defined(NEON_INTRINSICS)
+          if (env->GetCPUFlags() & CPUF_ARM_NEON)
+            get_layer_yuv_mul_functions_neon(is_chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
           else
 #endif
             get_layer_yuv_mul_functions(is_chroma, hasAlpha, placement, vi, bits_per_pixel, &layer_fn, &layer_f_fn);
@@ -2841,6 +2880,10 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         get_layer_planarrgb_mul_functions_avx2(chroma, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
       }
       else
+#elif defined(NEON_INTRINSICS)
+      if (env->GetCPUFlags() & CPUF_ARM_NEON)
+        get_layer_planarrgb_mul_functions_neon(chroma, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
+      else
 #endif
       {
         get_layer_planarrgb_mul_functions(chroma, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
@@ -2938,6 +2981,10 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
         // wrapper for the avx2 module, which calls its local scoped get_layer_planarrgb_lighten_darken_functions the included layer.hpp
         get_layer_planarrgb_lighten_darken_functions_avx2(isLighten, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
       }
+      else
+#elif defined(NEON_INTRINSICS)
+      if (env->GetCPUFlags() & CPUF_ARM_NEON)
+        get_layer_planarrgb_lighten_darken_functions_neon(isLighten, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);
       else
 #endif
         get_layer_planarrgb_lighten_darken_functions(isLighten, hasAlpha, process_alpha_channel, bits_per_pixel, &layer_fn, &layer_f_fn);

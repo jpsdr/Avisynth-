@@ -11,6 +11,88 @@ https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
 20261021 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
+- Optimization: aarch64 NEON packed RGB24 <-> RGB32 and RGB48 <-> RGB64 conversion (vld3/vst4 and
+  vld4/vst3 de-interleaving), the C versions stayed scalar with GCC -O3. Bit-identical to C.
+- Optimization: aarch64 NEON direct 8 bit YV24 -> packed RGB24/RGB32 (ConvertToRGB24/32 from 8 bit YUV,
+  the legacy 13 bit integer matrix path), YUVA alpha to RGB32 as well. Bit-identical to C.
+  The packed RGB -> YUV direction was already vectorized by GCC -O3.
+- Optimization: aarch64 NEON Blur/Sharpen horizontal pass, planar 8, 10-16 bit and 32 bit float, in-place like C,
+  any width. Bit-identical to C (float: fused like GCC contracts the C expression). The vertical pass was
+  already vectorized by GCC -O3. Differs from the Intel paths: 10-14 bit is computed in 16 bit lanes like 8 bit
+  (only 16 bit needs 32 bit lanes), every pixel is loaded once (neighbours from registers, no overlapping
+  reloads), and the last full block is SIMD at any width, only width % vector size remains per pixel.
+- Optimization: aarch64 NEON TemporalSoften, planar and packed RGB32/64, 8, 10-16 bit and 32 bit float (no float
+  SIMD on x86). Bit-identical to C. The scene change SAD was already vectorized by GCC -O3.
+- Optimization: aarch64 NEON ConvertBits ordered dither (dither=0), 8-16 bit to 8-16 bit, any dither_bits,
+  fulls/fulld range conversion, any width. Bit-identical to C.
+- Optimization: aarch64 NEON Limiter, planar 8, 10-16 bit and 32 bit float, any width. Bit-identical to C,
+  also for min > max and for -0.0 / NaN float pixels (compare + select where a min/max chain would differ).
+- Optimization: aarch64 NEON mask row preparation for subsampled chroma (Overlay/Layer/Merge masked blend, 8-16 bit):
+  all 13 mask placement kernels (4:2:0, 4:2:2, 4:1:1, 4:1:0, 4:4:0; center, MPEG2, top-left), with and
+  without baked opacity. Bit-identical to C. Float 4:2:0/4:1:1 center averages add in the C order (bit-identical).
+- Optimization: aarch64 planar YUV <-> planar RGB / Y matrix conversions: the C path is now vectorized by GCC
+  (#pragma GCC ivdep on the pixel loop). With 3 source and 3 destination planes GCC gave up on the runtime alias
+  checks, so only RGB -> Y was vectorized before. Output unchanged.
+- Optimization: aarch64 NEON horizontal resizer, planar 8, 10-16 bit, any kernel size (generic, like the AVX2
+  generic): per output pixel vmlal_s16 over 8 taps, vpaddq_s32 sums. Bit-identical to C. GCC compiled the C
+  (SIMD-C) version into scalar loads and multiplies on aarch64.
+- Resizers, C path, exact 16 bit horizontal: the 4-tap step of the kernel rest uses the signed pivot like the others.
+- Optimization: aarch64 NEON horizontal resizer, planar 32 bit float, any kernel size: 4 output pixels at once
+  (independent fma chains), horizontal sums after a 4x4 transpose in the C order. Bit-identical to C.
+- Optimization: aarch64 NEON vertical resizer, planar 8, 10-16 bit and 32 bit float: 16 pixels per step,
+  taps in an even and an odd chain (float: fused, in the C order). Bit-identical to C. GCC compiled the C
+  version into per-pixel lane loads (8-16 bit) and accumulators kept in memory (float) on aarch64.
+- Build: Clang (and clang-cl) NEON builds use -ffp-contract=fast, like GCC by default: a*b+c is fused across
+  the SIMD-C operator calls too, so the C and NEON float paths give the same results with GCC and Clang.
+- Optimization: aarch64 Layer C path, planar RGB mul / lighten / darken and YUV lighten / darken: vectorized by GCC
+  (#pragma GCC ivdep on the pixel loop; too many planes for its runtime alias checks). 8 bit and float mul,
+  float lighten / darken without mask. Output unchanged.
+- Optimization: aarch64 NEON Layer, planar RGB(A) and YUV(A): mul and YUV mulovr 10-16 bit, lighten / darken
+  10-16 bit and 32 bit float. NEON row kernels in the C templates (16 bit magic division by vmull_u32); 8 bit and
+  float mul / mulovr stay on the GCC/Clang vectorized C. YUV lighten / darken and mulovr use the NEON mask row
+  preparation. Bit-identical to C.
+- Optimization: aarch64 NEON ExtractR/G/B/A and PlaneToY("R"/"G"/"B"/"A") from packed RGB24/32/48/64:
+  de-interleaving loads (vld3/vld4), 16 (8 bit) or 8 (16 bit) pixels per step.
+- Optimization: aarch64 ShowRed/Green/Blue/Alpha from packed RGB32/64 to planar RGBA: the C path is vectorized
+  by GCC (#pragma GCC ivdep; 4 destination planes were too many for its runtime alias checks). The other
+  ShowXxx paths were already vectorized (GCC/Clang). Output unchanged.
+- Optimization: aarch64 NEON plane sum and SAD for the runtime functions (AverageLuma & co., LumaDifference,
+  RGBDifference, YDifferenceFromPrevious/ToNext & co.) and the TemporalSoften scene change detection, 8-16 bit:
+  vpadal / vabd / vabal, two accumulators, alpha of packed RGB32/64 masked. Same integer totals as C.
+- Optimization: aarch64 8 bit plane sum and SAD (the same functions) with UDOT, used when the CPU has the
+  dot product extension (CPUF_ARM_DOTPROD, SetMaxCPU "dotprod"); _dp.cpp modules. Same integer totals as C.
+- Build: aarch64 dot product modules (*_dp.cpp) are compiled with -march=armv8.2-a+dotprod (MSVC /arch:armv8.2):
+  FEAT_DotProd is an Armv8.2 extension, and GCC 11/12 do not provide vdotq_u32 for armv8.1-a+dotprod.
+- Optimization: Windows ARM64 text overlay (Subtitle, ShowFrameNumber, Info, ...: GDI antialiaser): NEON
+  GetAlphaRect (the SSE4.1 pair: 8-column quick-exit, vcnt popcount) and NEON mask row preparation for
+  subsampled formats. Same result as the scalar code.
+- Optimization: planar RGB(A) <-> packed RGB24/32/48/64 C path: local plane pointers, the 8 bit loops are now
+  vectorized by GCC and Clang (aarch64: ld3/ld4/st3/st4). A char store could alias the plane pointer array,
+  the pointers were reloaded per pixel. Output unchanged.
+- Optimization: aarch64 Overlay mode="add"/"subtract"/"difference"/"exclusion"/"softlight"/"hardlight" with mask,
+  and Layer planar RGB "add" C path (no alpha, use_chroma=false, float): vectorized by GCC (#pragma GCC ivdep;
+  too many planes for its runtime alias checks). Output unchanged.
+- Optimization: Overlay mode="darken"/"lighten" 10-16 bit (and 8 bit C path), Overlay mode="add"/"subtract"
+  32 bit float: the C path is vectorized by GCC (aarch64 and x86). Branchless rewrite; GCC kept the conditional
+  parts as control flow (its default -ftrapping-math). Clang already vectorized them. Output unchanged.
+- Optimization: Tweak hue/saturation (no hue/saturation range, no dither) 10-16 bit, 32 bit float and 8 bit realcalc:
+  the C path is vectorized by GCC (x64: 1.3x-2.4x); the "all pixels" case is now a template parameter.
+  aarch64 Levels 32 bit float (no gamma, no dither): vectorized by GCC; coring is a template parameter.
+  On aarch64 the float and 16 bit results can differ from the earlier
+  version in the last bit: multiply-adds are fused differently in the vectorized code.
+- Optimization: ColorKeyMask planar RGBA (8-16 bit, float) and packed RGB32/RGB64 C path: branchless, vectorized
+  by GCC and Clang (float: GCC only). x64 planar 8 bit 2.3x, 16 bit 1.3x-2x, float 1.2x.
+  New SSE2 RGB64 version (x64 1.15x-1.25x). Output unchanged.
+- Fix: Compare 16 bit (planar and RGB48/RGB64): the sum of squared differences (PSNR) overflowed for pixel
+  differences above 46340, e.g. PSNR was nan for black vs. white. The result depended on the compiler.
+- Optimization: Compare RGB24/32/48/64 and YUY2 C path: vectorized by GCC and Clang (compile time component
+  step, row sums in locals). x64 C: RGB32 2.2x, RGB64 1.3x, RGB24/48 1.15x-1.2x. Output unchanged.
+- Optimization: aarch64 Overlay mode="multiply" with mask: the C path is vectorized by GCC (#pragma GCC ivdep;
+  7 planes were too many for its runtime alias checks). Clang already vectorized it. Output unchanged.
+- Optimization: ExtractR/G/B and PlaneToY("R"/"G"/"B") from RGB24/48: SSSE3 path for CPUs without AVX2 and for
+  rows narrower than the AVX2 minimum (32 / 16 pixels): 1.4x (RGB48) - 3.3x (RGB24) vs. the C path.
+- Overlay: removed the unused internal 4:2:0/4:2:2 <-> 4:4:4 converters (444convert, C/SSE2/AVX2);
+  Overlay converts through ConvertToYUV444 with the chroma placement since the placement-aware rework.
 - Fix: SetMaxCPU limited the CPU flags of the whole process until the DLL was unloaded: a script reload
   in VirtualDub, with a new ScriptEnvironment, kept the earlier limit (#440). Since 3d7c1a8e (2025-05)
   the limit is stored per ScriptEnvironment; now documented, and the unused singleton setter removed.

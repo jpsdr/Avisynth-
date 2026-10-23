@@ -49,6 +49,9 @@
 #include "intel/planeswap_sse.h"
 #include "intel/planeswap_avx2.h"
 #endif
+#ifdef NEON_INTRINSICS
+#include "aarch64/planeswap_neon.h"
+#endif
 #include "../core/internal.h"
 #include "../core/strings.h"
 #include <algorithm>
@@ -319,6 +322,7 @@ PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
 #ifdef INTEL_INTRINSICS
     const bool avx2 = (env->GetCPUFlags() & CPUF_AVX2) != 0;
     const bool sse2 = (env->GetCPUFlags() & CPUF_SSE2) != 0;
+    const bool ssse3 = (env->GetCPUFlags() & CPUF_SSSE3) != 0;
     if (avx2 && (src_vi.IsRGB32() || src_vi.IsRGB64())) {
       if (src_vi.IsRGB32()) {
         switch (channel_index) {
@@ -349,6 +353,20 @@ PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
       case 1: extract_packed_rgb_noalpha_channel_avx2<uint16_t, 1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
       case 2: extract_packed_rgb_noalpha_channel_avx2<uint16_t, 2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
       }
+    } else if (ssse3 && src_vi.IsRGB24() && channel_index <= 2 && width >= 16) {
+      // RGB24 SSSE3: 16 pixels/iter (no pshufb in plain SSE2: SSE2-only CPUs use C)
+      switch (channel_index) {
+      case 0: extract_packed_rgb_noalpha_channel_ssse3<uint8_t, 0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 1: extract_packed_rgb_noalpha_channel_ssse3<uint8_t, 1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 2: extract_packed_rgb_noalpha_channel_ssse3<uint8_t, 2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      }
+    } else if (ssse3 && src_vi.IsRGB48() && channel_index <= 2 && width >= 8) {
+      // RGB48 SSSE3: 8 pixels/iter
+      switch (channel_index) {
+      case 0: extract_packed_rgb_noalpha_channel_ssse3<uint16_t, 0>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 1: extract_packed_rgb_noalpha_channel_ssse3<uint16_t, 1>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      case 2: extract_packed_rgb_noalpha_channel_ssse3<uint16_t, 2>(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height); break;
+      }
     } else if (sse2 && (src_vi.IsRGB32() || src_vi.IsRGB64())) {
       if (src_vi.IsRGB32()) {
         switch (channel_index) {
@@ -367,7 +385,12 @@ PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
       }
     } else
 #endif
-    { // C fallback (RGB24/48 without AVX2, RGB32/64 without SSE2, or small widths)
+#ifdef NEON_INTRINSICS
+    if (env->GetCPUFlags() & CPUF_ARM_NEON) {
+      extract_packed_rgb_channel_neon(srcp_bottom, dstp_base, src_pitch, dst_pitch, width, height, pixelsize, src_components, channel_index);
+    } else
+#endif
+    { // C fallback (RGB24/48 without SSSE3, RGB32/64 without SSE2, or small widths)
       const BYTE* srcp = srcp_bottom + byte_offset;
       BYTE*       dstp = dstp_base;
       if (pixelsize == 1) {

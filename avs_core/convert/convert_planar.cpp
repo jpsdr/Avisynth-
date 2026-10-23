@@ -42,6 +42,8 @@
 #ifdef INTEL_INTRINSICS
 #include "intel/convert_planar_sse.h"
 #include "intel/convert_planar_avx2.h"
+#elif defined(NEON_INTRINSICS)
+#include "aarch64/convert_planar_neon.h"
 #endif
 #include "convert_bits.h"
 #include "../filters/resample.h"
@@ -196,6 +198,8 @@ ConvertRGBToYUV444::ConvertRGBToYUV444(PClip src, const char *matrix_name, bool 
       const int dither_mode = -1;
 #ifdef INTEL_INTRINSICS
       get_convert_any_bits_functions(dither_mode, source_bit_depth, target_bit_depth, fulls, fulld, sse2, sse4, avx2, conv_function, conv_function_chroma, conv_function_a);
+#elif defined(NEON_INTRINSICS)
+      get_convert_any_bits_functions(dither_mode, source_bit_depth, target_bit_depth, fulls, fulld, !!(env->GetCPUFlags() & CPUF_ARM_NEON), conv_function, conv_function_chroma, conv_function_a);
 #else
       get_convert_any_bits_functions(dither_mode, source_bit_depth, target_bit_depth, fulls, fulld, conv_function, conv_function_chroma, conv_function_a);
 #endif
@@ -509,6 +513,8 @@ ConvertYUV444ToRGB::ConvertYUV444ToRGB(PClip src, const char *matrix_name, int _
     const int dither_mode = -1;
 #ifdef INTEL_INTRINSICS
     get_convert_any_bits_functions(dither_mode, source_bit_depth, target_bit_depth, fulls, fulld, sse2, sse4, avx2, conv_function, conv_function_chroma, conv_function_a);
+#elif defined(NEON_INTRINSICS)
+    get_convert_any_bits_functions(dither_mode, source_bit_depth, target_bit_depth, fulls, fulld, !!(env->GetCPUFlags() & CPUF_ARM_NEON), conv_function, conv_function_chroma, conv_function_a);
 #else
     get_convert_any_bits_functions(dither_mode, source_bit_depth, target_bit_depth, fulls, fulld, conv_function, conv_function_chroma, conv_function_a);
 #endif
@@ -683,6 +689,13 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
     pixel_t_dst* d1 = reinterpret_cast<pixel_t_dst*>(dstp[1]); // B or U
     pixel_t_dst* d2 = reinterpret_cast<pixel_t_dst*>(dstp[2]); // R or V
 
+    // 3 source + 3 destination planes: too many pointer pairs for GCC's runtime alias checks
+    // (vect-max-version-for-alias-checks), so without this only RGB_TO_Y was vectorized on aarch64.
+    // Safe: x reads and writes element x of each plane only and dst/src are different frames,
+    // so there is no loop-carried dependency.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC ivdep
+#endif
     for (int x = 0; x < width; x++) {
       float in0_f, in1_f, in2_f;
       int in0_i, in1_i, in2_i;
@@ -1055,6 +1068,19 @@ PVideoFrame __stdcall ConvertYUV444ToRGB::GetFrame(int n, IScriptEnvironment* en
       return dst;
     }
 #endif
+#elif defined(NEON_INTRINSICS)
+    if (env->GetCPUFlags() & CPUF_ARM_NEON) {
+      if (pixel_step == 4) {
+        if (src_pitch_a) // move alpha channel from YUVA
+          convert_yv24_to_rgb_neon<4, true>(dstp, srcY, srcU, srcV, srcA, dst_pitch, src_pitch_y, src_pitch_uv, src_pitch_a, vi.width, vi.height, matrix);
+        else
+          convert_yv24_to_rgb_neon<4, false>(dstp, srcY, srcU, srcV, srcA, dst_pitch, src_pitch_y, src_pitch_uv, src_pitch_a, vi.width, vi.height, matrix);
+      }
+      else {
+        convert_yv24_to_rgb_neon<3, false>(dstp, srcY, srcU, srcV, srcA, dst_pitch, src_pitch_y, src_pitch_uv, src_pitch_a, vi.width, vi.height, matrix);
+      }
+      return dst;
+    }
 #endif
 
     // Unoptimized C-code.
