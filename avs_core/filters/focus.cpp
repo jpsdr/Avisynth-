@@ -36,6 +36,9 @@
 #ifdef INTEL_INTRINSICS
 #include "intel/focus_sse.h"
 #include "intel/focus_avx2.h"
+#elif defined(NEON_INTRINSICS)
+#include "aarch64/focus_neon.h"
+#include "aarch64/focus_dp.h"
 #endif
 #include <cmath>
 #include <vector>
@@ -79,11 +82,8 @@ AdjustFocusV::AdjustFocusV(double _amount, PClip _child)
 
 template<typename pixel_t>
 static void af_vertical_c(BYTE* line_buf8, BYTE* dstp8, const int height, const int pitch8, const int width, const int half_amount, int bits_per_pixel) {
-  typedef typename std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t;
-  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2], same arithmetic as the SIMD paths
-  weight_t center_weight = af_center_weight_int(half_amount);
-  weight_t outer_weight = af_outer_weight_int(half_amount);
-  int max_pixel_value = (1 << bits_per_pixel) - 1;
+  const int outer_weight_15 = af_outer_weight_q15(half_amount); // same arithmetic as the SIMD paths
+  const int max_pixel_value = (1 << bits_per_pixel) - 1;
 
   pixel_t * dstp = reinterpret_cast<pixel_t *>(dstp8);
   pixel_t * line_buf = reinterpret_cast<pixel_t *>(line_buf8);
@@ -91,23 +91,14 @@ static void af_vertical_c(BYTE* line_buf8, BYTE* dstp8, const int height, const 
 
   for (int y = height-1; y>0; --y) {
     for (int x = 0; x < width; ++x) {
-      pixel_t a;
-      // Note: ScaledPixelClip is overloaded. With int64_t parameter and uint16_t result works for 16 bit
-      if constexpr(sizeof(pixel_t) == 1)
-        a = ScaledPixelClip((weight_t)(dstp[x] * center_weight + (line_buf[x] + dstp[x+pitch]) * outer_weight));
-      else
-        a = (pixel_t)ScaledPixelClipEx((weight_t)(dstp[x] * center_weight + (line_buf[x] + dstp[x+pitch]) * outer_weight), max_pixel_value);
+      const pixel_t a = (pixel_t)af_kernel_int(line_buf[x], dstp[x], dstp[x+pitch], outer_weight_15, max_pixel_value);
       line_buf[x] = dstp[x];
       dstp[x] = a;
     }
     dstp += pitch;
   }
-  for (int x = 0; x < width; ++x) { // Last row - map centre as lower
-    if constexpr(sizeof(pixel_t) == 1)
-      dstp[x] = ScaledPixelClip((weight_t)(dstp[x] * center_weight + (line_buf[x] + dstp[x]) * outer_weight));
-    else
-      dstp[x] = (pixel_t)ScaledPixelClipEx((weight_t)(dstp[x] * center_weight + (line_buf[x] + dstp[x]) * outer_weight), max_pixel_value);
-  }
+  for (int x = 0; x < width; ++x) // Last row - map centre as lower
+    dstp[x] = (pixel_t)af_kernel_int(line_buf[x], dstp[x], dstp[x], outer_weight_15, max_pixel_value);
 }
 
 static void af_vertical_c_float(BYTE* line_buf8, BYTE* dstp8, const int height, const int pitch8, const int width, const float amount) {
@@ -242,54 +233,46 @@ AdjustFocusH::AdjustFocusH(double _amount, PClip _child)
 }
 
 
-// --------------------------------------
-// Blur/Sharpen Horizontal RGB32 C++ Code
-// --------------------------------------
+// ---------------------------------------------------
+// Blur/Sharpen Horizontal RGB24/32/48/64 C++ Code
+// ---------------------------------------------------
 
-template<typename pixel_t, typename weight_t>
-static AVS_FORCEINLINE void af_horizontal_rgb32_process_line_c(pixel_t b_left, pixel_t g_left, pixel_t r_left, pixel_t a_left, pixel_t *dstp, size_t width, weight_t center_weight, weight_t outer_weight) {
-  size_t x;
-  for (x = 0; x < width-1; ++x)
+// Not in-place (like the SSE2 versions): src -> dst, each output only from source pixels, so the row is one
+// flat loop over the components, vectorized by GCC and Clang. The in-place version carried the original
+// left neighbour from pixel to pixel and stayed scalar. num_comp: components per pixel (3 or 4).
+// First and last pixel: the missing neighbour is the pixel itself.
+// Same pivot (Q15) arithmetic as the SIMD paths (see af_outer_weight_q15): fits int32 for 16 bit too.
+template<typename pixel_t, int num_comp>
+static void af_horizontal_packed_rgb_c(BYTE* dstp8, const BYTE* srcp8, size_t dst_pitch8, size_t src_pitch8, size_t height, size_t width, int half_amount) {
+  const int outer_weight_15 = af_outer_weight_q15(half_amount);
+  constexpr int max_pixel_value = sizeof(pixel_t) == 1 ? 255 : 65535;
+  auto kernel = [=](int left, int center, int right) {
+    return (pixel_t)af_kernel_int(left, center, right, outer_weight_15, max_pixel_value);
+  };
+
+  pixel_t* dstp = reinterpret_cast<pixel_t*>(dstp8);
+  const pixel_t* srcp = reinterpret_cast<const pixel_t*>(srcp8);
+  const size_t dst_pitch = dst_pitch8 / sizeof(pixel_t);
+  const size_t src_pitch = src_pitch8 / sizeof(pixel_t);
+  const size_t count = width * num_comp;
+
+  for (size_t y = height; y > 0; --y)
   {
-    pixel_t b = ScaledPixelClip((weight_t)(dstp[x*4+0] * center_weight + (b_left + dstp[x*4+4]) * outer_weight));
-    b_left = dstp[x*4+0];
-    dstp[x*4+0] = b;
-    pixel_t g = ScaledPixelClip((weight_t)(dstp[x*4+1] * center_weight + (g_left + dstp[x*4+5]) * outer_weight));
-    g_left = dstp[x*4+1];
-    dstp[x*4+1] = g;
-    pixel_t r = ScaledPixelClip((weight_t)(dstp[x*4+2] * center_weight + (r_left + dstp[x*4+6]) * outer_weight));
-    r_left = dstp[x*4+2];
-    dstp[x*4+2] = r;
-    pixel_t a = ScaledPixelClip((weight_t)(dstp[x*4+3] * center_weight + (a_left + dstp[x*4+7]) * outer_weight));
-    a_left = dstp[x*4+3];
-    dstp[x*4+3] = a;
+    if (width == 1) {
+      for (int c = 0; c < num_comp; c++)
+        dstp[c] = kernel(srcp[c], srcp[c], srcp[c]);
+    }
+    else {
+      for (int c = 0; c < num_comp; c++) // first pixel: left neighbour = itself
+        dstp[c] = kernel(srcp[c], srcp[c], srcp[c + num_comp]);
+      for (size_t i = num_comp; i < count - num_comp; i++)
+        dstp[i] = kernel(srcp[i - num_comp], srcp[i], srcp[i + num_comp]);
+      for (size_t i = count - num_comp; i < count; i++) // last pixel: right neighbour = itself
+        dstp[i] = kernel(srcp[i - num_comp], srcp[i], srcp[i]);
+    }
+    dstp += dst_pitch;
+    srcp += src_pitch;
   }
-  dstp[x*4+0] = ScaledPixelClip((weight_t)(dstp[x*4+0] * center_weight + (b_left + dstp[x*4+0]) * outer_weight));
-  dstp[x*4+1] = ScaledPixelClip((weight_t)(dstp[x*4+1] * center_weight + (g_left + dstp[x*4+1]) * outer_weight));
-  dstp[x*4+2] = ScaledPixelClip((weight_t)(dstp[x*4+2] * center_weight + (r_left + dstp[x*4+2]) * outer_weight));
-  dstp[x*4+3] = ScaledPixelClip((weight_t)(dstp[x*4+3] * center_weight + (a_left + dstp[x*4+3]) * outer_weight));
-}
-
-template<typename pixel_t>
-static void af_horizontal_rgb32_64_c(BYTE* dstp8, size_t height, size_t pitch8, size_t width, int half_amount) {
-  typedef typename std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t;
-  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2], same arithmetic as the SIMD paths
-  weight_t center_weight = af_center_weight_int(half_amount);
-  weight_t outer_weight = af_outer_weight_int(half_amount);
-
-  pixel_t* dstp = reinterpret_cast<pixel_t *>(dstp8);
-  size_t pitch = pitch8 / sizeof(pixel_t);
-
-  for (size_t y = height; y>0; --y)
-  {
-    pixel_t b_left = dstp[0];
-    pixel_t g_left = dstp[1];
-    pixel_t r_left = dstp[2];
-    pixel_t a_left = dstp[3];
-    af_horizontal_rgb32_process_line_c<pixel_t, weight_t>(b_left, g_left, r_left, a_left, dstp, width, center_weight, outer_weight);
-    dstp += pitch;
-  }
-
 }
 
 
@@ -297,109 +280,44 @@ static void af_horizontal_rgb32_64_c(BYTE* dstp8, size_t height, size_t pitch8, 
 // Blur/Sharpen Horizontal YUY2 C++ Code
 // -------------------------------------
 
-static void af_horizontal_yuy2_c(BYTE* p, int height, int pitch, int width, int amount) {
-  const int center_weight = af_center_weight_int(amount); // same arithmetic as the SIMD paths
-  const int outer_weight = af_outer_weight_int(amount);
-  for (int y0 = height; y0>0; --y0)
-  {
-    BYTE yy = p[0];
-    BYTE uv = p[1];
-    BYTE vu = p[3];
-    int x;
-    for (x = 0; x < width-2; ++x)
-    {
-      BYTE y = ScaledPixelClip(p[x*2+0] * center_weight + (yy + p[x*2+2]) * outer_weight);
-      yy   = p[x*2+0];
-      p[x*2+0] = y;
-      BYTE w = ScaledPixelClip(p[x*2+1] * center_weight + (uv + p[x*2+5]) * outer_weight);
-      uv   = vu;
-      vu   = p[x*2+1];
-      p[x*2+1] = w;
+// Not in-place (like the SSE2 version), same pivot arithmetic as the SIMD paths. Luma: neighbours at +-2 bytes,
+// chroma (U with U, V with V) at +-4 bytes; at the row ends the missing neighbour is the sample itself.
+// The inner macropixels (Y U Y V) have all their neighbours inside the row: one flat loop, vectorized by GCC and Clang.
+static void af_horizontal_yuy2_c(BYTE* dstp, const BYTE* srcp, size_t dst_pitch, size_t src_pitch, size_t height, size_t width, int half_amount) {
+  const int outer_weight_15 = af_outer_weight_q15(half_amount);
+  auto kernel = [=](int left, int center, int right) {
+    return (BYTE)af_kernel_int(left, center, right, outer_weight_15, 255);
+  };
+  const size_t count = width * 2; // width is even: whole macropixels
+  // pointers by value: a by-reference capture keeps Clang from vectorizing the inner loop
+  auto edge_macropixel = [=](BYTE* d, const BYTE* s, size_t i0) {
+    for (size_t i = i0; i < i0 + 4; i++) {
+      const size_t step = (i & 1) ? 4 : 2;
+      d[i] = kernel(i >= step ? s[i - step] : s[i], s[i], i + step < count ? s[i + step] : s[i]);
     }
-    BYTE y     = ScaledPixelClip(p[x*2+0] * center_weight + (yy + p[x*2+2]) * outer_weight);
-    yy       = p[x*2+0];
-    p[x*2+0] = y;
-    p[x*2+1] = ScaledPixelClip(p[x*2+1] * center_weight + (uv + p[x*2+1]) * outer_weight);
-    p[x*2+2] = ScaledPixelClip(p[x*2+2] * center_weight + (yy + p[x*2+2]) * outer_weight);
-    p[x*2+3] = ScaledPixelClip(p[x*2+3] * center_weight + (vu + p[x*2+3]) * outer_weight);
+  };
 
-    p += pitch;
+  for (size_t y = height; y > 0; --y)
+  {
+    edge_macropixel(dstp, srcp, 0);
+    for (size_t i = 4; i < count - 4; i += 4) {
+      dstp[i + 0] = kernel(srcp[i - 2], srcp[i + 0], srcp[i + 2]);
+      dstp[i + 1] = kernel(srcp[i - 3], srcp[i + 1], srcp[i + 5]);
+      dstp[i + 2] = kernel(srcp[i + 0], srcp[i + 2], srcp[i + 4]);
+      dstp[i + 3] = kernel(srcp[i - 1], srcp[i + 3], srcp[i + 7]);
+    }
+    edge_macropixel(dstp, srcp, count - 4); // width 2: the same macropixel again
+    dstp += dst_pitch;
+    srcp += src_pitch;
   }
 }
 
-
-// --------------------------------------
-// Blur/Sharpen Horizontal RGB24 C++ Code
-// --------------------------------------
-
-template<typename pixel_t>
-static void af_horizontal_rgb24_48_c(BYTE* dstp8, int height, int pitch8, int width, int half_amount) {
-  typedef typename std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t;
-  // kernel:[(1-1/2^_amount)/2, 1/2^_amount, (1-1/2^_amount)/2], same arithmetic as the SIMD paths
-  weight_t center_weight = af_center_weight_int(half_amount);
-  weight_t outer_weight = af_outer_weight_int(half_amount);
-
-  pixel_t *dstp = reinterpret_cast<pixel_t *>(dstp8);
-  int pitch = pitch8 / sizeof(pixel_t);
-  for (int y = height; y>0; --y)
-  {
-    pixel_t bb = dstp[0];
-    pixel_t gg = dstp[1];
-    pixel_t rr = dstp[2];
-    int x;
-    for (x = 0; x < width-1; ++x)
-    {
-      // ScaledPixelClip has 2 overloads: BYTE/uint16_t (int/int64 i)
-      pixel_t b = ScaledPixelClip((weight_t)(dstp[x*3+0] * center_weight + (bb + dstp[x*3+3]) * outer_weight));
-      bb = dstp[x*3+0]; dstp[x*3+0] = b;
-      pixel_t g = ScaledPixelClip((weight_t)(dstp[x*3+1] * center_weight + (gg + dstp[x*3+4]) * outer_weight));
-      gg = dstp[x*3+1]; dstp[x*3+1] = g;
-      pixel_t r = ScaledPixelClip((weight_t)(dstp[x*3+2] * center_weight + (rr + dstp[x*3+5]) * outer_weight));
-      rr = dstp[x*3+2]; dstp[x*3+2] = r;
-    }
-    dstp[x*3+0] = ScaledPixelClip((weight_t)(dstp[x*3+0] * center_weight + (bb + dstp[x*3+0]) * outer_weight));
-    dstp[x*3+1] = ScaledPixelClip((weight_t)(dstp[x*3+1] * center_weight + (gg + dstp[x*3+1]) * outer_weight));
-    dstp[x*3+2] = ScaledPixelClip((weight_t)(dstp[x*3+2] * center_weight + (rr + dstp[x*3+2]) * outer_weight));
-    dstp += pitch;
-  }
-}
 
 // -------------------------------------
 // Blur/Sharpen Horizontal YV12 C++ Code
 // -------------------------------------
 
-// for linker reasons these forceinlined functions appear in C, intel sse2 and avx2 source as well
-template<typename pixel_t>
-static AVS_FORCEINLINE void af_horizontal_planar_process_line_c(pixel_t left, BYTE *dstp8, size_t row_size, int center_weight, int outer_weight) {
-  size_t x;
-  pixel_t* dstp = reinterpret_cast<pixel_t *>(dstp8);
-  typedef typename std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t; // for calling the right ScaledPixelClip()
-  size_t width = row_size / sizeof(pixel_t);
-  for (x = 0; x < width-1; ++x) {
-    pixel_t temp = ScaledPixelClip((weight_t)(dstp[x] * (weight_t)center_weight + (left + dstp[x+1]) * (weight_t)outer_weight));
-    left = dstp[x];
-    dstp[x] = temp;
-  }
-  // ScaledPixelClip has 2 overloads: BYTE/uint16_t (int/int64 i)
-  dstp[x] = ScaledPixelClip((weight_t)(dstp[x] * (weight_t)center_weight + (left + dstp[x]) * (weight_t)outer_weight));
-}
-
-static AVS_FORCEINLINE void af_horizontal_planar_process_line_uint16_c(uint16_t left, BYTE *dstp8, size_t row_size, int center_weight, int outer_weight, int bits_per_pixel) {
-  size_t x;
-  typedef uint16_t pixel_t;
-  pixel_t* dstp = reinterpret_cast<pixel_t *>(dstp8);
-  const int max_pixel_value = (1 << bits_per_pixel) - 1; // clamping on 10-12-14-16 bitdepth
-  typedef std::conditional < sizeof(pixel_t) == 1, int, int64_t>::type weight_t; // for calling the right ScaledPixelClip()
-  size_t width = row_size / sizeof(pixel_t);
-  for (x = 0; x < width-1; ++x) {
-    pixel_t temp = (pixel_t)ScaledPixelClipEx((weight_t)(dstp[x] * (weight_t)center_weight + (left + dstp[x+1]) * (weight_t)outer_weight), max_pixel_value);
-    left = dstp[x];
-    dstp[x] = temp;
-  }
-  // ScaledPixelClip has 2 overloads: BYTE/uint16_t (int/int64 i)
-  dstp[x] = ScaledPixelClipEx((weight_t)(dstp[x] * (weight_t)center_weight + (left + dstp[x]) * (weight_t)outer_weight), max_pixel_value);
-}
-
+// for linker reasons this forceinlined function appears in C and intel sse2 source as well (8-16 bit: focus.h)
 static AVS_FORCEINLINE void af_horizontal_planar_process_line_float_c(float left, float* dstp, size_t row_size, float center_weight, float outer_weight) {
   size_t x;
   size_t width = row_size / sizeof(float);
@@ -416,15 +334,10 @@ static void af_horizontal_planar_c(BYTE* dstp8, size_t height, size_t pitch8, si
 {
     pixel_t* dstp = reinterpret_cast<pixel_t *>(dstp8);
     size_t pitch = pitch8 / sizeof(pixel_t);
-    int center_weight = af_center_weight_int(half_amount); // same arithmetic as the SIMD paths
-    int outer_weight = af_outer_weight_int(half_amount);
-    pixel_t left;
+    const int outer_weight_15 = af_outer_weight_q15(half_amount); // same arithmetic as the SIMD paths
+    const int max_pixel_value = (1 << bits_per_pixel) - 1;
     for (size_t y = height; y>0; --y) {
-        left = dstp[0];
-        if constexpr(sizeof(pixel_t) == 1)
-          af_horizontal_planar_process_line_c<pixel_t>(left, (BYTE *)dstp, row_size, center_weight, outer_weight);
-        else
-          af_horizontal_planar_process_line_uint16_c(left, (BYTE *)dstp, row_size, center_weight, outer_weight, bits_per_pixel);
+        af_horizontal_planar_process_line_c<pixel_t>(dstp[0], (BYTE *)dstp, row_size, outer_weight_15, max_pixel_value);
         dstp += pitch;
     }
 }
@@ -502,6 +415,18 @@ PVideoFrame __stdcall AdjustFocusH::GetFrame(int n, IScriptEnvironment* env)
         af_horizontal_planar_float_sse2(q, height, pitch, row_size, (float)amountd);
       }
       else
+#elif defined(NEON_INTRINSICS)
+      // any width: the NEON functions do the row ends per pixel
+      if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_ARM_NEON)) {
+        af_horizontal_planar_neon(q, height, pitch, row_size, half_amount);
+      }
+      else if (pixelsize == 2 && (env->GetCPUFlags() & CPUF_ARM_NEON)) {
+        af_horizontal_planar_uint16_t_neon(q, height, pitch, row_size, half_amount, bits_per_pixel);
+      }
+      else if (pixelsize == 4 && (env->GetCPUFlags() & CPUF_ARM_NEON)) {
+        af_horizontal_planar_float_neon(q, height, pitch, row_size, (float)amountd);
+      }
+      else
 #endif
       {
         switch (pixelsize) {
@@ -515,8 +440,6 @@ PVideoFrame __stdcall AdjustFocusH::GetFrame(int n, IScriptEnvironment* env)
   }
   else {
     if (vi.IsYUY2()) {
-      BYTE* q = dst->GetWritePtr();
-      const int pitch = dst->GetPitch();
 #ifdef INTEL_INTRINSICS
       if ((env->GetCPUFlags() & CPUF_SSE2) && vi.width > 8) {
         af_horizontal_yuy2_sse2(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
@@ -524,8 +447,7 @@ PVideoFrame __stdcall AdjustFocusH::GetFrame(int n, IScriptEnvironment* env)
       else
 #endif
       {
-        copy_frame(src, dst, env, planesYUVA, 1); //in-place
-        af_horizontal_yuy2_c(q, vi.height, pitch, vi.width, half_amount);
+        af_horizontal_yuy2_c(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
       }
     }
     else if (vi.IsRGB32() || vi.IsRGB64()) {
@@ -545,19 +467,17 @@ PVideoFrame __stdcall AdjustFocusH::GetFrame(int n, IScriptEnvironment* env)
       else
 #endif
       {
-        copy_frame(src, dst, env, planesYUVA, 1);
         if (pixelsize == 1)
-          af_horizontal_rgb32_64_c<uint8_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
+          af_horizontal_packed_rgb_c<uint8_t, 4>(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
         else
-          af_horizontal_rgb32_64_c<uint16_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
+          af_horizontal_packed_rgb_c<uint16_t, 4>(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
       }
     }
     else if (vi.IsRGB24() || vi.IsRGB48()) {
-      copy_frame(src, dst, env, planesYUVA, 1);
       if (pixelsize == 1)
-        af_horizontal_rgb24_48_c<uint8_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
+        af_horizontal_packed_rgb_c<uint8_t, 3>(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
       else
-        af_horizontal_rgb24_48_c<uint16_t>(dst->GetWritePtr(), vi.height, dst->GetPitch(), vi.width, half_amount);
+        af_horizontal_packed_rgb_c<uint16_t, 3>(dst->GetWritePtr(), src->GetReadPtr(), dst->GetPitch(), src->GetPitch(), vi.height, vi.width, half_amount);
     }
   }
 
@@ -890,6 +810,25 @@ static void accumulate_line(BYTE* c_plane, const BYTE** planeP, int planes, size
     }
   } else
 #endif
+#elif defined(NEON_INTRINSICS)
+  // any width: the NEON function does the rest of the row per pixel
+  if (env->GetCPUFlags() & CPUF_ARM_NEON) {
+    switch (pixelsize) {
+    case 1:
+      if (maxThreshold) accumulate_line_neon<uint8_t, true>(c_plane, planeP, planes, rowsize, threshold, div, bits_per_pixel);
+      else accumulate_line_neon<uint8_t, false>(c_plane, planeP, planes, rowsize, threshold, div, bits_per_pixel);
+      break;
+    case 2:
+      if (maxThreshold) accumulate_line_neon<uint16_t, true>(c_plane, planeP, planes, rowsize, threshold, div, bits_per_pixel);
+      else accumulate_line_neon<uint16_t, false>(c_plane, planeP, planes, rowsize, threshold, div, bits_per_pixel);
+      break;
+    case 4:
+      if (maxThreshold) accumulate_line_neon<float, true>(c_plane, planeP, planes, rowsize, threshold, div, bits_per_pixel);
+      else accumulate_line_neon<float, false>(c_plane, planeP, planes, rowsize, threshold, div, bits_per_pixel);
+      break;
+    }
+  }
+  else
 #endif
 
     {
@@ -961,6 +900,16 @@ static int64_t calculate_sad(const BYTE* cur_ptr, const BYTE* other_ptr, int cur
   // sse2 uint16_t
   if ((pixelsize == 2) && (env->GetCPUFlags() & CPUF_SSE2) && rowsize >= 16) {
     return calculate_sad_8_or_16_sse2<uint16_t, false>(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height) >> (bits_per_pixel-8);
+  }
+#endif
+#ifdef NEON_INTRINSICS
+  if (pixelsize == 1 && (env->GetCPUFlags() & CPUF_ARM_DOTPROD))
+    return calculate_sad_8_dp<false>(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height);
+  if (env->GetCPUFlags() & CPUF_ARM_NEON) {
+    if (pixelsize == 1)
+      return calculate_sad_8_or_16_neon<uint8_t, false>(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height);
+    if (pixelsize == 2)
+      return calculate_sad_8_or_16_neon<uint16_t, false>(cur_ptr, other_ptr, cur_pitch, other_pitch, rowsize, height) >> (bits_per_pixel - 8);
   }
 #endif
 

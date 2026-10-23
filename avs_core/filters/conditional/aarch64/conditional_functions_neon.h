@@ -1,6 +1,6 @@
-// Avisynth v2.5.  Copyright 2002 Ben Rudiak-Gould et al.
+// AviSynth+.  Copyright 2026 AviSynth+ Project
+// https://avs-plus.net
 // http://avisynth.nl
-
 // This program is free software; you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation; either version 2 of the License, or
@@ -32,23 +32,15 @@
 // which is not derived from or based on Avisynth, such as 3rd-party filters,
 // import and export plugins, or graphical user interfaces.
 
-// Overlay (c) 2003, 2004 by Klaus Post
+#ifndef __Conditional_Functions_NEON_H__
+#define __Conditional_Functions_NEON_H__
 
-#ifndef __444Convert_h
-#define __444Convert_h
+#include <avs/types.h>
+#include <cstddef>
 
-#include <avisynth.h>
+// Sum of the pixels of a plane, 8 / 16 bit (AverageLuma & co.), width in pixels.
+// Same result as get_sum_of_pixels_c and get_sum_of_pixels_sse2 / _uint16_sse2.
+template<typename pixel_t>
+double get_sum_of_pixels_neon(const BYTE* srcp, size_t height, size_t width, size_t pitch);
 
-void Convert444FromYV16(PVideoFrame &src, PVideoFrame &dst, int pixelsize, int bits_per_pixel, IScriptEnvironment* env);
-void Convert444FromYV12(PVideoFrame &src, PVideoFrame &dst, int pixelsize, int bits_per_pixel, IScriptEnvironment* env);
-void Convert444FromYUY2(PVideoFrame &src, PVideoFrame &dst, int pixelsize, int bits_per_pixel, IScriptEnvironment* env);
-void Convert444ToYV16(PVideoFrame &src, PVideoFrame &dst, int pixelsize, int bits_per_pixel, IScriptEnvironment* env);
-void Convert444ToYV12(PVideoFrame &src, PVideoFrame &dst, int pixelsize, int bits_per_pixel, IScriptEnvironment* env);
-void Convert444ToYUY2(PVideoFrame &src, PVideoFrame &dst, int pixelsize, int bits_per_pixel, IScriptEnvironment* env);
-#if 0
-// history
-void ConvertYToYV12Chroma(BYTE *dst, BYTE *src, int dstpitch, int srcpitch, int pixelsize, int w, int h, IScriptEnvironment* env);
-void ConvertYToYV16Chroma(BYTE *dst, BYTE *src, int dstpitch, int srcpitch, int pixelsize, int w, int h, IScriptEnvironment* env);
-#endif
-
-#endif //444Convert
+#endif // __Conditional_Functions_NEON_H__

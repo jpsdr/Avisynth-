@@ -50,6 +50,9 @@
 #include "overlay/intel/masked_rowprep_sse41.h"
 #include "overlay/intel/masked_rowprep_avx2.h"
 #endif
+#ifdef NEON_INTRINSICS
+#include "overlay/aarch64/masked_rowprep_neon.h"
+#endif
 #include "../convert/convert_matrix.h"  // for RGB2YUV_Rec601
 #include "../convert/convert_helper.h"  // chroma location
 
@@ -59,6 +62,7 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <type_traits>
 #include <avs/minmax.h>
 #include "../core/internal.h"
 #include "../core/info.h"
@@ -174,6 +178,25 @@ static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
     default: break;
     }
   }
+#elif defined(NEON_INTRINSICS)
+  if (cpuFlags & CPUF_ARM_NEON) {
+    switch (mode) {
+    case MASK444:         return prepare_effective_mask_for_row_neon<MASK444,         uint16_t, true>;
+    case MASK411:         return prepare_effective_mask_for_row_neon<MASK411,         uint16_t, true>;
+    case MASK411_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK411_TOPLEFT, uint16_t, true>;
+    case MASK420:         return prepare_effective_mask_for_row_neon<MASK420,         uint16_t, true>;
+    case MASK420_MPEG2:   return prepare_effective_mask_for_row_neon<MASK420_MPEG2,   uint16_t, true>;
+    case MASK420_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK420_TOPLEFT, uint16_t, true>;
+    case MASK422:         return prepare_effective_mask_for_row_neon<MASK422,         uint16_t, true>;
+    case MASK422_MPEG2:   return prepare_effective_mask_for_row_neon<MASK422_MPEG2,   uint16_t, true>;
+    case MASK422_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK422_TOPLEFT, uint16_t, true>;
+    case MASK440:         return prepare_effective_mask_for_row_neon<MASK440,         uint16_t, true>;
+    case MASK440_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK440_TOPLEFT, uint16_t, true>;
+    case MASK410:         return prepare_effective_mask_for_row_neon<MASK410,         uint16_t, true>;
+    case MASK410_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK410_TOPLEFT, uint16_t, true>;
+    default: break;
+    }
+  }
 #else
   (void)cpuFlags;
 #endif
@@ -225,6 +248,8 @@ Antialiaser::Antialiaser(int width, int height, const char fontname[], int size,
   if (!getalpharect_fn && (cpuFlags & CPUF_SSE4_1))
     getalpharect_fn = GetAlphaRect_select_sse41(_noaa, _interlaced);
   // nullptr means scalar fallback (called directly inside GetAlphaRect())
+#elif defined(NEON_INTRINSICS)
+  getalpharect_fn = (cpuFlags & CPUF_ARM_NEON) ? GetAlphaRect_select_neon(_noaa, _interlaced) : nullptr;
 #endif
 
   struct {
@@ -592,7 +617,7 @@ void Antialiaser::GetAlphaRect()
 {
   dirty = false;
   const int srcpitch = (w + 4 + 3) & -4;
-#ifdef INTEL_INTRINSICS
+#if defined(INTEL_INTRINSICS) || defined(NEON_INTRINSICS)
   if (getalpharect_fn) {
     getalpharect_fn(lpAntialiasBits, soa_buf, w, h, w_stride, srcpitch,
                     textcolor, halocolor, xl, yt, xr, yb);
@@ -2539,6 +2564,9 @@ AVSValue __cdecl Compare::Create(AVSValue args, void*, IScriptEnvironment *env)
             env);
 }
 
+// d * d as unsigned 32 bit: exact for 16 bit differences (|d| <= 65535), the int multiply overflows above 46340
+static AVS_FORCEINLINE uint32_t sqr_u32(int d) { return (uint32_t)d * (uint32_t)d; }
+
 static void compare_planar_c(
     const BYTE * f1ptr, int pitch1,
     const BYTE * f2ptr, int pitch2,
@@ -2588,7 +2616,7 @@ static void compare_planar_uint16_t_c(
             int d0 = p1 - p2;
             SD_sum += d0;
             SAD_sum += abs(d0);
-            row_SSD += d0 * d0;
+            row_SSD += sqr_u32(d0);
             pos_D = max(pos_D, d0);
             neg_D = min(neg_D, d0);
         }
@@ -2599,70 +2627,53 @@ static void compare_planar_uint16_t_c(
 }
 
 
-static void compare_c(uint32_t mask, int increment,
-    const BYTE * f1ptr, int pitch1,
-    const BYTE * f2ptr, int pitch2,
-    int rowsize, int height,
-    int64_t &SAD_sum, int64_t &SD_sum, int &pos_D,  int &neg_D, double &SSD_sum)
+// Packed RGB24/32/48/64, YUY2. incr: components per step (3: RGB24/48, 4: others); the component masks
+// are 0 or all ones, a masked component gives d=0, which changes no statistics.
+// Compile time incr, component-wise loads and row sums in locals: vectorized by GCC and Clang
+// (runtime increment and the references updated per pixel kept it scalar).
+template<typename pixel_t, int incr>
+static void compare_packed_c(const pixel_t(&m)[4],
+  const BYTE* f1ptr8, int pitch1,
+  const BYTE* f2ptr8, int pitch2,
+  int rowsize, int height,
+  int64_t& SAD_sum, int64_t& SD_sum, int& pos_D, int& neg_D, double& SSD_sum)
 {
-    int row_SSD;
+  // row SSD: 8 bit int as before; 16 bit: 64 bit sum of the unsigned 32 bit squares
+  typedef typename std::conditional<sizeof(pixel_t) == 1, int, int64_t>::type sq_t;
+  const pixel_t* f1ptr = reinterpret_cast<const pixel_t*>(f1ptr8);
+  const pixel_t* f2ptr = reinterpret_cast<const pixel_t*>(f2ptr8);
+  pitch1 /= sizeof(pixel_t);
+  pitch2 /= sizeof(pixel_t);
+  rowsize /= sizeof(pixel_t);
+  const pixel_t m0 = m[0], m1 = m[1], m2 = m[2], m3 = m[3];
 
-    for (int y = 0; y < height; y++) {
-        row_SSD = 0;
-        for (int x = 0; x < rowsize; x += increment) {
-            uint32_t p1 = *(uint32_t*)(f1ptr + x) & mask;
-            uint32_t p2 = *(uint32_t*)(f2ptr + x) & mask;
-            int d0 = (p1 & 0xff) - (p2 & 0xff);
-            int d1 = ((p1 >> 8) & 0xff) - ((p2 & 0xff00) >> 8); // ?PF why not (p2 >> 8) & 0xff as for p1?
-            int d2 = ((p1 >> 16) & 0xff) - ((p2 & 0xff0000) >> 16);
-            int d3 = (p1 >> 24) - (p2 >> 24);
-            SD_sum += d0 + d1 + d2 + d3;
-            SAD_sum += abs(d0) + abs(d1) + abs(d2) + abs(d3);
-            row_SSD += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
-            pos_D = max(max(max(max(pos_D, d0), d1), d2), d3);
-            neg_D = min(min(min(min(neg_D, d0), d1), d2), d3);
-        }
-        SSD_sum += row_SSD;
-        f1ptr += pitch1;
-        f2ptr += pitch2;
+  for (int y = 0; y < height; y++) {
+    int64_t row_SD = 0, row_SAD = 0;
+    sq_t row_SSD = 0;
+    int row_pos = pos_D, row_neg = neg_D;
+    for (int x = 0; x < rowsize; x += incr) {
+      const int d0 = (f1ptr[x] & m0) - (f2ptr[x] & m0);
+      const int d1 = (f1ptr[x + 1] & m1) - (f2ptr[x + 1] & m1);
+      const int d2 = (f1ptr[x + 2] & m2) - (f2ptr[x + 2] & m2);
+      const int d3 = incr == 4 ? (f1ptr[x + 3] & m3) - (f2ptr[x + 3] & m3) : 0;
+      row_SD += d0 + d1 + d2 + d3;
+      row_SAD += abs(d0) + abs(d1) + abs(d2) + abs(d3);
+      if constexpr (sizeof(pixel_t) == 1)
+        row_SSD += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+      else
+        row_SSD += (sq_t)sqr_u32(d0) + (sq_t)sqr_u32(d1) + (sq_t)sqr_u32(d2) + (sq_t)sqr_u32(d3);
+      row_pos = max(max(max(max(row_pos, d0), d1), d2), d3);
+      row_neg = min(min(min(min(row_neg, d0), d1), d2), d3);
     }
+    SD_sum += row_SD;
+    SAD_sum += row_SAD;
+    SSD_sum += row_SSD;
+    pos_D = row_pos;
+    neg_D = row_neg;
+    f1ptr += pitch1;
+    f2ptr += pitch2;
+  }
 }
-
-static void compare_uint16_t_c(uint64_t mask64, int increment,
-    const BYTE * f1ptr8, int pitch1,
-    const BYTE * f2ptr8, int pitch2,
-    int rowsize, int height,
-    int64_t& SAD_sum, int64_t &SD_sum, int &pos_D, int &neg_D, double &SSD_sum)
-{
-    int64_t row_SSD;
-
-    const uint16_t *f1ptr = reinterpret_cast<const uint16_t *>(f1ptr8);
-    const uint16_t *f2ptr = reinterpret_cast<const uint16_t *>(f2ptr8);
-    pitch1 /= sizeof(uint16_t);
-    pitch2 /= sizeof(uint16_t);
-    rowsize /= sizeof(uint16_t);
-
-    for (int y = 0; y < height; y++) {
-        row_SSD = 0;
-        for (int x = 0; x < rowsize; x += increment) {
-            uint64_t p1 = *(uint64_t *)(f1ptr + x) & mask64;
-            uint64_t p2 = *(uint64_t *)(f2ptr + x) & mask64;
-            int d0 = (p1 & 0xffff) - (p2 & 0xffff);
-            int d1 = ((p1 >> 16) & 0xffff) - ((p2 & 0xffff0000) >> 16);     // ?PF why not (p2 >> 16) & 0xffff as for p1?
-            int d2 = ((p1 >> 32) & 0xffff) - ((p2 & 0xffff00000000ull) >> 32);
-            int d3 = (p1 >> 48) - (p2 >> 48);
-            SD_sum += d0 + d1 + d2 + d3;
-            SAD_sum += abs(d0) + abs(d1) + abs(d2) + abs(d3);
-            row_SSD += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
-            pos_D = max(max(max(max(pos_D, d0), d1), d2), d3);
-            neg_D = min(min(min(min(neg_D, d0), d1), d2), d3);
-        }
-        SSD_sum += row_SSD;
-        f1ptr += pitch1;
-        f2ptr += pitch2;
-    }
-}
-
 
 
 PVideoFrame __stdcall Compare::GetFrame(int n, IScriptEnvironment* env)
@@ -2711,10 +2722,20 @@ PVideoFrame __stdcall Compare::GetFrame(int n, IScriptEnvironment* env)
 #endif
       {
 
-        if (pixelsize == 1)
-          compare_c(mask, incr, f1ptr, pitch1, f2ptr, pitch2, rowsize, height, SAD, SD, pos_D, neg_D, SSD);
-        else
-          compare_uint16_t_c(mask64, incr, f1ptr, pitch1, f2ptr, pitch2, rowsize, height, SAD, SD, pos_D, neg_D, SSD);
+        if (pixelsize == 1) {
+          const uint8_t m[4] = { (uint8_t)mask, (uint8_t)(mask >> 8), (uint8_t)(mask >> 16), (uint8_t)(mask >> 24) };
+          if (incr == 3)
+            compare_packed_c<uint8_t, 3>(m, f1ptr, pitch1, f2ptr, pitch2, rowsize, height, SAD, SD, pos_D, neg_D, SSD);
+          else
+            compare_packed_c<uint8_t, 4>(m, f1ptr, pitch1, f2ptr, pitch2, rowsize, height, SAD, SD, pos_D, neg_D, SSD);
+        }
+        else {
+          const uint16_t m[4] = { (uint16_t)mask64, (uint16_t)(mask64 >> 16), (uint16_t)(mask64 >> 32), (uint16_t)(mask64 >> 48) };
+          if (incr == 3)
+            compare_packed_c<uint16_t, 3>(m, f1ptr, pitch1, f2ptr, pitch2, rowsize, height, SAD, SD, pos_D, neg_D, SSD);
+          else
+            compare_packed_c<uint16_t, 4>(m, f1ptr, pitch1, f2ptr, pitch2, rowsize, height, SAD, SD, pos_D, neg_D, SSD);
+        }
       }
   }
   else { // Planar

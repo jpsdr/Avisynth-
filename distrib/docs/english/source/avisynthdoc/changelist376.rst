@@ -629,6 +629,9 @@ Bugfixes
 - Fix: "Expr" wrong results or crash (mostly x86) in the SSE2/AVX2 JIT under certain conditions: relative
   pixel loads (``x[dx,dy]``) near the row edges with many values held on the stack (high register pressure).
   A bug in the JIT code generator's register handling, existed in earlier versions as well.
+- Fix: "Compare" 16 bit (planar and RGB48/RGB64): the sum of squared differences overflowed for pixel
+  differences above 46340, PSNR was wrong or ``nan`` (e.g. black vs. white), depending on the compiler.
+  Existed since 16 bit support in "Compare".
 
 
 Optimizations
@@ -664,6 +667,22 @@ Optimizations
 - add NEON optimizations for ARM64 (aarch64) for TurnLeft/TurnRight/Turn180.
   (First aarch64 code in Avisynth)
 - add NEON optimizatons for Overlay blend
+- add NEON optimizations for packed RGB24 <-> RGB32 and RGB48 <-> RGB64 conversion
+  (``ConvertToRGB32``, ``ConvertToRGB24`` and the 16 bit pairs)
+- add NEON optimizations for the direct 8 bit YUV 4:4:4 to packed RGB24/RGB32 conversion
+- add NEON optimizations for ``Blur``/``Sharpen`` horizontal pass, planar 8-16 bit and 32 bit float
+- add NEON optimizations for ``TemporalSoften``, 8-16 bit and 32 bit float
+- add NEON optimizations for ``ConvertBits`` ordered dither (``dither=0``), 8-16 bit to 8-16 bit
+- add NEON optimizations for ``Limiter``, planar 8-16 bit and 32 bit float
+- add NEON optimizations for the subsampled chroma mask preparation of ``Overlay``, ``Layer`` and masked merges, 8-16 bit
+- aarch64: planar YUV <-> RGB matrix conversions vectorized (GCC auto-vectorization of the C path)
+- add NEON optimizations for the horizontal and vertical resizers, planar 8-16 bit and 32 bit float
+- add NEON optimizations for ``Layer`` mul and (YUV) mulovr (10-16 bit), lighten and darken (10-16 bit and 32 bit float), planar RGB(A) and YUV(A)
+- add NEON optimizations for ``ExtractR/G/B/A`` and ``PlaneToY`` from packed RGB24/32/48/64
+- add NEON optimizations for the runtime functions ``AverageLuma/ChromaU/ChromaV/R/G/B`` and the ``xDifference``,
+  ``xDifferenceFromPrevious``, ``xDifferenceToNext`` families (8-16 bit), and for the ``TemporalSoften`` scene change detection;
+  8 bit with the ARM dot product extension (UDOT) when available
+- add NEON optimizations for the Windows ARM64 text overlay antialiaser (``Subtitle``, ``ShowFrameNumber``, ``Info``, ...)
 - (filter graph) avoid MTGuard and CacheGuard creation if a filter returns one of its clip parameter unaltered.
 - Add some avx2 stuff to Invert (no really gain, filter is too simple) and some Layer subfilter.
 - "Layer", "Overlay", "Merge": unify three separate masked-merge kernel families into shared
