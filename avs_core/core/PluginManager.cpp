@@ -767,7 +767,14 @@ void PluginManager::AutoloadPlugins()
     return;
 
   AutoloadExecuted = true;
-  Autoloading = true;
+
+  // Make Autoloading (the variable) is reset also when a plugin or an .avsi throws,
+  // otherwise later LoadPlugin calls and functions would be treated as autoloaded ones.
+  struct AutoloadingGuard {
+    bool& flag;
+    AutoloadingGuard(bool& f) : flag(f) { flag = true; }
+    ~AutoloadingGuard() { flag = false; }
+  } autoloading_guard(Autoloading);
 
   // Load binary plugins
   // AutoLoadDirs are utf8 on Windows as well
@@ -898,8 +905,6 @@ void PluginManager::AutoloadPlugins()
       }
     }
   }
-
-  Autoloading = false;
 }
 
 PluginManager::~PluginManager()
@@ -1040,7 +1045,13 @@ bool PluginManager::LoadPlugin(PluginFile &plugin, bool throwOnError, AVSValue *
 #else // AVS_POSIX
   plugin.Library = dlopen(plugin.FilePath.c_str(), RTLD_LAZY);
   if (plugin.Library == NULL)
-    Env->ThrowError("Cannot load file '%s'. Reason: %s", plugin.FilePath.c_str(), dlerror());
+  {
+    // e.g. a dependency library is missing: autoload skips it, like on Windows
+    if (throwOnError)
+      Env->ThrowError("Cannot load file '%s'. Reason: %s", plugin.FilePath.c_str(), dlerror());
+    else
+      return false;
+  }
 #endif
 
   // Try to load various plugin interfaces
@@ -1239,7 +1250,11 @@ std::string PluginManager::PluginLoading() const
 // 3: other exception
 int PluginManager::TryAsAvs26(PluginFile &plugin, AVSValue *result, std::string &avsexception_message)
 {
+#ifdef AVS_WINDOWS
   extern const AVS_Linkage* const AVS_linkage; // In interface.cpp
+#else
+  extern const AVS_Linkage* AVS_linkage; // In interface.cpp, not const on POSIX
+#endif
 #ifdef AVS_POSIX
   AvisynthPluginInit3Func AvisynthPluginInit3 = (AvisynthPluginInit3Func)dlsym(plugin.Library, "AvisynthPluginInit3");
 #elif defined(GCC_WIN32)

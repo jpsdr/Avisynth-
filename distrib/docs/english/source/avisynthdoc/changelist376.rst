@@ -373,6 +373,20 @@ Build environment, Interface
 
 Bugfixes
 ~~~~~~~~
+- Fix: escaped strings ending with an escaped backslash, e.g. ``e"C:\\Temp\\"`` or ``e"\\"``, gave
+  "missing closing quotation mark".
+  See :doc:`Script variables <./syntax/syntax_script_variables>`.
+- Fix: ``ResampleAudio``: fix signed overflow in the dtbe (creep error) scale.
+- Fix: aarch64 Linux/BSD: SVE2.1 CPU feature was never detected. Reported by MeteorRain.
+- Fix: ``Expr`` (x86/x64 JIT): memory leak on Linux, macOS and BSD (the compiled code was never freed),
+  crash on FreeBSD; executable memory allocation failure gives an error instead of a crash.
+  Reported by MeteorRain.
+- Fix: Linux/BSD: crash when loading any C++ plugin into a host that links libavisynth directly
+  (``AVS_linkage`` symbol of the plugin resolved to the read-only one of the core). Existing plugins
+  work without a rebuild. Reported by MeteorRain.
+- Fix: Linux/macOS/BSD: an autoload plugin which cannot be loaded (e.g. ImageSeq without DevIL) made the whole
+  autoload fail, and with it ``LoadPlugin`` of any other plugin. Now it is skipped like on Windows; an explicit
+  ``LoadPlugin`` of it still reports the reason. Reported by MysteryX.
 - Fix: ``SetMaxCPU`` limited the CPU flags of the whole process until the AviSynth DLL was unloaded, e.g. a
   script reload in VirtualDub kept the earlier limit (#440). Now the limit belongs to the script environment.
   See :ref:`SetMaxCPU <setmaxcpu>`. Existed since 3.6.0.

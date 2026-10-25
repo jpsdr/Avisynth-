@@ -9,7 +9,28 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20261021 3.7.5.rXXXX (pre 3.7.6)
+20261024 3.7.5.rXXXX (pre 3.7.6)
+--------------------------------
+- ResampleAudio: fix signed overflow in the dtbe (creep error) scale
+  Reported by MeteorRain (Doom9)
+- Fix: Expr: the jitasm Backend constructor called memset on a NULL buffer with size 0 (UB).
+  Reported by MeteorRain
+- Fix: aarch64 Linux/BSD: SVE2.1 was never detected. Reported by MeteorRain
+- Fix: Expr JIT (x86/x64): the executable code blocks were never freed on Linux/macOS/BSD (munmap with size 0),
+  mmap failed on FreeBSD (fd 0 instead of -1 for MAP_ANON), allocation failures were not checked
+  (now an error message instead of a crash). Reported by MeteorRain
+- Fix: Linux/BSD: crash when loading any C++ plugin into a host that links libavisynth directly (not via
+  dlopen RTLD_LOCAL): the plugin's own AVS_linkage bound to the core's read-only AVS_linkage, then the plugin's
+  store in AvisynthPluginInit3 wrote to read-only memory. The core's AVS_linkage is not const on POSIX anymore,
+  existing plugin binaries work without a rebuild. Reported by MeteorRain
+- Fix: Linux/macOS/BSD: an autoload plugin which cannot be loaded (e.g. a missing dependency, like ImageSeq without
+  DevIL) made the whole autoload fail, and with it LoadPlugin of any other plugin. Now it is skipped like on Windows;
+  an explicit LoadPlugin of it still reports the reason. Reported by MysteryX
+- Fix: escaped strings ending with an escaped backslash, e.g. e"C:\\Temp\\" or e"\\", gave "missing closing
+  quotation mark": a quotation mark after \\ was taken as an escaped one. Now it is escaped only after an odd
+  number of backslashes.
+
+20261023 3.7.5.r4896 (pre 3.7.6)
 --------------------------------
 - Optimization: aarch64 NEON packed RGB24 <-> RGB32 and RGB48 <-> RGB64 conversion (vld3/vst4 and
   vld4/vst3 de-interleaving), the C versions stayed scalar with GCC -O3. Bit-identical to C.
