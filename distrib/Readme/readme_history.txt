@@ -9,6 +9,33 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
+20261031 3.7.6.rXXXX (pre 3.7.7)
+--------------------------------
+- Fix #531: GCC build with LTO (-flto) failed at link time on x86/x64 Linux:
+  "inlining failed in call to 'always_inline' prepare_effective_mask_for_row_float_sse41: target specific
+  option mismatch". The force-inlined SSE4.1 function, defined in another source file, was called from a
+  function without the SSE4.1 target; LTO tried to inline it across the files.
+  The caller now has the SSE4.1 target, and the needless force-inline was removed (also from the AVX2 twin).
+  Existed since 3.7.6.
+- Fix #530: AddAlphaPlane() refused greyscale (Y) clips. Now Y gives YA (e.g. Y8 -> YA8, Y32 -> YAS), with
+  the default opaque alpha, a mask value, opacity= or a mask clip (Y, or any alpha format, also YA).
+  RemoveAlphaPlane() turns YA back into Y. Existed since 3.7.6 (new YA formats).
+- Fix: Format() (and propShow, SetFilterProp JSON output, array output) gave one digit more than needed
+  for a few powers of two: 37 of the 2098 double and 3 of the 277 float powers of two. Only the last
+  (17th, float: 9th) digit was superfluous, the value always read back exactly.
+  e.g. Format("{}", Pow(2.0, -24)): was 5.9604644775390625e-08, now 5.960464477539063e-08
+  Below a power of two the representable values are half as far apart, so the nearest decimal can miss the
+  narrower lower half interval while the next decimal up reads back. Now that one is tried as well.
+- Fix #529: ConvertToYUY2() from alpha sources (planar RGBA, YUVA, YA) failed with a misleading
+  "ConvertYV16ToYUY2: Only YV16 is allowed" error. Alpha is now dropped, as with RGB32/RGB64.
+  Reported by dartheditous
+- Fix: Layer(op="Subtract") with YUVA clips: the blend weight is the original overlay alpha, not the inverted
+  one. Regression since 3.7.5.r4589. Reported by MeteorRain
+
+20261025 3.7.6.r4909
+--------------------
+** RELEASE **
+
 20261024 3.7.5.rXXXX (pre 3.7.6)
 --------------------------------
 - ResampleAudio: fix signed overflow in the dtbe (creep error) scale
