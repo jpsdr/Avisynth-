@@ -70,6 +70,29 @@
 #include "../core/audio.h"
 #include <bitset>
 
+// GetAlphaRect lookup tables, shared by the scalar and all SIMD tiers (declared in getalpharect_impl.h).
+const GARTables& gar_tables() noexcept {
+  static const GARTables t = []() {
+    GARTables t{};
+    const double scale = 516.0 * 64.0 / std::sqrt(128.0);
+    for (int i = 0; i <= 128; i++)
+      t.gamma[i] = (uint16_t)(std::sqrt((double)i) * scale + 0.5);
+    for (int i = 0; i < 256; i++) {
+      uint8_t b = 0, l = 0, r = 0;
+      if (i &   1) { b=1; l|=0x01; r|=0xFF; }
+      if (i &   2) { ++b; l|=0x03; r|=0xFE; }
+      if (i &   4) { ++b; l|=0x07; r|=0xFC; }
+      if (i &   8) { ++b; l|=0x0F; r|=0xF8; }
+      if (i &  16) { ++b; l|=0x1F; r|=0xF0; }
+      if (i &  32) { ++b; l|=0x3F; r|=0xE0; }
+      if (i &  64) { ++b; l|=0x7F; r|=0xC0; }
+      if (i & 128) { ++b; l|=0xFF; r|=0x80; }
+      t.bitcnt[i] = b; t.bitexl[i] = l; t.bitexr[i] = r;
+    }
+    return t;
+  }();
+  return t;
+}
 
 #if defined(AVS_WINDOWS) && !defined(NO_WIN_GDI)
 static HFONT LoadFont(const char name[], int size, bool bold, bool italic, int width=0, int angle=0)
@@ -137,7 +160,7 @@ extern const AVSFunction Text_filters[] = {
 
 // Select the best rowprep function for soa_mask_mode (SoA = Structure of Arrays,
 // the row-interleaved layout used by soa_buf/ApplyPlanar_SoA below) at construction time.
-using rowprep_u16_fn_t = const uint16_t*(*)(const uint16_t*, int, int, std::vector<uint16_t>&, int, int, MagicDiv);
+using rowprep_u16_fn_t = const uint16_t*(*)(const uint16_t*, int, int, uint16_t*, int, int, MagicDiv);
 
 static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
 {
@@ -486,9 +509,9 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
   // +1 * w_stride was already handled: Y
   if constexpr (bits_per_pixel == 8) {
     for (int y = yb; y <= yt; y += stepY) {
-      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba, 0, 0, {});
-      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u,  0, 0, {});
-      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v,  0, 0, {});
+      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba.data(), 0, 0, {});
+      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u.data(),  0, 0, {});
+      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v.data(),  0, 0, {});
       for (int xs = xl_uv; xs <= xr_uv; ++xs) {
         const int ba = ba_row[xs];
         if (ba != 256) {
@@ -502,9 +525,9 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
     }
   } else if constexpr (bits_per_pixel >= 10 && bits_per_pixel <= 16) {
     for (int y = yb; y <= yt; y += stepY) {
-      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba, 0, 0, {});
-      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u,  0, 0, {});
-      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v,  0, 0, {});
+      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba.data(), 0, 0, {});
+      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u.data(),  0, 0, {});
+      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v.data(),  0, 0, {});
       uint16_t* pU = reinterpret_cast<uint16_t*>(bufU_row);
       uint16_t* pV = reinterpret_cast<uint16_t*>(bufV_row);
       for (int xs = xl_uv; xs <= xr_uv; ++xs) {
@@ -524,9 +547,9 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
     constexpr float scale_1_per_256 = 1.0f / 256.0f;
     constexpr float scale_1_per_65536 = 1.0f / 65536.0f;
     for (int y = yb; y <= yt; y += stepY) {
-      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba, 0, 0, {});
-      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u,  0, 0, {});
-      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v,  0, 0, {});
+      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba.data(), 0, 0, {});
+      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u.data(),  0, 0, {});
+      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v.data(),  0, 0, {});
       float* pU = reinterpret_cast<float*>(bufU_row);
       float* pV = reinterpret_cast<float*>(bufV_row);
       for (int xs = xl_uv; xs <= xr_uv; ++xs) {
@@ -568,9 +591,9 @@ void Antialiaser::ApplyYUY2(BYTE* buf, int pitch, MaskMode maskMode) {
       if (ba != 256)
         buf[x * 2] = BYTE((buf[x * 2] * ba + ry_y[x]) >> 8);
     }
-    const uint16_t* ba_row = rowprep_fns[maskMode](row_ptr,                soa_row_pitch, uv_width, uv_buf_ba, 0, 0, {});
-    const uint16_t* u_row  = rowprep_fns[maskMode](row_ptr + 2 * w_stride, soa_row_pitch, uv_width, uv_buf_u,  0, 0, {});
-    const uint16_t* v_row  = rowprep_fns[maskMode](row_ptr + 3 * w_stride, soa_row_pitch, uv_width, uv_buf_v,  0, 0, {});
+    const uint16_t* ba_row = rowprep_fns[maskMode](row_ptr,                soa_row_pitch, uv_width, uv_buf_ba.data(), 0, 0, {});
+    const uint16_t* u_row  = rowprep_fns[maskMode](row_ptr + 2 * w_stride, soa_row_pitch, uv_width, uv_buf_u.data(),  0, 0, {});
+    const uint16_t* v_row  = rowprep_fns[maskMode](row_ptr + 3 * w_stride, soa_row_pitch, uv_width, uv_buf_v.data(),  0, 0, {});
     for (int xs = xl_uv; xs <= xr_uv; ++xs) {
       const int ba = ba_row[xs];
       if (ba != 256) {
