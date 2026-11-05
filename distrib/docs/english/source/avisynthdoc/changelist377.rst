@@ -12,6 +12,26 @@ Build environment, Interface
 
 Bugfixes
 ~~~~~~~~
+- Fix: 8 and 16 bit horizontal resize, AVX-512: some kernels could read up to ~120 bytes past the end of the
+  source frame buffer on the last row (possible access violation; the output was not affected).
+  Existed since 3.7.6.
+- Fix: 32 bit float horizontal resize (all resizers), AVX2 and AVX-512: near the right edge of each row the
+  source was read past the row end; multiplied by zero padding coefficients, a NaN found there gave NaN
+  output pixels, at random (depending on memory content). Existed since 3.7.6.
+- Fix: YUV to planar RGB (and RGB to YUV/Y) conversion to 10-14 bit, AVX2: values above 32767 before the
+  final clamp were not clamped (e.g. 14 bit target, B channel at high Y and near-maximum U gave ~32800
+  instead of 16383). Existed since 3.7.6.
+- Fix: ConvertToYUV444/ConvertToY (and the other planar RGB to YUV/Y conversions) from 32 bit float RGB
+  to 8-16 bit: the output range scaling depended on uninitialized memory, giving full or limited range
+  scaling at random (e.g. 10 bit full range 910 instead of 913), different from run to run.
+  Existed since 3.7.6.
+- Fix: YUV to planar RGB (and RGB to YUV/Y) conversion from 8-16 bit to 32 bit float, AVX2: memory
+  overwrite past the end of the rows (and the last row past the plane) on narrow clips, corrupting the
+  first row of the next plane. Existed since 3.7.6.
+- Fix: Limiter with (Degenerated case) min > max (e.g. ``Limiter(200, 100, 180, 50, paramscale=true)``), which is outside the
+  documented [min, max] range use: the x86 SIMD paths gave ``max`` for every pixel, the C and the aarch64 NEON
+  give ``min`` below ``min`` and ``max`` otherwise. On x86 this case now goes to C as well; min <= max is unchanged.
+  Existed since classic AviSynth (8 bit) and since the 10-16 bit Limiter (2016).
 - Fix: Layer(op="Subtract") with YUVA clips: the blend weight is the original overlay alpha, not the inverted
   one. Regression since 3.7.6 (test build r4589)
 - Fix: ConvertToYUY2 from sources with alpha (planar RGBA, YUVA, YA) gave
@@ -27,6 +47,8 @@ Bugfixes
 
 Optimizations
 ~~~~~~~~~~~~~
+- Optimization: x86 SSE2 (no SSE4.1) emulation of unsigned 16 bit min/max (Limiter, Blur/Sharpen, 10-14 bit
+  resizers) and the pack + clamp-to-limit in the MSVC SSE2 build of the C resizer: fewer instructions.
 
 Documentation
 ~~~~~~~~~~~~~

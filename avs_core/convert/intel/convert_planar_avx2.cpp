@@ -494,7 +494,7 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
   const int max_pixel_value_target = (1 << bits_per_pixel_target) - 1;
 
   bits_conv_constants conversion_ranges;
-  const bool full_scale_d = m.offset_out == 0;
+  const bool full_scale_d = m.full_scale_d;
   // matrix is handling only the same-bit-depth factor. Output result must be scaled as if
   // we further correct it with a post-matrix scaling for bit depth conversion which depends only
   // on the destination limite/full
@@ -830,7 +830,10 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
   }
 
   const int rowsize = width * sizeof(pixel_t);
-  const int rowsize_aligned = AlignNumber(rowsize, FRAME_ALIGN); // 64
+  // Float rows (float input loads, float output stores): pixels in a FRAME_ALIGN-aligned row.
+  // Counted in pixels, not in source bytes: with 8-16 bit input and float output the destination
+  // row is 2-4x wider than the source row.
+  const int width_aligned_float = AlignNumber(width * (int)sizeof(float), FRAME_ALIGN) / (int)sizeof(float);
   for (int yy = 0; yy < height; yy++) {
     // 32 pixels per loop: 32 * 8 bit = 32 bytes; 32 * 16 bit = 64 bytes
     // Note: extra care needed for 32-bit float input or output, since 32xfloat is over
@@ -861,9 +864,10 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
       // Can I write all 32 pixels (blockA+B+C+D)?
       // yes: write all 4 blocks (blockA, B, C, D)
       // no : Write only first 2 blocks (blockA, B), 16 floats are guaranteed safe due to 64-byte alignment
+      // Same rule for loading the second 16 floats of a float source row.
       bool safe_last_16float_64bytes;
       if constexpr (final_is_float || sizeof(pixel_t) == 4)
-        safe_last_16float_64bytes = (x + 32 * (int)sizeof(pixel_t)) <= rowsize_aligned;
+        safe_last_16float_64bytes = (x / (int)sizeof(pixel_t) + 32) <= width_aligned_float;
       else
         safe_last_16float_64bytes = false;
 
@@ -1175,8 +1179,8 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
             else if constexpr (sizeof(pixel_t_dst) == 2) {
               // x->16 bits
               if constexpr (lessthan16bit_target) {
-                p1 = _mm256_min_epi16(p1, limit);
-                p2 = _mm256_min_epi16(p2, limit);
+                p1 = _mm256_min_epu16(p1, limit);
+                p2 = _mm256_min_epu16(p2, limit);
               }
               if constexpr (sizeof(pixel_t) == 1) {
                 // 8->16 bits:
@@ -1405,8 +1409,9 @@ static void convert_yuv_to_planarrgb_avx2_internal(BYTE* (&dstp)[3], int(&dstPit
             else {
               // X->16 bits
               if constexpr (lessthan16bit_target) {
-                p1 = _mm256_min_epi16(p1, limit);
-                p2 = _mm256_min_epi16(p2, limit);
+                // unsigned min: packus_epi32 gives 0..65535, a signed min would let 32768..65535 through
+                p1 = _mm256_min_epu16(p1, limit);
+                p2 = _mm256_min_epu16(p2, limit);
               }
               if constexpr (sizeof(pixel_t) == 1) {
                 // 8->16 bits:
@@ -1493,7 +1498,7 @@ void convert_yuv_to_planarrgb_avx2(BYTE* (&dstp)[3], int(&dstPitch)[3], const BY
       return;
     }
 
-    const bool full_d = m.offset_out == 0;
+    const bool full_d = m.full_scale_d;
 
     if (bits_per_pixel_target >= 8 && bits_per_pixel <= 16) {
       // int->int conversion with range conversion (limited<->full), or upscale with no range conversion (full->full or limited->limited)

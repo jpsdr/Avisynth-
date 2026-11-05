@@ -11,6 +11,51 @@ https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
 20261031 3.7.6.rXXXX (pre 3.7.7)
 --------------------------------
+- Fix: AVX-512 8 and 16 bit horizontal resizers: possible read past the end of the source buffer.
+  These permutex kernels load a 128 byte (8 bit) or 64 pixel (16 bit) source window from each pixel group
+  start, but the safe-zone limit checked only the first group of each step: 8 bit mpz_ks16 (32 pixels/step)
+  and the 2s32 kernels (second window at x+32), 16 bit 4s16 kernels (windows at x+16 and x+48). On the last
+  row this could read up to ~120 bytes past the buffer, beyond the guaranteed 64 byte slack. The values were
+  never used (output unchanged), but it could fault. Now every window start is checked.
+  Existed since 3.7.6.
+- Fix: 32 bit float horizontal resizers, AVX2 and AVX-512: random NaN output pixels near the right edge.
+  The "safe zone" (fast, full-width loads) was limited by a too short source read width: e.g. the generic
+  kernel reads filter_size (aligned to 8) source floats per target pixel, but checked only 16; the AVX-512
+  ks8 transpose kernel reads 8 but checked 4; the AVX-512 permutex kernels (ks4/ks8/ks16, 2s8, 4s4) load a
+  32 float window but checked 4 or 8. The over-read values (next row, or past the frame) were multiplied by
+  the zero padding coefficients, and 0 * NaN = NaN. So the result depended on memory content and varied from
+  run to run, e.g. Spline64Resize(20, 4) of a 64 pixel wide YUV444PS clip. The AVX-512 permutex kernels could
+  also read past the end of the source buffer. Now each kernel uses the limit of its real read width.
+  Existed since 3.7.6.
+- Fix: AVX2 YUV to planar RGB (and RGB to YUV/Y) conversion with 10-14 bit integer output: missing clamp.
+  The result was packed with unsigned saturation (0..65535) and then clamped with a signed 16 bit min, so
+  values 32768..65535 (negative as signed) passed the max-pixel-value clamp.
+  With valid input this happens at 14 bit target only: e.g. YUV444P14 limited, Y=15285, U=V=16181 gave B=32847
+  instead of 16383. Out-of-range input (e.g. ConvertBits(truerange=false)) can trigger it at 10-12 bit too.
+  SSE2 and C were correct. Existed since 3.7.6.
+- Fix: planar RGB to YUV/Y conversion from 32 bit float source to 8-16 bit integer (ConvertToYUV444,
+  ConvertToY, ConvertToYUV420/422 ...): the conversion matrix for a float source did not set its integer
+  offsets, and the converters (C, SSE2, AVX2) decided full/limited destination range from "offset_out == 0".
+  So the range scaling depended on leftover memory: e.g. RGBPS to 10 bit PC.709 gave 913 or 910
+  (x1023 or x1020), Rec709 848 or 845, varying from run to run and between C and SIMD.
+  The matrix now carries the destination range explicitly and starts from all zero.
+  (YUV->RGB from float with limited RGB output was also misread as full range, offset 16/255 rounded to 0.)
+  Existed since 3.7.6.
+- Fix: AVX2 YUV to planar RGB (and RGB to YUV/Y) conversion from 8-16 bit source to 32 bit float output:
+  memory overwrite. The "can store 32 floats" check used the source row size, the float destination row
+  is 2-4x wider. On narrow clips (e.g. width < 16, or the last 32-pixel block of a row) up to 64 bytes per row
+  were written past the row end; on the last row past the end of the plane, overwriting the first row of
+  the next plane (seen as random values in B and R row 0). Existed since 3.7.6.
+- Fix: Limiter with min > max, e.g. Limiter(200, 100, 180, 50, paramscale=true). Not a documented use (the
+  filter clamps into a [min, max] range), but the result depended on the CPU: the x86 SIMD paths compute
+  min(max(x, min), max), which gives max for every pixel, while the C and the aarch64 NEON compute
+  x < min ? min : (x > max ? max : x), which gives min below min and max otherwise.
+  On x86 the min > max case now uses the C path, so x86, C and NEON give the same output; min <= max is unchanged.
+  Existed since classic AviSynth (8 bit) and since the 10-16 bit Limiter (2016).
+- Optimization: SSE2 emulation of the SSE4.1 _mm_min_epu16 / _mm_max_epu16 (used without SSE4.1 by Limiter,
+  Blur/Sharpen and the 10-14 bit resizers): 2 instructions (saturating subtract trick) instead of 5
+  (compare + blend). The pack + clamp-to-limit helpers in avs_simd_c.h (MSVC SSE2 build, e.g. the C resizer):
+  min against the biased limit right after the biased signed pack, 5 instructions instead of 9. Output is unchanged.
 - Fix #531: GCC build with LTO (-flto) failed at link time on x86/x64 Linux:
   "inlining failed in call to 'always_inline' prepare_effective_mask_for_row_float_sse41: target specific
   option mismatch". The force-inlined SSE4.1 function, defined in another source file, was called from a
