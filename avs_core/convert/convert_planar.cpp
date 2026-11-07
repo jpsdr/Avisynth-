@@ -35,6 +35,7 @@
 // ConvertPlanar (c) 2005 by Klaus Post
 
 
+#include "../core/internal.h"
 #include "convert.h"
 #include "convert_matrix.h"
 #include "convert_helper.h"
@@ -507,6 +508,7 @@ ConvertYUV444ToRGB::ConvertYUV444ToRGB(PClip src, const char *matrix_name, int _
     const bool sse2 = !!(env->GetCPUFlags() & CPUF_SSE2);
     const bool sse4 = !!(env->GetCPUFlags() & CPUF_SSE4_1);
     const bool avx2 = !!(env->GetCPUFlags() & CPUF_AVX2);
+#endif
     // we really need only alpha conversion function
     const bool fulls = true; // alpha is always full range
     const bool fulld = true; // alpha is always full range
@@ -518,9 +520,6 @@ ConvertYUV444ToRGB::ConvertYUV444ToRGB(PClip src, const char *matrix_name, int _
 #else
     get_convert_any_bits_functions(dither_mode, source_bit_depth, target_bit_depth, fulls, fulld, conv_function, conv_function_chroma, conv_function_a);
 #endif
-
-#endif
-
   }
   else {
     bitdepthConverted = false;
@@ -659,7 +658,7 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
   const float out_offset_f = m.offset_out_f_32;
   const int half_pixel_offset = 1 << (bits_per_pixel - 1);
   const int half_pixel_offset_target = 1 << (bits_per_pixel_target - 1);
-  const int max_pixel_value_target = (1 << bits_per_pixel_target) - 1;
+  const int max_pixel_value_target = bits_per_pixel_target <= 16 ? (1 << bits_per_pixel_target) - 1 : 0; // float: n/a
 
   bits_conv_constants conversion_ranges;
   const bool full_scale_d = m.full_scale_d;
@@ -1488,6 +1487,12 @@ ConvertToPlanarGeneric::ConvertToPlanarGeneric(
   if (vi.height & ymask)
     env->ThrowError("Convert: Cannot convert if height isn't mod%d!", ysOut);
 
+  // Chroma is processed by fields: each field must have an integral number of chroma rows on both sides.
+  // Otherwise the woven chroma has fewer rows than the output plane.
+  const int ysField = 2 * std::max(ysIn, ysOut);
+  if (interlaced && (vi.height & (ysField - 1)))
+    env->ThrowError("Convert: Cannot convert with interlaced=true if height isn't mod%d!", ysField);
+
   int uv_width  = vi.width  >> vi.GetPlaneWidthSubsampling(PLANAR_U);
   int uv_height = vi.height >> vi.GetPlaneHeightSubsampling(PLANAR_U);
 
@@ -2092,6 +2097,9 @@ static int getPlacement(const AVSValue& _placement, IScriptEnvironment* env) {
 
 
 ResamplingFunction* getResampler(const char* resampler, AVSValue param1, AVSValue param2, AVSValue param3, bool throw_on_error, IScriptEnvironment* env) {
+  check_float_param(param1, "Resampler", "param1", env);
+  check_float_param(param2, "Resampler", "param2", env);
+  check_float_param(param3, "Resampler", "param3", env);
   if (resampler) {
     if (!lstrcmpi(resampler, "point"))
       return new PointFilter();

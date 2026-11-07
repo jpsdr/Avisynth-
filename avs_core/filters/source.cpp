@@ -139,7 +139,7 @@ static PVideoFrame CreateBlankFrame(const VideoInfo& vi, int color, int mode, co
   // RGB 8->16 bit: not << 8 like YUV but 0..255 -> 0..65535 or 0..1023 for 10 bit
   int pixelsize = vi.ComponentSize();
   int bits_per_pixel = vi.BitsPerComponent();
-  int max_pixel_value = (1 << bits_per_pixel) - 1;
+  int max_pixel_value = bits_per_pixel <= 16 ? (1 << bits_per_pixel) - 1 : 0; // float: n/a
   auto rgbcolor8to16 = [](uint8_t color8, int max_pixel_value) { return (uint16_t)(color8 * max_pixel_value / 255); };
 
   // int color holds the "old" 8 bit color values that are scaled automatically to the right bitmap
@@ -225,11 +225,11 @@ static PVideoFrame CreateBlankFrame(const VideoInfo& vi, int color, int mode, co
         default: // case 4:
           float val_f;
           if (plane == PLANAR_U || plane == PLANAR_V) {
-            float shift = 0.0f;
-            val_f = float(val_i - 128) / 255.0f + shift; // 32 bit float chroma 128=0.5
+            val_f = uv8tof(val_i); // 32 bit float chroma 128=0.0
           }
           else {
-            val_f = float(val_i) / 255.0f;
+            // PLANAR_Y: limited range. Alpha and RGB planes: full range.
+            val_f = plane == PLANAR_Y ? y8tof(val_i) : c8tof(val_i);
           }
           std::fill_n((float *)dstp, size / sizeof(float), val_f);
         }
@@ -305,6 +305,7 @@ static PVideoFrame CreateBlankFrame(const VideoInfo& vi, int color, int mode, co
 
 
 static AVSValue __cdecl Create_BlankClip(AVSValue args, void*, IScriptEnvironment* env) {
+  check_float_params(args, "BlankClip", { { 5, "fps" }, { 13, "colors" } }, env);
   VideoInfo vi_default;
   memset(&vi_default, 0, sizeof(VideoInfo));
 
@@ -2601,9 +2602,9 @@ public:
       // future other ColorBars types can be added here
     }
 
-    // Alpha cnannel - if any - is common. RGB32/64 has already filled alpha.
+    // Alpha channel - if any - is common. RGB32/64 has already filled alpha.
     if (vi.IsYUVA() || vi.IsPlanarRGBA()) {
-      // initialize planar alpha planes with zero (no transparency), like RGB32 does
+      // initialize planar alpha planes with zero (fully transparent), like RGB32 does
       BYTE* dstp = frame->GetWritePtr(PLANAR_A);
       int rowsize = frame->GetRowSize(PLANAR_A);
       int pitch = frame->GetPitch(PLANAR_A);
@@ -2885,7 +2886,7 @@ public:
 
   SFLOAT getValueAt(double where) {
     AVS_UNUSED(where);
-    return (float) rand()*(2.0f/RAND_MAX) -1.0f;}
+    return (float) rand()*(2.0f/(float)RAND_MAX) -1.0f;}
 };
 
 class SquareGenerator : public SampleGenerator {
@@ -2982,6 +2983,7 @@ public:
 
   static AVSValue __cdecl Create(AVSValue args, void*, IScriptEnvironment* env)
   {
+    check_float_params(args, "Tone", { { 0, "length" }, { 1, "frequency" }, { 5, "level" } }, env);
     return new Tone(args[0].AsFloat(10.0f), args[1].AsFloat(440.0f), args[2].AsInt(48000),
           args[3].AsInt(2), args[4].AsString("Sine"), args[5].AsFloatf(1.0f), env);
   }

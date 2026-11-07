@@ -576,6 +576,7 @@ AVSValue ComparePlane::CmpPlaneSame(AVSValue clip, void* , int offset, int plane
 }
 
 AVSValue MinMaxPlane::Create_minmax_stats(AVSValue args, void* user_data, IScriptEnvironment* env) {
+  check_float_params(args, "PlaneMinMaxStats", { { 1, "threshold" } }, env);
   const int plane = args[3].AsInt(0); // 0:Y or R  1:U or G  2: V or B  3:A
   if (plane < 0 || plane>3)
     env->ThrowError("MinMax Stats: plane index must be between 0-3!");
@@ -597,11 +598,13 @@ AVSValue MinMaxPlane::Create_minmax_stats(AVSValue args, void* user_data, IScrip
 
 
 AVSValue MinMaxPlane::Create_max(AVSValue args, void* user_data, IScriptEnvironment* env) {
+  check_float_params(args, "PlaneMax", { { 1, "threshold" } }, env);
   int plane = (int)reinterpret_cast<intptr_t>(user_data);
   return MinMax(args[0], user_data, args[1].AsDblDef(0.0), args[2].AsInt(0), plane, MinMaxPlane::MAX, false, env);
 }
 
 AVSValue MinMaxPlane::Create_min(AVSValue args, void* user_data, IScriptEnvironment* env) {
+  check_float_params(args, "PlaneMin", { { 1, "threshold" } }, env);
   int plane = (int)reinterpret_cast<intptr_t>(user_data);
   return MinMax(args[0], user_data, args[1].AsDblDef(0.0), args[2].AsInt(0), plane, MinMaxPlane::MIN, false, env);
 }
@@ -613,6 +616,7 @@ AVSValue MinMaxPlane::Create_median(AVSValue args, void* user_data, IScriptEnvir
 }
 
 AVSValue MinMaxPlane::Create_minmax(AVSValue args, void* user_data, IScriptEnvironment* env) {
+  check_float_params(args, "PlaneMinMaxDifference", { { 1, "threshold" } }, env);
   int plane = (int)reinterpret_cast<intptr_t>(user_data);
   return MinMax(args[0], user_data, args[1].AsDblDef(0.0), args[2].AsInt(0), plane, MinMaxPlane::MINMAX_DIFFERENCE, false, env);
 }
@@ -776,7 +780,7 @@ AVSValue MinMaxPlane::MinMax(AVSValue clip, void* , double threshold, int offset
   }
 
   const int bits_per_pixel = vi.BitsPerComponent();
-  const int max_pixel_value = (1 << bits_per_pixel) - 1;
+  const int max_pixel_value = bits_per_pixel <= 16 ? (1 << bits_per_pixel) - 1 : 0; // float: n/a
 
   const int buffersize = pixelsize == 4 ? 65536 : (1 << bits_per_pixel); // 65536 for float, too, reason for 10-14 bits: avoid overflow
   uint32_t* accum_buf = new uint32_t[buffersize];
@@ -1091,9 +1095,9 @@ AVSValue GetPropertyAsArray::Create(AVSValue args, void* , IScriptEnvironment* e
   // propGetIntArray or propGetFloatArray is available
   // Pre interface V11: AVSValue is int and float, prop arrays are int64_t and double
   if (propType == 'i') {
-    const int64_t* arr = env->propGetIntArray(avsmap, propName, &error);
+    // one by one: propGetIntArray does not flip a _ColorRange array
     for (int i = 0; i < size; ++i)
-      result[i] = arr[i]; // v11: no need for (int) cast
+      result[i] = env->propGetInt(avsmap, propName, i, &error); // v11: no need for (int) cast
   }
   else if (propType == 'f') {
     const double* arr = env->propGetFloatArray(avsmap, propName, &error);
@@ -1175,11 +1179,13 @@ AVSValue GetAllProperties::Create(AVSValue args, void*, IScriptEnvironment* env_
   if (0 == propNum)
     return AVSValue(nullptr, 0); // zero sized array
 
-  std::vector<AVSValue> result(propNum);
+  // _Range is listed under its old name as well: reachable by scripts which look for _ColorRange in the list
+  const int resultNum = propNum + (env->propGetType(avsmap, "_Range") == 'i' ? 1 : 0);
+  std::vector<AVSValue> result(resultNum);
 
-  for (int index = 0; index < propNum; index++) {
+  for (int index = 0; index < resultNum; index++) {
     std::vector<AVSValue> pair(2);
-    const char* propName = env->propGetKey(avsmap, index);
+    const char* propName = index < propNum ? env->propGetKey(avsmap, index) : "_ColorRange";
     pair[0] = env->SaveString(propName);
     const char propType = env->propGetType(avsmap, propName);
     const int propNumElements = env->propNumElements(avsmap, propName);
@@ -1195,9 +1201,9 @@ AVSValue GetAllProperties::Create(AVSValue args, void*, IScriptEnvironment* env_
         elem = AVSValue(env->propGetInt(avsmap, propName, 0, &error)); // v11: no need for (int) cast
       else {
         std::vector<AVSValue> avsarr(propNumElements);
-        const int64_t* arr = env->propGetIntArray(avsmap, propName, &error);
+        // one by one: propGetIntArray does not flip a _ColorRange array
         for (int i = 0; i < propNumElements; ++i)
-          avsarr[i] = arr[i]; // v11: no need for (int) cast
+          avsarr[i] = env->propGetInt(avsmap, propName, i, &error); // v11: no need for (int) cast
         elem = AVSValue(avsarr.data(), propNumElements); // array deep copy
       }
     }
@@ -1248,7 +1254,7 @@ AVSValue GetAllProperties::Create(AVSValue args, void*, IScriptEnvironment* env_
     result[index] = AVSValue(pair.data(), 2); // arrays in arrays, automatic deep copy
   }
 
-  return AVSValue(result.data(), propNum); // array deep copy
+  return AVSValue(result.data(), resultNum); // array deep copy
 }
 
 // e.g. string length

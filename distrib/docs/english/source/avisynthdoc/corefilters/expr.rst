@@ -220,10 +220,12 @@ Expressions are evaluated on each plane, Y, U, V (and A) or R, G, B (,A). When
 an expression string is not specified, the previous expression is used for that
 plane – except for plane A (alpha) which is copied by default. When an expression
 is an empty string (``""``) then the relevant plane will be copied (if the output
-clip bit depth is similar). When an expression is a single clip reference letter
-("x") and the source/target bit depth is similar, then the relevant plane will
-be copied. When an expression is constant (after constant folding), then the
-relevant plane will be filled with an optimized memory fill method.
+clip bit depth is similar, otherwise it is converted to the new bit depth as in
+:doc:`ConvertBits <convertbits>`: Y, U, V as limited range, R, G, B and alpha as full 
+range). When an expression is a single clip reference letter ("x") and the source/target 
+bit depth is similar, then the relevant plane will be copied. When an expression is 
+constant (after constant folding), then the relevant plane will be filled with an 
+optimized memory fill method.
 
 * Example: ``Expr(clip, "255", "128, "128")`` fills all three planes.
 * Example: ``Expr(clip, "x", "range_half, "range_half")`` copies luma, fills U
@@ -251,6 +253,14 @@ Expr language/RPN elements
   \|x/d\| < 2^24; above that the result is inaccurate.
 * Math constant: ``pi``
 * Functions: ``min, max, sqrt, abs, exp, log, pow ^`` (synonyms: ``pow`` and ``^``)
+* ``sqrt`` of a negative number or NaN is 0, on every CPU and also in a constant expression. The same goes for a
+  ``0.5 pow``, which is calculated as ``sqrt``. There is no good answer for a negative number: NaN, 0 and a signed
+  root (the sign of x with ``sqrt(abs(x))``) all have their reasons, this is the one chosen. With 0, a value which is
+  below zero only by a float rounding error, like ``7.0 0.1 % 0.1 -`` (-0.0000001), does not turn into NaN.
+* ``pow`` with a negative base follows IEEE 754 on every CPU: an integer power has a real result (``-2 ^ 3`` is -8), a
+  fractional power gives NaN. Too large results are the difference between the paths: x86 JIT stops at about 2.4e38,
+  C (aarch64, ``SetMaxCPU("none")``, an expression with ``acos``, ``asin``, ``atan``, constant expressions) gives
+  infinity, also at ``0 ^ -1``.
 * Function: ``neg`` simple negates stack top
 * Function: ``sgn`` simple signum function -1 if x<0; 0 when x==0; 1 if x>0
 * Function: ``clip`` three operand function for clipping. Example: ``x 16 240
@@ -274,18 +284,122 @@ Expr language/RPN elements
 * Ternary operator: ``?`` - Example: ``x 128 < x y ?``
 * Duplicate stack elements: ``dup, dupn`` (dup1, dup2, ...)
 * Swap stack elements: ``swap, swapn`` (swap1, swap2, ...)
-* Scale by bit shift: ``scaleb`` (operand is treated as being a number in 8 bit
-  range unless i8..i16 or f32 is specified).
-* Scale by full scale stretch: ``scalef`` (operand is treated as being a number
-  in 8 bit range unless i8..i16 or f32 is specified).
+* Convert a limited range level to the bit depth of the clip: ``scaleb``. The operand is
+  an 8 bit level unless i8..i16 or f32 is specified. See `Converting levels: scaleb, scalef`_.
+* Convert a full range level to the bit depth of the clip: ``scalef``. The operand is
+  an 8 bit level unless i8..i16 or f32 is specified.
+
+
+Converting levels: scaleb, scalef
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``scaleb`` and ``scalef`` convert a **level**, a position on the pixel value scale, from
+the base bit depth to the bit depth of the first clip. ``128 scaleb`` is neutral chroma
+and ``235 scaleb`` is limited range white at any bit depth. The base is 8 bit, unless
+``i8, i10, i12, i14, i16`` or ``f32`` is given. Only the last of these counts for the
+whole expression. With ``f32`` the operand is a limited range float level, and on a float
+clip it is passed through unchanged.
+
+* ``scaleb`` uses limited range rules, ``scalef`` uses full range rules. These are the
+  same calculations as in :doc:`ConvertBits <convertbits>`.
+* ``yscaleb`` and ``yscalef`` use the luma rules on the chroma planes as well.
+* The name "bit shift" of ``scaleb`` only describes the result between integer bit depths,
+  where the offsets cancel out:
+
+  .. table::
+      :widths: auto
+
+      +--------+--------------+------------------------------------------------+---------------------+
+      | Plane  | Target clip  | Calculation for an 8 bit operand               | Reduces to          |
+      +========+==============+================================================+=====================+
+      | Luma   | 10-16 bit    | ``(x - 16) * 2^(bits-8) + (16 << (bits-8))``   | ``x << (bits-8)``   |
+      +--------+--------------+------------------------------------------------+---------------------+
+      | Luma   | 32 bit float | ``(x - 16) / 255 + 16/255``                    | ``x / 255``         |
+      +--------+--------------+------------------------------------------------+---------------------+
+      | Chroma | 10-16 bit    | ``(x - 128) * 2^(bits-8) + (128 << (bits-8))`` | ``x << (bits-8)``   |
+      +--------+--------------+------------------------------------------------+---------------------+
+      | Chroma | 32 bit float | ``(x - 128) / 255``                            | ``(x - 128) / 255`` |
+      +--------+--------------+------------------------------------------------+---------------------+
+
+Results:
+
+.. table::
+    :widths: auto
+
+    +------------------------------------+-------+-------+--------+--------+---------+
+    | Expression (no source pixels used) | Plane | 8 bit | 10 bit | 16 bit | Float   |
+    +====================================+=======+=======+========+========+=========+
+    | ``235 scaleb``                     | Y     | 235   | 940    | 60160  | 0.92157 |
+    +------------------------------------+-------+-------+--------+--------+---------+
+    | ``235 scaleb``                     | U, V  | 235   | 940    | 60160  | 0.41961 |
+    +------------------------------------+-------+-------+--------+--------+---------+
+    | ``128 scaleb``                     | U, V  | 128   | 512    | 32768  | 0.0     |
+    +------------------------------------+-------+-------+--------+--------+---------+
+    | ``i10 940 scaleb``                 | Y     | 235   | 940    | 60160  | 0.92157 |
+    +------------------------------------+-------+-------+--------+--------+---------+
+    | ``i16 60160 scaleb``               | Y     | 235   | 940    | 60160  | 0.92157 |
+    +------------------------------------+-------+-------+--------+--------+---------+
+    | ``f32 0.92157 scaleb``             | Y     | 235   | 940    | 60160  | 0.92157 |
+    +------------------------------------+-------+-------+--------+--------+---------+
+    | ``235 scalef``                     | Y     | 235   | 943    | 60395  | 0.92157 |
+    +------------------------------------+-------+-------+--------+--------+---------+
+
+.. warning::
+
+    ``scaleb`` and ``scalef`` are for levels. Do not use them on float chroma to give a
+    **difference**, that is an amount to add to or subtract from a pixel, such as an
+    overshoot limit. The conversion subtracts neutral chroma, 128, from the operand, so
+    ``5 scaleb`` on float U or V is -0.48235, not 5 steps of 0.01961. This is not a new
+    behaviour, and scripts using it get a wrong result on float chroma.
+
+    With ``scale_inputs="floatUV"`` the result looks almost right, but it is still about
+    10% low. On luma and at integer bit depths a difference comes out right only because
+    the offsets cancel there, so these are not a reason to use a level conversion for it.
+
+For a difference in 8 bit limited range steps, scale by the size of the range. This gives
+the correct value on every bit depth, with or without ``"floatUV"``:
+
+* Chroma planes: ``x 5 224 / cmax cmin - * +``, where 224 = 240 - 16, the size of the
+  8 bit limited range of chroma.
+* Luma plane: ``x 5 219 / ymax ymin - * +``, where 219 = 235 - 16, the size of the
+  8 bit limited range of luma.
+
+With ``scale_inputs="all"`` the expression works on 8 bit values, there ``5`` itself is the
+difference, and the operators ``scaleb`` and ``scalef`` have nothing to scale.
+
+.. table::
+    :widths: auto
+
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | Source U (neutral) | Expression on U               | ``scale_inputs`` | Result       | Correct value |
+    +====================+===============================+==================+==============+===============+
+    | 128 (8 bit)        | ``x 5 scaleb +``              |                  | 133          | 133           |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 512 (10 bit)       | ``x 5 scaleb +``              |                  | 532          | 532           |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 0.0 (float)        | ``x 5 scaleb +``              |                  | **-0.48235** | 0.01961       |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 0.0 (float)        | ``x 5 scaleb +``              | ``"floatUV"``    | **0.01765**  | 0.01961       |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 0.0 (float)        | ``x 5 scaleb +``              | ``"all"``        | 0.01961      | 0.01961       |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 128 (8 bit)        | ``x 5 224 / cmax cmin - * +`` |                  | 133          | 133           |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 512 (10 bit)       | ``x 5 224 / cmax cmin - * +`` |                  | 532          | 532           |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 0.0 (float)        | ``x 5 224 / cmax cmin - * +`` |                  | 0.01961      | 0.01961       |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
+    | 0.0 (float)        | ``x 5 224 / cmax cmin - * +`` | ``"floatUV"``    | 0.01961      | 0.01961       |
+    +--------------------+-------------------------------+------------------+--------------+---------------+
 
 
 Bit-depth aware constants
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-* ``ymin, ymax`` (ymin_a .. ymin_z for individual clips) - the usual luma limits
-  (16..235 or scaled equivalents).
-* ``cmin, cmax`` (cmin_a .. cmin_z) - chroma limits (16..240 or scaled equivalents)
+* ``ymin, ymax`` (ymin_a .. ymin_z for individual clips) - the limited range luma limits
+  (16..235 or scaled equivalents), whatever the range of the clip is.
+* ``cmin, cmax`` (cmin_a .. cmin_z) - the limited range chroma limits (16..240 or scaled
+  equivalents), whatever the range of the clip is.
 * ``range_half`` (range_half_a .. range_half_z) - half of the range, (128 or scaled
   equivalents).
 * ``range_size`` (range_size_a .. range_size_z , etc..) - 256, 1024, 4096, 16384,
@@ -300,6 +414,67 @@ When the constant name is ended with _x, _y, _z, _a, etc.. the constant is broug
 from the specified clip (input clips can be of different formats) When by using
 parameter ``"scale_inputs"`` the input is converted to e.g. 8 bits, these constants
 are calculated for this internally used bit depth.
+
+.. note::
+
+    Expr does not read the ``_ColorRange`` frame property of the clips by itself, and the
+    constants do not depend on the range of the clip. ``ymin, ymax, cmin, cmax`` and ``scaleb``
+    are always limited range values, also on a full range clip. So the script has to choose by
+    name: ``ymin, ymax`` and ``scaleb`` for limited range, ``range_min, range_max`` and ``scalef``
+    for full range.
+
+.. table::
+    :widths: auto
+
+    +----------------------------------------+-----------------------------------------+---------+-----------------+
+    | On the Y plane, ``_ColorRange`` 0 or 1 | Always means                            | 10 bit  | Float           |
+    +========================================+=========================================+=========+=================+
+    | ``ymin, ymax``                         | Limited range luma limits, 16 and 235   | 64, 940 | 0.0627, 0.9216  |
+    +----------------------------------------+-----------------------------------------+---------+-----------------+
+    | ``cmin, cmax``                         | Limited range chroma limits, 16 and 240 | 64, 960 | -0.4392, 0.4392 |
+    +----------------------------------------+-----------------------------------------+---------+-----------------+
+    | ``255 scaleb``                         | A level, by limited range rules         | 1020    | 1.0             |
+    +----------------------------------------+-----------------------------------------+---------+-----------------+
+    | ``255 scalef``                         | A level, by full range rules            | 1023    | 1.0             |
+    +----------------------------------------+-----------------------------------------+---------+-----------------+
+    | ``range_min, range_max``               | The whole range of the plane            | 0, 1023 | 0.0, 1.0        |
+    +----------------------------------------+-----------------------------------------+---------+-----------------+
+    | ``range_half``                         | The middle of the range                 | 512     | 0.5             |
+    +----------------------------------------+-----------------------------------------+---------+-----------------+
+
+To follow the clip, read the frame property in the expression, see `Frame property input`_.
+This example gives 940 on a limited range 10 bit clip and 1023 on a full range one, on the
+Y plane. A YUV clip without the property counts as limited::
+
+    x._ColorRange 1 == ymax range_max ?
+
+Alpha plane
+~~~~~~~~~~~
+
+Alpha is full range, but the constants are not adjusted for it: ``ymax`` is 235 or its scaled
+equivalent on the alpha plane as well. In an alpha expression use ``range_min, range_max`` and
+``scalef``.
+
+A single expression string does not reach the alpha plane, it is copied, also on YA clips. On YA
+the second expression string is for alpha. When ``format`` changes the bit depth, the copy
+is a full range conversion to the new bit depth, as on the other planes without an expression.
+
+.. table::
+    :widths: auto
+
+    +--------------------+-------------------------------------+---------------------+-------------+
+    | Source clip, alpha | Call                                | Alpha before 3.7.7  | Alpha now   |
+    +====================+=====================================+=====================+=============+
+    | YA10, 800          | ``Expr("128 scalef")``              | 514, the expression | 800, copied |
+    +--------------------+-------------------------------------+---------------------+-------------+
+    | YUVA444P10, 800    | ``Expr("128 scalef")``              | 800, copied         | 800, copied |
+    +--------------------+-------------------------------------+---------------------+-------------+
+    | YA10, 800          | ``Expr("128 scalef", "range_max")`` | 1023                | 1023        |
+    +--------------------+-------------------------------------+---------------------+-------------+
+    | YUVA444P8, 200     | ``Expr("x", format="YUVA444P16")``  | random              | 51400       |
+    +--------------------+-------------------------------------+---------------------+-------------+
+    | YA8, 200           | ``Expr("x", format="YA16")``        | 200                 | 51400       |
+    +--------------------+-------------------------------------+---------------------+-------------+
 
 Keywords for modifying base bit depth
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -321,6 +496,24 @@ Frame property input
   expression.
 * Example: ``x._ColorRange`` will push the value of ``_ColorRange`` frame
   property on stack (of clip x).
+* A property which is not set or is not a number reads as 0. The exception is ``_Range`` and its
+  older name ``_ColorRange``: when it is not set, it reads as the usual default of that clip's format:
+  RGB full, the others limited, as ``ConvertBits`` assumes as well. ``_Range`` 1 is full, ``_ColorRange``
+  0 is full.
+
+  +----------------------------------------------------------------------------------+------------------------+--------+-------------+
+  | Source clip                                                                      | Expression             | Before | Since 3.7.7 |
+  +==================================================================================+========================+========+=============+
+  | ``BlankClip(pixel_type="YUV444P10").propDelete("_ColorRange")``                  | ``x._ColorRange``      | 0      | 1           |
+  +----------------------------------------------------------------------------------+------------------------+--------+-------------+
+  | ``BlankClip(pixel_type="YUV444PS").propDelete("_ColorRange")``                   | ``x._ColorRange``      | 0      | 1           |
+  +----------------------------------------------------------------------------------+------------------------+--------+-------------+
+  | ``BlankClip(pixel_type="RGBP10").propDelete("_ColorRange")``                     | ``x._ColorRange``      | 0      | 0           |
+  +----------------------------------------------------------------------------------+------------------------+--------+-------------+
+  | ``BlankClip(pixel_type="YUV444P10").propSet("_ColorRange", 0)``                  | ``x._ColorRange``      | 0      | 0           |
+  +----------------------------------------------------------------------------------+------------------------+--------+-------------+
+  | ``BlankClip(pixel_type="RGBP10").propSet("_ColorRange", 1)``                     | ``x._ColorRange``      | 1      | 1           |
+  +----------------------------------------------------------------------------------+------------------------+--------+-------------+
 
 Internal variables
 ~~~~~~~~~~~~~~~~~~
@@ -352,9 +545,10 @@ Internal variables
     * ``frameno`` : use current frame number in expression.
       ``0 <= frameno < clip_frame_count.`` |br| A 32 bit integer converted to
       float, so it is precise only at approximately 24 bits.
-    * ``time`` : ``calculation: time = frameno/clip_frame_count``. Use relative
-      time position in expression. ``0 <= time < frameno/clip_frame_count``
-    * ``width, height``: clip width and clip height
+    * ``time`` : ``calculation: time = frameno/(clip_frame_count-1)``. Use relative
+      time position in expression. ``0 <= time <= 1``; 0 on a single frame clip.
+    * ``width, height``: width and height of the plane being processed. On subsampled
+      chroma planes they differ from the clip size, e.g. half of it on 4:2:0.
 
 Pixel addressing
 ~~~~~~~~~~~~~~~~
@@ -784,7 +978,7 @@ Changelog
 | AviSynth+ r2542 |  Initial release                                         |
 +-----------------+----------------------------------------------------------+
 
-$Date: 2026/10/15 08:40:00 $
+$Date: 2026/11/05 12:00:00 $
 
 .. _mathematical function:
     https://en.wikipedia.org/wiki/Function_(mathematics)

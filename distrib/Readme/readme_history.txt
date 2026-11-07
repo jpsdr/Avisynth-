@@ -9,8 +9,130 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist376.html
 
-20261031 3.7.6.rXXXX (pre 3.7.7)
+20261105 3.7.6.rXXXX (pre 3.7.7)
 --------------------------------
+- Float parameters of the built-in filters which are not a number (NaN) or infinite give an error, when the filter uses them.
+- Frame properties: _Range is added, the number follows ITU-T H.273, as in VapourSynth: 1 is full, 0 is limited.
+  _ColorRange stays reserved and it is its older name with 0 and 1 swapped: the two are one property, the frame holds it
+  as _Range. All env->propXXX (C and C++ API) and the script functions map the name, integers are swapped when used as
+  _ColorRange. Any other integer is the same, a value of another type is stored as it is under _Range. Core filters use _Range.
+  Key lists (propNumKeys, propGetKeyByIndex) give _Range only, propGetAll and propShow give both.
+- Fix: Expr: x._ColorRange on a clip without this frame property read as 0, which means full range, also on YUV.
+  Now it is the default of the clip's format: 0 for RGB, 1 (limited) for the others, as in ConvertBits.
+  Other frame properties which are not set still read as 0.
+- Fix: Expr: pow with a negative base, x86 JIT: it gave 2.4e38 on any power which was not a constant 2, 3 or 4. Now it follows
+  IEEE 754 as the C paths do: an integer power has a real result (-2 ^ 3 is -8), a fractional power is NaN. Also
+  0 ^ 0.25 was 3.3e-10, now 0. Results of a positive base are not changed.
+- Fix: Expr: sqrt of a negative number gave NaN instead of 0 when the expression did not run in JIT (aarch64, acos,
+  asin, atan in it, SetMaxCPU("none")) or was constant, while x86 JIT gave 0. Now it is 0 on all of them.
+- Fix: Tweak: integer results are rounded on all paths. realcalc=true, chroma at 12-16 bit and chroma from the lookup
+  table without dither truncated: chroma was biased low, realcalc=true luma could differ from the lookup table.
+  Output changes by up to 1 at these paths.
+- Fix: Expr, YA clips: a single expression string was applied on the alpha plane too. Now alpha is copied, as on YUVA and
+  planar RGBA.
+- Fix: Expr: a plane with an empty expression (or the alpha plane without an expression) was left unset, its content was
+  random, when format changed the bit depth. Now it is converted to the new bit depth as in ConvertBits: Y, U, V as
+  limited range, R, G, B and alpha as full range.
+- Fix: resizers, Bob, and param1, param2, param3 of the ConvertTo... filters, AddBorders and LetterBox: NaN and Inf
+  were accepted, the result was undefined and differed by platform. Now an error, as are src_left, src_top, src_width,
+  src_height too large for the resizer.
+- Fix: Expr cmin, scale_inputs="floatUV", 8-16 bit clips: it was half a step too high and rounded up, 17 instead of
+  16 at 8 bit, 65 instead of 64 at 10 bit. Existed since 3.5.0 (2020).
+- Fix: RGBAdjust, ColorYUV analyze=true: stack buffer overflow in the text of the statistics on very large float pixel
+  values or on only NaN pixels.
+- Fix: RGBAdjust analyze=true, planar RGB 32 bit float: crash on NaN pixels, which can come from Expr or from a NaN parameter.
+- Fix: ShowFrameNumber, ShowCRC32 scroll=true: division by zero when size is larger than the clip height, which is also
+  the default size on a clip less than 24 pixels high.
+- Fix: ShowFrameNumber, ShowCRC32: size of 0 or below, NaN or too large never finished. Now an error: it must be between 1
+  and 1000000.
+- Fix: NaN passed the range check of Tweak (startHue, endHue, minSat, maxSat, interp), MaskHS (same without interp),
+  Histogram factor, AddAlphaPlane (opacity, mask), ShowSMPTE fps. Now an error.
+- Fix: UToY, VToY, clips with alpha: the alpha plane of the output was left unset, its content was random.
+  Now it is opaque.
+- Fix: non-Intel builds (aarch64): crash in YUV with alpha to RGB when the bit depth changes, e.g. ConvertToRGB32 from
+  10-16 bit or 32 bit float YUVA, or ConvertToPlanarRGBA(bits=8).
+- Fix: undefined behaviour on 32 bit float clips: 1 << 32 in setup code (Levels, Tweak, MaskHS, Limiter, ColorKeyMask,
+  Layer, Invert, BlankClip, AddAlphaPlane, YUV-RGB converters, conditional functions). The shift now runs only up to
+  16 bits. Float paths did not use the result, output is unchanged on x86. Histogram "luma" float: left shift of a
+  negative value.
+- Fix: Histogram "levels", 32 bit float, limited range: the source offset was missing from the luma position: x*255+16,
+  so bars were 16 levels too high and levels above 239 piled up in the last bar. The population scale follows the
+  largest bar, so the others shrank to 2 pixels. Chroma, RGB and full range were right.
+- Fix: Histogram "classic", 32 bit float, limited range, bits above 8: position was x*(2^bits-1) instead of x*255<<(bits-8).
+- Fix: Histogram "levels" on YA clips gave a GetPlaneWidthSubsampling error, now works as on greyscale, alpha copied with
+  keepsource. "color" and "color2" give the greyscale error message.
+- Fix: Subtitle (gdi=true), 10-16 bit YUV: the colour addends of the text have a *256.99 scale (right for the 8 bit >>8,
+  right for full range RGB, 255 is 65535), so limited range got Y*257: 16 bit white 60393 instead of 60160, neutral U
+  32895 instead of 32768. Now they are scaled back to a plain shift, exact at full coverage for all 8 bit levels.
+  8 bit and RGB 10-16 bit output is not changed, apart from the next point.
+- Fix: Subtitle (gdi=true), 10-16 bit, planar and packed RGB as well: base alpha + colour weight can be above 256, so a
+  bright background overflowed: 16 bit values wrapped around to dark pixels at text edges, 10-14 bit went above maximum.
+  Clamped. At 8 bit the truncation hides it, this stays as is.
+- Fix: Subtitle (gdi=true), 32 bit float: chroma subtracted 0.5 from 128/255, neutral chroma was 0.0019 (half an 8 bit
+  step). The addends are now scaled to level/255: Y follows ConvertBits, RGB white is 1.0 (was 0.99995).
+- Fix: Histogram "color2", 10-16 bit limited range, bits below the clip bit depth: rounding moved U or V at the top of
+  the range (10 bit, bits=8: 1022 and 1023) to position 256, plotted outside the panel: the row spilled into the next
+  plane, or past the end of the frame if the panel is the last row. Clamped now, as the other paths do. Existed since 3.7.6.
+- Fix: Histogram "classic", "levels", "color", clips with alpha (YUVA, YA, planar RGBA): the alpha plane of the histogram
+  area was left unset, its content was random. Also the area under a shorter source in "levels". Now it is opaque.
+- Histogram "color2": the alpha plane of the histogram area is opaque, it was 0 in 3.7.6. The panel stays visible
+  when the output goes through a filter which uses alpha. Same in all modes.
+- 32 bit float: limited range levels are calculated at one place, core/limited_range_float.h, used by
+  get_bits_conv_constants as well. New y8tof (limited luma) and y8diff_tof (limited luma difference); uv8tof uses the
+  same chroma span; c8tof is for full range only (RGB, alpha). Literals like 235/255.0f are gone from Tweak, MaskHS,
+  Levels, Limiter, Histogram, Expr (ymin, ymax, cmin, cmax), ColorYUV coring, Text, AddBorders, BlankClip, Subtract,
+  YToUV, CombinePlanes. Values may move by a rounding step, the limits are now the same as ConvertBits gives for that
+  level. Integer formats and full range conversions are not touched.
+- Fix: Tweak, 32 bit float: dither was not centred. dither_strength is /65536 there (one 16 bit step of amplitude,
+  this part is right), but the -1 of the integer bias formula stayed unscaled, so luma got +0.00195 (half an 8 bit step),
+  chroma +0.00012. Now the bias is -(N-1)*dither_strength/2, N=256 for luma, 16 for chroma. Existed since r2290.
+  https://github.com/HomeOfAviSynthPlusEvolution/AviSynthPlus-UT/issues/53
+- Fix: Tweak, 32 bit float: coring limits were 16/256 and 235/256, bright was /256. Tweak() turned 235 into 234.08 and
+  16 into 15.94 (in 8 bit steps); bright=128 gave 0.5 less. Now they follow the limited range rule. Existed since r2290.
+- Fix: Limiter(show="chroma"), 32 bit float: U or V exactly 16 or 240 from ConvertBits was marked as out of range.
+- Fix: ConvertToXXXX with interlaced=true, 4:2:0 involved: uv_height/2 was rounded down, so with e.g. 8x6 YV24 or
+  720x486 YUY2 to 4:2:0 the woven chroma had one row less than the output plane, and BitBlt copied that row from
+  outside the source frame. Now an error: "height isn't mod4", mod8 when 4:2:0 <-> 4:1:0. This also replaces the
+  misleading "SeparateFields: height must be even" and "Resize: Height must be greater than 0" errors.
+  Y sources are not affected. zimg (VapourSynth resize), fmtconv and SeparateFields have the same rule.
+  Existed since AviSynth 2.6.
+  https://github.com/HomeOfAviSynthPlusEvolution/AviSynthPlus-UT/issues/5
+- Fix: YToUV without Y clip, 32 bit float: the grey Y plane was 126/256. The value now comes from the common bit
+  depth conversion constants (8 bit limited range to the actual bit depth, like ConvertBits), which gives 126/255.
+  10-16 bits stay 126 << (bits-8). Existed since AviSynth+ r2487.
+- Fix: YToUV with YUVA U clip and no Y clip: the output stayed YUVA, but nothing wrote its alpha plane, so it had
+  the content of the reused frame buffer. Now fully opaque, like Y is filled with grey in this case.
+  Existed since AviSynth+ r2487.
+- Fix: YToUV accepted clips which do not fit the output frame. BitBlt uses the row size of the source, so wider
+  samples wrote past the plane rows, narrower ones left a part of them unset. Now errors: V or Y clip of different
+  bit depth, packed or planar RGB; A clip RGB24, RGB48, planar RGB without alpha (G plane was copied) or YUY2.
+  Bit depth of A was already compared to Y. RGB32 and RGB64 as A clip work now through an intermediate ExtractA.
+  Existed since AviSynth+ r2487.
+  https://github.com/HomeOfAviSynthPlusEvolution/AviSynthPlus-UT/issues/8
+- Overlay, Layer, Subtitle, Text: chroma mask (and text chroma) kernels are low-pass filters, no point samples.
+  Per axis: 2:1 centred [1 1]; 2:1 co-sited [1 2 1]; 4:1 centred (triangle) [1 3 5 7 7 5 3 1]/32, luma offsets
+  -2..5; 4:1 co-sited (tent) [1 2 3 4 3 2 1]/16, offsets -3..3.
+  Kernels: 4:2:0 top_left 3x3 (was: point); 4:2:2 top_left = left (was: point); 4:4:0 top, top_left [1 2 1] (was:
+  point); 4:1:1 center 8-tap triangle (was: box), left/top_left/bottom_left/dv 7-tap tent (was: point);
+  4:1:0 center/top/bottom 8x8 triangle (was: box; top: point), left/bottom_left/dv 7x8 (new; was: point), top_left
+  7x7 tent (was: point).
+  Mask edges are clamped: the first and last luma row and column are repeated. The row preparation has SSE4.1 (also
+  used by AVX2) and NEON versions, bit-identical to C also in float: fixed addition order of box sums.
+  Output changes for these placements.
+- Text, Subtitle(gdi=false): chroma is rendered by one common function for all subsampled formats incl. YUY2, with
+  the same kernels. Luma positions outside the frame are clamped. Chroma samples whose kernel reaches the text are
+  drawn, also beside its chroma blocks; with fading only the background part inside the text rectangle is faded.
+  The safety columns of the text bitmap are gone.
+- Subtitle(gdi=true): the chroma processing range has a one chroma block margin, for the same reason.
+- Fix: Text and Subtitle(gdi=false) on 4:1:0: y not divisible by 4 misplaced the chroma by the remainder.
+  Existed since 3.7.6.
+- Fix: Overlay and Layer, 32 bit float mask, AVX2: 4:2:2 left-sited vector loop loaded 8 floats instead of 16, so it
+  did not get the odd samples of the second half; 4:2:0 left-sited scalar tail read mask samples 4 positions off.
+  The float 4:2:0 box and 4:2:2 left-sited kernels in SSE4.1 and AVX2 now use the addition order of C.
+  Existed since 3.7.6.
+- Optimization: Text and Subtitle(gdi=false): non-fading luma loops skip empty bitmap bytes; chroma walks only the
+  set bits of the bitmap, without branching on them; rectangle weights are computed once per column.
+  About 20-35% quicker without halo and fading (19 lines of text, frame copies excluded).
 - Fix: AVX-512 8 and 16 bit horizontal resizers: possible read past the end of the source buffer.
   These permutex kernels load a 128 byte (8 bit) or 64 pixel (16 bit) source window from each pixel group
   start, but the safe-zone limit checked only the first group of each step: 8 bit mpz_ks16 (32 pixels/step)

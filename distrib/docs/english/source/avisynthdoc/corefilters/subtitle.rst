@@ -211,16 +211,14 @@ versions of a frame at once, and you want to label them to remember which is whi
     kernels, the same way as the mask kernels of :doc:`Overlay <overlay>` and
     :doc:`Layer <layer>` (see the kernel table in Overlay's ``placement``):
 
-    Both renderers (``gdi=true`` and ``gdi=false``, the latter same as ``Text``) have
-    the same kernel variants: "mpeg2"-like (left-cosited H, centred V; 1-2-1 filter),
-    "mpeg1"-like (centred; box average) and "top_left"-like. 4:1:1, 4:4:0 and 4:1:0
-    have no "mpeg2"-like kernel. The "top_left"-like kernel is a point sample (a single
-    luma sample of the block) with ``gdi=true``; with ``gdi=false`` it is a 1-2-1 filter
-    centred on the top-left luma sample on 4:2:0 (3x3) and 4:4:0 (vertical), the same
-    as ``"left"`` on 4:2:2/YUY2, and a point sample on 4:1:1/4:1:0.
+    Both renderers (``gdi=true`` and ``gdi=false``, the latter same as ``Text``) use the
+    same kernels: the low-pass filters of the mask kernel table, for all subsampled
+    formats. E.g. ``"top"`` and ``"bottom"`` use the centred kernel on
+    4:2:0/4:2:2/4:1:1/4:1:0, and on 4:4:0 ``"left"`` (``"mpeg2"``) equals ``"center"``.
+    YUY2 is handled like 4:2:2.
 
-    E.g. ``"top"`` and ``"bottom"`` use the centred kernel on 4:2:0/4:2:2/4:1:1, and on
-    4:4:0 ``"left"`` (``"mpeg2"``) equals ``"center"``. YUY2 is handled like 4:2:2.
+    Every chroma sample is drawn which is reached by the kernel, also those beside the
+    chroma blocks of the text. At the frame edges the luma positions are clamped.
 
     Default (not given or ``"auto"``): the clip's ``_ChromaLocation`` frame property
     (read from frame 0; subsampled YUV incl. YUY2), otherwise the per-format default of ConvertToXXXX:
@@ -234,8 +232,7 @@ versions of a frame at once, and you want to label them to remember which is whi
     | When *false*, the built-in bitmap font (Terminus) is used — same rendering
       as the ``Text`` filter. Faster and cross-platform compatible but limited:
       ``font_filename``, ``font_width``, ``font_angle``, ``interlaced``, ``noaa``
-      and ``font`` (font name) are ignored. ``placement`` works with both; only the
-      ``"top_left"``-like kernel differs (see ``placement``).
+      and ``font`` (font name) are ignored. ``placement`` works the same with both.
 
     Default: true
 
@@ -342,13 +339,10 @@ of specifying ``lsp`` parameter.
     Valid values are the same as in ``ChromaInPlacement`` and ``ChromaOutPlacement``
     in the :doc:`Convert <convert>` functions.
 
-    Any placement is accepted, and silently mapped to the implemented chroma kernels
-    with the kernel table of :doc:`Overlay <overlay>`'s ``placement``: "mpeg2"-like
-    (``"left"``, 1-2-1 filter; 4:2:0/4:2:2/YUY2 only), "mpeg1"-like (centred, box average)
-    and "top_left"-like (1-2-1 filter centred on the top-left luma sample: 3x3 on 4:2:0,
-    vertical on 4:4:0; equals ``"left"`` on 4:2:2/YUY2; point sample on 4:1:1/4:1:0).
-    E.g. ``"top"`` and ``"bottom"`` are centred on
-    4:2:0/4:2:2/4:1:1, and on 4:4:0 ``"left"`` (``"mpeg2"``) equals ``"center"``.
+    Any placement is accepted, and silently mapped to the implemented chroma kernels:
+    the low-pass filters of the mask kernel table of :doc:`Overlay <overlay>`'s ``placement``.
+    E.g. ``"top"`` and ``"bottom"`` are centred on 4:2:0/4:2:2/4:1:1/4:1:0, and on 4:4:0
+    ``"left"`` (``"mpeg2"``) equals ``"center"``.
 
     Default (not given or ``"auto"``): the clip's ``_ChromaLocation`` frame property
     (read from frame 0; subsampled YUV incl. YUY2), otherwise the per-format default of ConvertToXXXX:
@@ -476,12 +470,66 @@ It results in: ::
     Text("Load bdf font", font="spleen-12x24.bdf", align=6)
 
 
+Colour levels above 8 bit
+-------------------------
+
+``Subtitle`` with ``gdi=true`` calculates the text colour for 8 bit, then applies it to the clip's bit depth:
+
++----------------------------+-----------------------------------------------------------------------+
+| Format                     | Text colour at full coverage                                          |
++============================+=======================================================================+
+| 8 bit                      | the 8 bit level                                                       |
++----------------------------+-----------------------------------------------------------------------+
+| YUV(A), Y, 10-16 bit       | limited range rule: level shifted up, 235 is 60160 at 16 bit,         |
+|                            | neutral chroma 128 is 32768                                           |
++----------------------------+-----------------------------------------------------------------------+
+| RGB, 10-16 bit             | full range rule: level * 257 at 16 bit, 255 is about 65535            |
++----------------------------+-----------------------------------------------------------------------+
+| YUV(A), Y, 32 bit float    | same as ConvertBits gives for that level, neutral chroma is 0.0       |
++----------------------------+-----------------------------------------------------------------------+
+| RGB, 32 bit float          | level / 255                                                           |
++----------------------------+-----------------------------------------------------------------------+
+
+Results before and since AviSynth+ 3.7.7, each pixel fully covered by ``Subtitle("MMM", size=64, text_color=c,
+halo_color=$FF000000)``. ``Text`` is not affected. 8 bit formats give the same output as before. RGB 10-16 bit is the
+same as well, except for the overflow in the last row. The last row is the darkest pixel of the frame:
+with white text on white it should stay close to 65535.
+
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+| Source clip                                                    | ``c``      | Plane     | Before | Since 3.7.7 |
++================================================================+============+===========+========+=============+
+| ``BlankClip(pixel_type="YUV444P16", color_yuv=$108080)``       | ``$FFFFFF``| Y         | 60393  | 60160       |
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+| ``BlankClip(pixel_type="YUV444P16", color_yuv=$108080)``       | ``$FFFFFF``| U         | 32895  | 32768       |
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+| ``BlankClip(pixel_type="YUV444P16", color_yuv=$108080)``       | ``$FF0000``| V         | 61678  | 61440       |
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+| ``BlankClip(pixel_type="YUV444P10", color_yuv=$108080)``       | ``$FFFFFF``| Y         | 943    | 940         |
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+| ``BlankClip(pixel_type="YUV444P10", color_yuv=$108080)``       | ``$FFFFFF``| U         | 513    | 512         |
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+| ``BlankClip(pixel_type="YUV444PS", color_yuv=$108080)``        | ``$FFFFFF``| U         | 0.00194| 0.0         |
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+| ``BlankClip(pixel_type="RGBP16", color=$FFFFFF)``              | ``$FFFFFF``| R, darkest| 0      | 65313       |
++----------------------------------------------------------------+------------+-----------+--------+-------------+
+
 Changelog
 ---------
 
 +-----------------+--------------------------------------------------------------------------+
 | Version         | Changes                                                                  |
 +=================+==========================================================================+
+| AviSynth+ 3.7.7 | | Fix: ``Subtitle`` (``gdi=true``), YUV 10-16 bit: limited range levels. |
+|                 | | Fix: ``Subtitle`` (``gdi=true``), 10-16 bit: overflow on a bright      |
+|                 |   background, text edges were dark or out of range.                      |
+|                 | | Fix: ``Subtitle`` (``gdi=true``), 32 bit float: chroma was off by half |
+|                 |   an 8 bit step. See `Colour levels above 8 bit`_.                       |
+|                 | | ``Subtitle`` and ``Text``: the chroma uses the low-pass mask kernels   |
+|                 |   of :doc:`Overlay <overlay>` (no point samples or 4:1 box kernels).     |
+|                 | | Chroma samples beside the text blocks are drawn as well.               |
+|                 | | Fix: ``Text`` on 4:1:0: chroma misplaced for y not divisible by 4.     |
+|                 | | ``Text``: faster, mainly without halo and fading.                      |
++-----------------+--------------------------------------------------------------------------+
 | AviSynth+ 3.7.6 || Add ``placement`` parameter to ``Subtitle``: chroma placement for all   |
 |                 |  subsampled YUV formats incl. YUY2; ConvertToXXXX ``ChromaInPlacement``  |
 |                 |  names and default (``_ChromaLocation``, else format default). Values    |

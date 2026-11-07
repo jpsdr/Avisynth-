@@ -41,8 +41,11 @@
 #include <stdint.h>
 #include <string.h>
 #include "version.h"
+#include <cmath>
+#include <initializer_list>
 #include <memory>
 #include <string>
+#include <utility>
 #ifdef AVS_POSIX
 #include <limits.h>
 #endif
@@ -58,6 +61,29 @@
 #endif
 
 #endif
+
+// Float parameter: rejects NaN and Inf. An undefined parameter is fine, its default is used.
+// Script floats are double, so a value like 1e39 passes: what is too large depends on the use, it is checked there.
+static inline void check_float_param(const AVSValue& value, const char* filter, const char* name, IScriptEnvironment* env)
+{
+  if (value.IsArray()) { // e.g. colors
+    for (int i = 0; i < value.ArraySize(); i++)
+      check_float_param(value[i], filter, name, env);
+    return;
+  }
+  if (!value.IsFloat()) // also undefined. IsFloat is true for int as well
+    return;
+  if (!std::isfinite(value.AsFloat()))
+    env->ThrowError("%s: %s must be a finite number", filter, name);
+}
+
+// The float parameters of a filter, at its creation. Overloads of a function can have less arguments.
+static inline void check_float_params(const AVSValue& args, const char* filter, std::initializer_list<std::pair<int, const char*>> params, IScriptEnvironment* env)
+{
+  for (const auto& param : params)
+    if (param.first < args.ArraySize())
+      check_float_param(args[param.first], filter, param.second, env);
+}
 
 #if AVS_DEVNEXT_REV > 0
 #define AVS_DEVELOPMENT_BUILD "\nNext Version Development Build: " AVS_PPSTR(AVS_DEV_REVDATE)
@@ -194,16 +220,7 @@ static AVS_FORCEINLINE bool IsForwardedUserCacheHint(int cachehints) {
 
 /*** Inline helper methods ***/
 
-// 8 bit uv to float
-// 16-128-240 -> -112-0-112 -> 1..255: +/-127 -> +/-0.5
-[[maybe_unused]] static AVS_FORCEINLINE float uv8tof(int color) {
-  return (color - 128) / 255.f; // consistent with convert_uintN_to_float_c
-}
-
-// 8 bit fullscale to float
-[[maybe_unused]] static AVS_FORCEINLINE float c8tof(int color) {
-  return color / 255.0f;
-}
+#include "limited_range_float.h" // y8tof, uv8tof, c8tof
 
 [[maybe_unused]] static AVS_FORCEINLINE uint8_t Scaled15bitPixelClip(int i) {
   return (uint8_t)clamp((i + 16384) >> 15, 0, 255);

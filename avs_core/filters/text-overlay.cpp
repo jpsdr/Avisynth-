@@ -160,7 +160,7 @@ extern const AVSFunction Text_filters[] = {
 
 // Select the best rowprep function for soa_mask_mode (SoA = Structure of Arrays,
 // the row-interleaved layout used by soa_buf/ApplyPlanar_SoA below) at construction time.
-using rowprep_u16_fn_t = const uint16_t*(*)(const uint16_t*, int, int, uint16_t*, int, int, MagicDiv);
+using rowprep_u16_fn_t = const uint16_t*(*)(const uint16_t*, int, int, int, int, uint16_t*, int, int, MagicDiv);
 
 static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
 {
@@ -175,11 +175,11 @@ static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
     case MASK420_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK420_TOPLEFT, uint16_t, true>;
     case MASK422:         return prepare_effective_mask_for_row_avx2<MASK422,         uint16_t, true>;
     case MASK422_MPEG2:   return prepare_effective_mask_for_row_avx2<MASK422_MPEG2,   uint16_t, true>;
-    case MASK422_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK422_TOPLEFT, uint16_t, true>;
     case MASK440:         return prepare_effective_mask_for_row_avx2<MASK440,         uint16_t, true>;
     case MASK440_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK440_TOPLEFT, uint16_t, true>;
     case MASK410:         return prepare_effective_mask_for_row_avx2<MASK410,         uint16_t, true>;
     case MASK410_TOPLEFT: return prepare_effective_mask_for_row_avx2<MASK410_TOPLEFT, uint16_t, true>;
+    case MASK410_MPEG2  : return prepare_effective_mask_for_row_avx2<MASK410_MPEG2  , uint16_t, true>;
     default: break;
     }
   }
@@ -193,11 +193,11 @@ static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
     case MASK420_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK420_TOPLEFT, uint16_t, true>;
     case MASK422:         return prepare_effective_mask_for_row_sse41<MASK422,         uint16_t, true>;
     case MASK422_MPEG2:   return prepare_effective_mask_for_row_sse41<MASK422_MPEG2,   uint16_t, true>;
-    case MASK422_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK422_TOPLEFT, uint16_t, true>;
     case MASK440:         return prepare_effective_mask_for_row_sse41<MASK440,         uint16_t, true>;
     case MASK440_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK440_TOPLEFT, uint16_t, true>;
     case MASK410:         return prepare_effective_mask_for_row_sse41<MASK410,         uint16_t, true>;
     case MASK410_TOPLEFT: return prepare_effective_mask_for_row_sse41<MASK410_TOPLEFT, uint16_t, true>;
+    case MASK410_MPEG2  : return prepare_effective_mask_for_row_sse41<MASK410_MPEG2  , uint16_t, true>;
     default: break;
     }
   }
@@ -212,11 +212,11 @@ static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
     case MASK420_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK420_TOPLEFT, uint16_t, true>;
     case MASK422:         return prepare_effective_mask_for_row_neon<MASK422,         uint16_t, true>;
     case MASK422_MPEG2:   return prepare_effective_mask_for_row_neon<MASK422_MPEG2,   uint16_t, true>;
-    case MASK422_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK422_TOPLEFT, uint16_t, true>;
     case MASK440:         return prepare_effective_mask_for_row_neon<MASK440,         uint16_t, true>;
     case MASK440_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK440_TOPLEFT, uint16_t, true>;
     case MASK410:         return prepare_effective_mask_for_row_neon<MASK410,         uint16_t, true>;
     case MASK410_TOPLEFT: return prepare_effective_mask_for_row_neon<MASK410_TOPLEFT, uint16_t, true>;
+    case MASK410_MPEG2  : return prepare_effective_mask_for_row_neon<MASK410_MPEG2  , uint16_t, true>;
     default: break;
     }
   }
@@ -232,11 +232,11 @@ static rowprep_u16_fn_t select_rowprep_u16(MaskMode mode, int64_t cpuFlags)
   case MASK420_TOPLEFT: return prepare_effective_mask_for_row<MASK420_TOPLEFT, uint16_t, true>;
   case MASK422:         return prepare_effective_mask_for_row<MASK422,         uint16_t, true>;
   case MASK422_MPEG2:   return prepare_effective_mask_for_row<MASK422_MPEG2,   uint16_t, true>;
-  case MASK422_TOPLEFT: return prepare_effective_mask_for_row<MASK422_TOPLEFT, uint16_t, true>;
   case MASK440:         return prepare_effective_mask_for_row<MASK440,         uint16_t, true>;
   case MASK440_TOPLEFT: return prepare_effective_mask_for_row<MASK440_TOPLEFT, uint16_t, true>;
   case MASK410:         return prepare_effective_mask_for_row<MASK410,         uint16_t, true>;
   case MASK410_TOPLEFT: return prepare_effective_mask_for_row<MASK410_TOPLEFT, uint16_t, true>;
+  case MASK410_MPEG2  : return prepare_effective_mask_for_row<MASK410_MPEG2  , uint16_t, true>;
   default: break;
   }
   return nullptr;
@@ -410,30 +410,37 @@ void Antialiaser::Apply(const VideoInfo& vi, PVideoFrame* frame, int pitch)
     case MASK440_TOPLEFT: CALL_SOA(MASK440_TOPLEFT); break;
     case MASK410:         CALL_SOA(MASK410);         break;
     case MASK410_TOPLEFT: CALL_SOA(MASK410_TOPLEFT); break;
+    case MASK410_MPEG2  : CALL_SOA(MASK410_MPEG2  ); break;
     case MASK420:         CALL_SOA(MASK420);         break;
     case MASK420_MPEG2:   CALL_SOA(MASK420_MPEG2);   break;
     case MASK420_TOPLEFT: CALL_SOA(MASK420_TOPLEFT); break;
     case MASK422:         CALL_SOA(MASK422);         break;
     case MASK422_MPEG2:   CALL_SOA(MASK422_MPEG2);   break;
-    case MASK422_TOPLEFT: CALL_SOA(MASK422_TOPLEFT); break;
+    case MASK_MODE_COUNT: break;
     }
 #undef CALL_SOA
   }
 }
 
+// The GetAlphaRect colour addends are 8 bit level * coverage * 256.99 (33024 * 255 / 32768 at full coverage).
+// The 8 bit blend's >>8 needs this scale, and it is 257 for full range RGB at higher bit depths as well.
+// Limited range YUV is a plain shift: back to level * coverage * 256. Ratio 32768 / 32895. The addend is truncated,
+// rounding up makes all 256 levels exact at full coverage.
+static AVS_FORCEINLINE int text_addend_to_limited(int addend) {
+  return (int)((addend * (int64_t)16712443 + 16760439) >> 24);
+}
+
+// Float: addends to 8 bit level / 255 at full coverage. 33024 * 255 * 255 / 32768
+static constexpr float text_addend_to_float = 1.0f / 65533.0078125f;
+
 // Hoping that bits_per_pixel template make it quicker
 template<MaskMode maskMode, int bits_per_pixel>
 void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU, BYTE* bufV, bool isRGB)
 {
-  constexpr int shiftX =
-    (maskMode == MASK444 || maskMode == MASK440 || maskMode == MASK440_TOPLEFT) ? 0 :
-    (maskMode == MASK411 || maskMode == MASK411_TOPLEFT || maskMode == MASK410 || maskMode == MASK410_TOPLEFT) ? 2 : 1;
-  constexpr int shiftY =
-    (maskMode == MASK410 || maskMode == MASK410_TOPLEFT) ? 2 :
-    (maskMode == MASK420 || maskMode == MASK420_MPEG2 || maskMode == MASK420_TOPLEFT ||
-     maskMode == MASK440 || maskMode == MASK440_TOPLEFT) ? 1 : 0;
-  constexpr int stepX = 1 << shiftX;
-  constexpr int stepY = 1 << shiftY;
+  constexpr int stepX = MaskHSubsample<maskMode>;
+  constexpr int stepY = MaskVSubsample<maskMode>;
+  constexpr int shiftX = stepX == 4 ? 2 : stepX == 2 ? 1 : 0;
+  constexpr int shiftY = stepY == 4 ? 2 : stepY == 2 ? 1 : 0;
 
   if (dirty) {
     GetAlphaRect();
@@ -466,8 +473,11 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
       uint16_t* p = reinterpret_cast<uint16_t*>(buf_row);
       for (int x = xl; x <= xr; ++x) {
         const int ba = ba_y[x];
-        if (ba != 256)
-          p[x] = (uint16_t)((p[x] * ba + (ry_y[x] << (bits_per_pixel - 8))) >> 8);
+        if (ba != 256) {
+          const int addend = isRGB ? ry_y[x] << (bits_per_pixel - 8) : (text_addend_to_limited(ry_y[x]) << (bits_per_pixel - 8)) + 128;
+          // ba + addend's weight can be slightly above 256
+          p[x] = (uint16_t)std::min((p[x] * ba + addend) >> 8, (1 << bits_per_pixel) - 1);
+        }
       }
       buf_row   += pitch;
       y_row_ptr += 4 * w_stride;
@@ -480,7 +490,7 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
       for (int x = xl; x <= xr; ++x) {
         const int ba = ba_y[x];
         if (ba != 256)
-          p[x] = p[x] * ba / 256.0f + ry_y[x] / 65536.0f;
+          p[x] = p[x] * ba / 256.0f + ry_y[x] * text_addend_to_float;
       }
       buf_row   += pitch;
       y_row_ptr += 4 * w_stride;
@@ -491,27 +501,32 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
 
   // === U/G and V/B planes — plane 2=u, 3=v; chroma-placement-aware downsampling ===
   const int uv_width = w >> shiftX;
-  const int xl_uv    = xl >> shiftX;
-  const int xr_uv    = xr >> shiftX;
+  // One chroma block of margin around the dirty rectangle: the chroma mask filters reach into the
+  // neighbouring blocks (see MaskMode in blend_common.h), so text at the rectangle's edge also changes
+  // the chroma just outside it. Clamped to the plane; rows: first luma rows of the chroma rows.
+  const int xl_uv    = std::max((xl >> shiftX) - 1, 0);
+  const int xr_uv    = std::min((xr >> shiftX) + 1, uv_width - 1);
+  const int yb_uv    = std::max(yb - stepY, 0);
+  const int yt_uv    = std::min(yt + stepY, h - 1);
   // row preparation functions take full-width luma mask rows and downsample to UV width with correct chroma placement, returning a pointer to the prepared row (which may be buf_ba or an internal static buffer).
   // rowprep output buffers (unused for MASK444 — rowprep returns input ptr directly).
   std::vector<uint16_t>& buf_ba = uv_buf_ba;
   std::vector<uint16_t>& buf_u  = uv_buf_u;
   std::vector<uint16_t>& buf_v  = uv_buf_v;
 
-  const uint16_t* uv_row_ptr = soa_buf + yb * 4 * w_stride;
-  BYTE* bufU_row = bufU + pitchUV * (yb >> shiftY);
-  BYTE* bufV_row = bufV + pitchUV * (yb >> shiftY);
+  const uint16_t* uv_row_ptr = soa_buf + yb_uv * 4 * w_stride;
+  BYTE* bufU_row = bufU + pitchUV * (yb_uv >> shiftY);
+  BYTE* bufV_row = bufV + pitchUV * (yb_uv >> shiftY);
 
   // mask_pitch for 420 modes: next luma row of same plane is 4*w_stride elements ahead in SoA layout
   const int soa_row_pitch = 4 * w_stride;
 
   // +1 * w_stride was already handled: Y
   if constexpr (bits_per_pixel == 8) {
-    for (int y = yb; y <= yt; y += stepY) {
-      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba.data(), 0, 0, {});
-      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u.data(),  0, 0, {});
-      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v.data(),  0, 0, {});
+    for (int y = yb_uv; y <= yt_uv; y += stepY) {
+      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, y, h - 1 - y, buf_ba.data(), 0, 0, {});
+      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, buf_u.data(),  0, 0, {});
+      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, buf_v.data(),  0, 0, {});
       for (int xs = xl_uv; xs <= xr_uv; ++xs) {
         const int ba = ba_row[xs];
         if (ba != 256) {
@@ -524,17 +539,19 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
       uv_row_ptr += stepY * 4 * w_stride;
     }
   } else if constexpr (bits_per_pixel >= 10 && bits_per_pixel <= 16) {
-    for (int y = yb; y <= yt; y += stepY) {
-      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba.data(), 0, 0, {});
-      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u.data(),  0, 0, {});
-      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v.data(),  0, 0, {});
+    for (int y = yb_uv; y <= yt_uv; y += stepY) {
+      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, y, h - 1 - y, buf_ba.data(), 0, 0, {});
+      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, buf_u.data(),  0, 0, {});
+      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, buf_v.data(),  0, 0, {});
       uint16_t* pU = reinterpret_cast<uint16_t*>(bufU_row);
       uint16_t* pV = reinterpret_cast<uint16_t*>(bufV_row);
       for (int xs = xl_uv; xs <= xr_uv; ++xs) {
         const int ba = ba_row[xs];
         if (ba != 256) {
-          pU[xs] = (uint16_t)((pU[xs] * ba + (u_row[xs] << (bits_per_pixel - 8))) >> 8);
-          pV[xs] = (uint16_t)((pV[xs] * ba + (v_row[xs] << (bits_per_pixel - 8))) >> 8);
+          const int addend_u = isRGB ? u_row[xs] << (bits_per_pixel - 8) : (text_addend_to_limited(u_row[xs]) << (bits_per_pixel - 8)) + 128;
+          const int addend_v = isRGB ? v_row[xs] << (bits_per_pixel - 8) : (text_addend_to_limited(v_row[xs]) << (bits_per_pixel - 8)) + 128;
+          pU[xs] = (uint16_t)std::min((pU[xs] * ba + addend_u) >> 8, (1 << bits_per_pixel) - 1);
+          pV[xs] = (uint16_t)std::min((pV[xs] * ba + addend_v) >> 8, (1 << bits_per_pixel) - 1);
         }
       }
       bufU_row   += pitchUV;
@@ -543,21 +560,20 @@ void Antialiaser::ApplyPlanar_SoA(BYTE* buf, int pitch, int pitchUV, BYTE* bufU,
     }
   } else { // float UV
     // 32-bit float UV neutral chroma is 0.0f
-    const float middle_shift = isRGB ? 0.0f : 0.5f; // yes, correction needed in and out
+    const float middle_shift = isRGB ? 0.0f : -uv8tof(0); // 128/255, the addends are not signed. Correction needed in and out
     constexpr float scale_1_per_256 = 1.0f / 256.0f;
-    constexpr float scale_1_per_65536 = 1.0f / 65536.0f;
-    for (int y = yb; y <= yt; y += stepY) {
-      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, buf_ba.data(), 0, 0, {});
-      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, buf_u.data(),  0, 0, {});
-      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, buf_v.data(),  0, 0, {});
+    for (int y = yb_uv; y <= yt_uv; y += stepY) {
+      const uint16_t* ba_row = rowprep_fns[maskMode](uv_row_ptr,                soa_row_pitch, uv_width, y, h - 1 - y, buf_ba.data(), 0, 0, {});
+      const uint16_t* u_row  = rowprep_fns[maskMode](uv_row_ptr + 2 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, buf_u.data(),  0, 0, {});
+      const uint16_t* v_row  = rowprep_fns[maskMode](uv_row_ptr + 3 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, buf_v.data(),  0, 0, {});
       float* pU = reinterpret_cast<float*>(bufU_row);
       float* pV = reinterpret_cast<float*>(bufV_row);
       for (int xs = xl_uv; xs <= xr_uv; ++xs) {
         const int ba = ba_row[xs];
         if (ba != 256) {
           const float ba_f = ba * scale_1_per_256;
-          pU[xs] = (pU[xs] + middle_shift) * ba_f + u_row[xs] * scale_1_per_65536 - middle_shift;
-          pV[xs] = (pV[xs] + middle_shift) * ba_f + v_row[xs] * scale_1_per_65536 - middle_shift;
+          pU[xs] = (pU[xs] + middle_shift) * ba_f + u_row[xs] * text_addend_to_float - middle_shift;
+          pV[xs] = (pV[xs] + middle_shift) * ba_f + v_row[xs] * text_addend_to_float - middle_shift;
         }
       }
       bufU_row   += pitchUV;
@@ -577,8 +593,9 @@ void Antialiaser::ApplyYUY2(BYTE* buf, int pitch, MaskMode maskMode) {
     xl &= -2; xr |= 1;
   }
   const int uv_width = w >> 1;
-  const int xl_uv = xl >> 1;
-  const int xr_uv = xr >> 1;
+  // one chroma pixel of margin, see ApplyPlanar_SoA
+  const int xl_uv = std::max((xl >> 1) - 1, 0);
+  const int xr_uv = std::min((xr >> 1) + 1, uv_width - 1);
   const int soa_row_pitch = 4 * w_stride;
   const uint16_t* row_ptr = soa_buf + yb * soa_row_pitch;
   buf += pitch * yb;
@@ -591,9 +608,9 @@ void Antialiaser::ApplyYUY2(BYTE* buf, int pitch, MaskMode maskMode) {
       if (ba != 256)
         buf[x * 2] = BYTE((buf[x * 2] * ba + ry_y[x]) >> 8);
     }
-    const uint16_t* ba_row = rowprep_fns[maskMode](row_ptr,                soa_row_pitch, uv_width, uv_buf_ba.data(), 0, 0, {});
-    const uint16_t* u_row  = rowprep_fns[maskMode](row_ptr + 2 * w_stride, soa_row_pitch, uv_width, uv_buf_u.data(),  0, 0, {});
-    const uint16_t* v_row  = rowprep_fns[maskMode](row_ptr + 3 * w_stride, soa_row_pitch, uv_width, uv_buf_v.data(),  0, 0, {});
+    const uint16_t* ba_row = rowprep_fns[maskMode](row_ptr,                soa_row_pitch, uv_width, y, h - 1 - y, uv_buf_ba.data(), 0, 0, {});
+    const uint16_t* u_row  = rowprep_fns[maskMode](row_ptr + 2 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, uv_buf_u.data(),  0, 0, {});
+    const uint16_t* v_row  = rowprep_fns[maskMode](row_ptr + 3 * w_stride, soa_row_pitch, uv_width, y, h - 1 - y, uv_buf_v.data(),  0, 0, {});
     for (int xs = xl_uv; xs <= xr_uv; ++xs) {
       const int ba = ba_row[xs];
       if (ba != 256) {
@@ -625,9 +642,11 @@ void Antialiaser::ApplyRGB_packed(BYTE* buf, int pitch)
       const int ba = ba_row[x];
       if (ba != 256) {
         pixel_t* buf2 = reinterpret_cast<pixel_t*>(buf) + (x * pixel_step);
-        buf2[0] = (pixel_t)((buf2[0] * ba + (bv_row[x] << alpha_shift)) >> 8);  // B
-        buf2[1] = (pixel_t)((buf2[1] * ba + (gu_row[x] << alpha_shift)) >> 8);  // G
-        buf2[2] = (pixel_t)((buf2[2] * ba + (ry_row[x] << alpha_shift)) >> 8);  // R
+        // ba + addend's weight can be slightly above 256; no effect at 8 bit
+        constexpr int max_pixel = sizeof(pixel_t) == 1 ? 255 : 65535;
+        buf2[0] = (pixel_t)std::min((buf2[0] * ba + (bv_row[x] << alpha_shift)) >> 8, max_pixel);  // B
+        buf2[1] = (pixel_t)std::min((buf2[1] * ba + (gu_row[x] << alpha_shift)) >> 8, max_pixel);  // G
+        buf2[2] = (pixel_t)std::min((buf2[2] * ba + (ry_row[x] << alpha_shift)) >> 8, max_pixel);  // R
       }
     }
     buf     -= pitch;  // packed RGB is bottom-up
@@ -659,6 +678,16 @@ void Antialiaser::GetAlphaRect()
 /*************************************
  *******   Show Frame Number    ******
  ************************************/
+
+// ShowFrameNumber, ShowCRC32: the text is repeated in steps of size, so it has to be at least 1 after rounding.
+// scale: 8 for GDI, its unit is 1/8 pixel.
+static int get_repeated_text_size(double size_f, int scale, const char* name, IScriptEnvironment* env)
+{
+  const double size_scaled = size_f * scale + 0.5;
+  if (std::isnan(size_f) || size_scaled < 1.0 || size_f > 1000000.0)
+    env->ThrowError("%s: size must be between 1 and 1000000", name);
+  return (int)size_scaled;
+}
 
 ShowFrameNumber::ShowFrameNumber(PClip _child, bool _scroll, int _offset, int _x, int _y, const char _fontname[],
                                  int _size, int _textcolor, int _halocolor, int font_width, int font_angle,
@@ -715,7 +744,7 @@ PVideoFrame ShowFrameNumber::GetFrame(int n, IScriptEnvironment* env) {
       TextOut(hdc, x+16, y+16, text, (int)strlen(text));
     } else if (scroll) {
       int n1 = vi.IsFieldBased() ? (n/2) : n;
-      int y2 = size + size * (n1 % (vi.height * 8 / size));
+      int y2 = size + size * (n1 % std::max(1, vi.height * 8 / size));
       SetTextAlign(hdc, TA_BASELINE | (child->GetParity(n) ? TA_LEFT : TA_RIGHT));
       TextOut(hdc, child->GetParity(n) ? 32 : vi.width*8+8, y2, text, (int)strlen(text));
     } else {
@@ -737,7 +766,7 @@ PVideoFrame ShowFrameNumber::GetFrame(int n, IScriptEnvironment* env) {
     SimpleTextOutW(current_font.get(), vi, frame, x, y, s_utf8, false, textcolor, halocolor, true, 1, chromaplacement);
   } else if (scroll) {
     int n1 = vi.IsFieldBased() ? (n/2) : n;
-    int y2 = size + size * (n1 % (vi.height / size));
+    int y2 = size + size * (n1 % std::max(1, vi.height / size));
     if(child->GetParity(n))
       SimpleTextOutW(current_font.get(), vi, frame, 4, y2, s_utf8, false, textcolor, halocolor, true, 1, chromaplacement); // left
     else
@@ -757,6 +786,7 @@ PVideoFrame ShowFrameNumber::GetFrame(int n, IScriptEnvironment* env) {
 
 AVSValue __cdecl ShowFrameNumber::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "ShowFrameNumber", { { 3, "x" }, { 4, "y" }, { 6, "size" }, { 9, "font_width" }, { 10, "font_angle" } }, env);
   PClip clip = args[0].AsClip();
   bool scroll = args[1].AsBool(false);
   const int offset = args[2].AsInt(0);
@@ -765,7 +795,7 @@ AVSValue __cdecl ShowFrameNumber::Create(AVSValue args, void*, IScriptEnvironmen
   const int x = args[3].IsFloat() ? int(args[3].AsFloat() * (gdi ? 8 : 1) + 0.5) : DefXY;
   const int y = args[4].IsFloat() ? int(args[4].AsFloat() * (gdi ? 8 : 1) + 0.5) : DefXY;
   const char* font = args[5].AsString(gdi ? "Arial" : "Terminus");
-  const int size = int(args[6].AsFloat(24) * (gdi ? 8 : 1) + 0.5);
+  const int size = get_repeated_text_size(args[6].AsFloat(24), gdi ? 8 : 1, "ShowFrameNumber", env);
   const int font_width = int(args[9].AsFloat(0) * (gdi ? 8 : 1) + 0.5);
   const bool bold = args[11].AsBool(gdi);
 #else
@@ -773,7 +803,7 @@ AVSValue __cdecl ShowFrameNumber::Create(AVSValue args, void*, IScriptEnvironmen
   const int x = args[3].IsFloat() ? int(args[3].AsFloat() + 0.5) : DefXY;
   const int y = args[4].IsFloat() ? int(args[4].AsFloat() + 0.5) : DefXY;
   const char* font = args[5].AsString("Terminus");
-  const int size = int(args[6].AsFloat(24) + 0.5);
+  const int size = get_repeated_text_size(args[6].AsFloat(24), 1, "ShowFrameNumber", env);
   const int font_width = int(args[9].AsFloat(0) + 0.5);
   const bool bold = args[11].AsBool(false);
 #endif
@@ -995,7 +1025,7 @@ PVideoFrame ShowCRC32::GetFrame(int n, IScriptEnvironment* env) {
       TextOut(hdc, x + 16, y + 16, text, (int)strlen(text));
     } else if (scroll) {
       int n1 = vi.IsFieldBased() ? (n / 2) : n;
-      int y2 = size + size * (n1 % (vi.height * 8 / size));
+      int y2 = size + size * (n1 % std::max(1, vi.height * 8 / size));
       SetTextAlign(hdc, TA_BASELINE | (child->GetParity(n) ? TA_LEFT : TA_RIGHT));
       TextOut(hdc, child->GetParity(n) ? 32 : vi.width * 8 + 8, y2, text, (int)strlen(text));
     } else {
@@ -1017,7 +1047,7 @@ PVideoFrame ShowCRC32::GetFrame(int n, IScriptEnvironment* env) {
     SimpleTextOutW(current_font.get(), vi, frame, x, y, s_utf8, false, textcolor, halocolor, true, 1, chromaplacement);
   } else if (scroll) {
     int n1 = vi.IsFieldBased() ? (n / 2) : n;
-    int y2 = size + size * (n1 % (vi.height / size));
+    int y2 = size + size * (n1 % std::max(1, vi.height / size));
     if (child->GetParity(n))
       SimpleTextOutW(current_font.get(), vi, frame, 4, y2, s_utf8, false, textcolor, halocolor, true, 1, chromaplacement); // left
     else
@@ -1036,6 +1066,7 @@ PVideoFrame ShowCRC32::GetFrame(int n, IScriptEnvironment* env) {
 
 AVSValue __cdecl ShowCRC32::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "ShowCRC32", { { 3, "x" }, { 4, "y" }, { 6, "size" }, { 9, "font_width" }, { 10, "font_angle" } }, env);
   PClip original = args[0].AsClip();
   const VideoInfo& vi = original->GetVideoInfo();
 
@@ -1071,7 +1102,7 @@ AVSValue __cdecl ShowCRC32::Create(AVSValue args, void*, IScriptEnvironment* env
   const int x = args[3].IsFloat() ? int(args[3].AsFloat() * (gdi ? 8 : 1) + 0.5) : DefXY;
   const int y = args[4].IsFloat() ? int(args[4].AsFloat() * (gdi ? 8 : 1) + 0.5) : DefXY;
   const char* font = args[5].AsString(gdi ? "Arial" : "Terminus");
-  const int size = int(args[6].AsFloat(24) * (gdi ? 8 : 1) + 0.5);
+  const int size = get_repeated_text_size(args[6].AsFloat(24), gdi ? 8 : 1, "ShowCRC32", env);
   const int font_width = int(args[9].AsFloat(0) * (gdi ? 8 : 1) + 0.5);
   const bool bold = args[11].AsBool(gdi);
 #else
@@ -1079,7 +1110,7 @@ AVSValue __cdecl ShowCRC32::Create(AVSValue args, void*, IScriptEnvironment* env
   const int x = args[3].IsFloat() ? int(args[3].AsFloat() + 0.5) : DefXY;
   const int y = args[4].IsFloat() ? int(args[4].AsFloat() + 0.5) : DefXY;
   const char* font = args[5].AsString("Terminus");
-  const int size = int(args[6].AsFloat(24) + 0.5);
+  const int size = get_repeated_text_size(args[6].AsFloat(24), 1, "ShowCRC32", env);
   const int font_width = int(args[9].AsFloat(0) + 0.5);
   const bool bold = args[11].AsBool(false);
 #endif
@@ -1137,6 +1168,9 @@ ShowSMPTE::ShowSMPTE(PClip _child, double _rate, const char* offset, int _offset
     }
   }
   int off_f, off_sec, off_min, off_hour;
+
+  if (std::isnan(_rate) || _rate < 0.0 || _rate > 1000000.0)
+    env->ThrowError("ShowSMPTE: rate argument must be 23.976, 29.97 or an integer");
 
   rate = int(_rate + 0.5);
   dropframe = false;
@@ -1280,6 +1314,7 @@ PVideoFrame __stdcall ShowSMPTE::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl ShowSMPTE::CreateSMTPE(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "ShowSMPTE", { { 1, "fps" }, { 4, "x" }, { 5, "y" }, { 7, "size" }, { 10, "font_width" }, { 11, "font_angle" } }, env);
   PClip clip = args[0].AsClip();
   const VideoInfo& arg0vi = args[0].AsClip()->GetVideoInfo();
   double def_rate = (double)arg0vi.fps_numerator / arg0vi.fps_denominator;
@@ -1316,6 +1351,7 @@ AVSValue __cdecl ShowSMPTE::CreateSMTPE(AVSValue args, void*, IScriptEnvironment
 
 AVSValue __cdecl ShowSMPTE::CreateTime(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "ShowTime", { { 2, "x" }, { 3, "y" }, { 5, "size" }, { 8, "font_width" }, { 9, "font_angle" } }, env);
   PClip clip = args[0].AsClip();
   const int offset_f = args[1].AsInt(0);
   const int xreal = args[0].AsClip()->GetVideoInfo().width/2;
@@ -1427,6 +1463,7 @@ PVideoFrame Subtitle::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl Subtitle::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+    check_float_params(args, "Subtitle", { { 2, "x" }, { 3, "y" }, { 7, "size" }, { 13, "font_width" }, { 14, "font_angle" } }, env);
     PClip clip = args[0].AsClip();
     const char* text = args[1].AsString();
     const int first_frame = args[4].AsInt(0);
@@ -1805,6 +1842,7 @@ PVideoFrame SimpleText::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl SimpleText::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "Text", { { 2, "x" }, { 3, "y" }, { 7, "size" }, { 13, "font_width" }, { 14, "font_angle" } }, env);
   PClip clip = args[0].AsClip();
   VideoInfo vi = clip->GetVideoInfo();
 
@@ -2338,6 +2376,7 @@ PVideoFrame FilterInfo::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl FilterInfo::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+    check_float_params(args, "Info", { { 2, "size" }, { 9, "x" }, { 10, "y" } }, env);
     // 0   1      2       3             4         5       6      7       8    9  10    11      12
     // c[font]s[size]f[text_color]i[halo_color]i[bold]b[italic]b[noaa]b[cpu]b[x]f[y]f[align]i[gdi]b
     PClip clip = args[0].AsClip();
