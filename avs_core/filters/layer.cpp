@@ -263,7 +263,7 @@ ColorKeyMask::ColorKeyMask(PClip _child, int _color, int _tolB, int _tolG, int _
     env->ThrowError("ColorKeyMask: requires RGB32, RGB64 or Planar RGBA input");
   pixelsize = vi.ComponentSize();
   bits_per_pixel = vi.BitsPerComponent();
-  max_pixel_value = (1 << bits_per_pixel) - 1;
+  max_pixel_value = bits_per_pixel <= 16 ? (1 << bits_per_pixel) - 1 : 0; // float: n/a
 
   auto rgbcolor8to16 = [](uint8_t color8, int max_pixel_value) { return (uint16_t)(color8 * max_pixel_value / 255); };
 
@@ -548,6 +548,7 @@ PVideoFrame ResetMask::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue ResetMask::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "ResetMask", { { 1, "mask" }, { 2, "opacity" } }, env);
   return new ResetMask(args[0].AsClip(), args[1], args[2], env);
 }
 
@@ -617,7 +618,7 @@ Invert::Invert(PClip _child, const char* _channels, IScriptEnvironment* env)
   }
   else {
     mask = 0xffffffff;
-    mask64 = (1 << bits_per_pixel) - 1;
+    mask64 = bits_per_pixel <= 16 ? (1 << bits_per_pixel) - 1 : 0; // float: n/a
     mask64 |= (mask64 << 48) | (mask64 << 32) | (mask64 << 16); // works for 10 bit, too
     // RGB24/48 is special case no use of this mask
   }
@@ -2365,11 +2366,13 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
     separate_maskp = mask_frame->GetReadPtr(PLANAR_Y) + separate_mask_pitch * ysrc + xsrc * vi.ComponentSize();
   }
 
-  const int mylevel = hasAlpha ? (int)(opacity * ((1 << bits_per_pixel) + 1) + 0.5f) : (int)(opacity * (1 << bits_per_pixel) + 0.5f);
+  // integer paths only, float uses opacity
+  const int level_scale = bits_per_pixel <= 16 ? 1 << bits_per_pixel : 0;
+  const int mylevel = hasAlpha ? (int)(opacity * (level_scale + 1) + 0.5f) : (int)(opacity * level_scale + 0.5f);
 
   // For functions using magic-div (/max_val) arithmetic,
   // opacity_i in [0..max_pixel_value], same convention as masked_merge.
-  const int opacity_i = (int)(opacity * ((1 << bits_per_pixel) - 1) + 0.5f);
+  const int opacity_i = (int)(opacity * (level_scale - 1) + 0.5f);
 
   // The inner-loop functions that consume mylevel use a power-of-two shift (>> bpp) for the
   // blend, not division by max_val.  With a ÷(max_val+1) = ÷256 (@8bit) divisor, a weight
@@ -3020,6 +3023,7 @@ PVideoFrame __stdcall Layer::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl Layer::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "Layer", { { 8, "opacity" } }, env);
   const VideoInfo& vi1 = args[0].AsClip()->GetVideoInfo();
   const VideoInfo& vi2 = args[1].AsClip()->GetVideoInfo();
 
@@ -3190,14 +3194,15 @@ Subtract::Subtract(PClip _child1, PClip _child2, IScriptEnvironment* env)
   }
 }
 
-template<typename pixel_t, int midpixel, bool chroma>
+// limited: limited range YUV plane; false: full range RGB plane. Decides the 32 bit float value of the 8 bit levels.
+template<typename pixel_t, int midpixel, bool chroma, bool limited>
 static void subtract_plane(BYTE* src1p, const BYTE* src2p, int src1_pitch, int src2_pitch, int width, int height, int bits_per_pixel)
 {
   typedef typename std::conditional < sizeof(pixel_t) == 4, float, int>::type limits_t;
 
-  const limits_t limit_lo = sizeof(pixel_t) <= 2 ? 0 : (limits_t)(chroma ? uv8tof(0) : c8tof(0));
-  const limits_t limit_hi = sizeof(pixel_t) == 1 ? 255 : sizeof(pixel_t) == 2 ? ((1 << bits_per_pixel) - 1) : (limits_t)(chroma ? uv8tof(255) : c8tof(255));
-  const limits_t equal_luma = sizeof(pixel_t) == 1 ? midpixel : sizeof(pixel_t) == 2 ? (midpixel << (bits_per_pixel - 8)) : (limits_t)(chroma ? uv8tof(midpixel) : c8tof(midpixel));
+  const limits_t limit_lo = sizeof(pixel_t) <= 2 ? 0 : (limits_t)(chroma ? uv8tof(0) : limited ? y8tof(0) : c8tof(0));
+  const limits_t limit_hi = sizeof(pixel_t) == 1 ? 255 : sizeof(pixel_t) == 2 ? ((1 << bits_per_pixel) - 1) : (limits_t)(chroma ? uv8tof(255) : limited ? y8tof(255) : c8tof(255));
+  const limits_t equal_luma = sizeof(pixel_t) == 1 ? midpixel : sizeof(pixel_t) == 2 ? (midpixel << (bits_per_pixel - 8)) : (limits_t)(chroma ? uv8tof(midpixel) : limited ? y8tof(midpixel) : c8tof(midpixel));
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
       limits_t val = reinterpret_cast<const pixel_t*>(src2p)[x] - reinterpret_cast<const pixel_t*>(src1p)[x] + equal_luma;
@@ -3239,9 +3244,9 @@ PVideoFrame __stdcall Subtract::GetFrame(int n, IScriptEnvironment* env)
       }
     }
     else if (pixelsize == 2)
-      subtract_plane<uint16_t, 126, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+      subtract_plane<uint16_t, 126, false, true>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
     else //if (pixelsize==4)
-      subtract_plane<float, 126, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+      subtract_plane<float, 126, false, true>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
 
     // chroma
     row_size = src1->GetRowSize(PLANAR_U);
@@ -3270,12 +3275,12 @@ PVideoFrame __stdcall Subtract::GetFrame(int n, IScriptEnvironment* env)
         }
       }
       else if (pixelsize == 2) {
-        subtract_plane<uint16_t, 128, true>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
-        subtract_plane<uint16_t, 128, true>(src1pV, src2pV, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+        subtract_plane<uint16_t, 128, true, true>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+        subtract_plane<uint16_t, 128, true, true>(src1pV, src2pV, src1_pitch, src2_pitch, width, height, bits_per_pixel);
       }
       else { //if (pixelsize==4)
-        subtract_plane<float, 128, true>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
-        subtract_plane<float, 128, true>(src1pV, src2pV, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+        subtract_plane<float, 128, true, true>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+        subtract_plane<float, 128, true, true>(src1pV, src2pV, src1_pitch, src2_pitch, width, height, bits_per_pixel);
       }
     }
     return src1;
@@ -3304,11 +3309,11 @@ PVideoFrame __stdcall Subtract::GetFrame(int n, IScriptEnvironment* env)
         src1_pitch = src1->GetPitch(plane);
         src2_pitch = src2->GetPitch(plane);
         if (pixelsize == 1)
-          subtract_plane<uint8_t, 128, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+          subtract_plane<uint8_t, 128, false, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
         else if (pixelsize == 2)
-          subtract_plane<uint16_t, 128, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+          subtract_plane<uint16_t, 128, false, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
         else
-          subtract_plane<float, 128, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+          subtract_plane<float, 128, false, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
       }
     }
     else { // packed RGB
@@ -3323,7 +3328,7 @@ PVideoFrame __stdcall Subtract::GetFrame(int n, IScriptEnvironment* env)
       }
       else { // pixelsize == 2: RGB48, RGB64
         // width is getrowsize based here: ok.
-        subtract_plane<uint16_t, 128, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
+        subtract_plane<uint16_t, 128, false, false>(src1p, src2p, src1_pitch, src2_pitch, width, height, bits_per_pixel);
       }
     }
   }

@@ -131,8 +131,8 @@ static void get_limits(luma_chroma_limits_t &d, int bits_per_pixel) {
   int tv_range_hi_chroma_8 = 240;
 
   if (bits_per_pixel == 32) {
-    d.tv_range_low_luma_f = tv_range_lo_luma_8 / 255.0f;
-    d.tv_range_hi_luma_f = tv_range_hi_luma_8 / 255.0f;
+    d.tv_range_low_luma_f = y8tof(tv_range_lo_luma_8);
+    d.tv_range_hi_luma_f = y8tof(tv_range_hi_luma_8);
     d.full_range_low_luma_f = 0.0f;
     d.full_range_hi_luma_f = 1.0f;
 #ifdef FLOAT_CHROMA_IS_HALF_CENTERED
@@ -140,8 +140,8 @@ static void get_limits(luma_chroma_limits_t &d, int bits_per_pixel) {
 #else
     d.middle_chroma_f = 0.0f;
 #endif
-    d.tv_range_low_chroma_f = (tv_range_lo_chroma_8 - 128) / 255.0f + d.middle_chroma_f; // -112
-    d.tv_range_hi_chroma_f = (tv_range_hi_chroma_8 - 128) / 255.0f + d.middle_chroma_f; // 112
+    d.tv_range_low_chroma_f = uv8tof(tv_range_lo_chroma_8) + d.middle_chroma_f; // -112
+    d.tv_range_hi_chroma_f = uv8tof(tv_range_hi_chroma_8) + d.middle_chroma_f; // 112
     d.full_range_low_chroma_f = d.middle_chroma_f - 0.5f; // -0.5..0.5 or 0..1.0
     d.full_range_hi_chroma_f = d.middle_chroma_f + 0.5f;
 
@@ -240,9 +240,9 @@ Levels::Levels(PClip _child, float _in_min, double _gamma, float _in_max, float 
 
   // No lookup for float. Only slow pixel-by-pixel realtime calculation
 
-  int lookup_size = 1 << bits_per_pixel; // 256, 1024, 4096, 16384, 65536
+  int lookup_size = bits_per_pixel <= 16 ? 1 << bits_per_pixel : 0; // 256, 1024, 4096, 16384, 65536; float: n/a
   real_lookup_size = (pixelsize == 1) ? 256 : 65536; // avoids lut overflow in case of non-standard content of a 10 bit clip
-  int max_pixel_value = (1 << bits_per_pixel) - 1;
+  int max_pixel_value = bits_per_pixel <= 16 ? (1 << bits_per_pixel) - 1 : 0; // float: n/a
 
   use_lut = bits_per_pixel != 32; // for float: realtime only
 
@@ -812,6 +812,7 @@ void Levels::processFloat(PVideoFrame& frame)
 
 AVSValue __cdecl Levels::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "Levels", { { 1, "input_low" }, { 2, "gamma" }, { 3, "input_high" }, { 4, "output_low" }, { 5, "output_high" } }, env);
   enum { CHILD, IN_MIN, GAMMA, IN_MAX, OUT_MIN, OUT_MAX, CORING, DITHER };
   return new Levels( args[CHILD].AsClip(), (float)args[IN_MIN].AsFloat(), (float)args[GAMMA].AsFloat(), (float)args[IN_MAX].AsFloat(),
     (float)args[OUT_MIN].AsFloat(), (float)args[OUT_MAX].AsFloat(), args[CORING].AsBool(true), args[DITHER].AsBool(false), env );
@@ -1020,12 +1021,19 @@ static void fill_accum_rgb_planar_c(const BYTE *srcpR, const BYTE* srcpG, const 
     }
 }
 
+// Histogram bin of a float pixel. clamp keeps NaN, and casting that to int would give a wild index.
+static AVS_FORCEINLINE int float_to_accum_index(float v)
+{
+  const float x = v * 65535.0f + 0.5f;
+  return std::isnan(x) ? 0 : (int)clamp(x, 0.0f, 65535.0f);
+}
+
 static void fill_accum_rgb_planar_float_c(const BYTE* srcpR, const BYTE* srcpG, const BYTE* srcpB, int pitch,
   unsigned int* accum_r, unsigned int* accum_g, unsigned int* accum_b,
   int width, int height, RGBStats &rgbplanedata) {
 
   for (int i = 0; i < 3; i++) {
-    rgbplanedata.data[i].real_max = std::numeric_limits<float>::min();
+    rgbplanedata.data[i].real_max = std::numeric_limits<float>::lowest();
     rgbplanedata.data[i].real_min = std::numeric_limits<float>::max();
     rgbplanedata.data[i].sum = 0.0;
   }
@@ -1036,9 +1044,9 @@ static void fill_accum_rgb_planar_float_c(const BYTE* srcpR, const BYTE* srcpG, 
       float r = reinterpret_cast<const float*>(srcpR)[x];
       float g = reinterpret_cast<const float*>(srcpG)[x];
       float b = reinterpret_cast<const float*>(srcpB)[x];
-      int ri = (int)(clamp(r * 65535.0f + 0.5f, 0.0f, 65535.0f));
-      int gi = (int)(clamp(g * 65535.0f + 0.5f, 0.0f, 65535.0f));
-      int bi = (int)(clamp(b * 65535.0f + 0.5f, 0.0f, 65535.0f));
+      int ri = float_to_accum_index(r);
+      int gi = float_to_accum_index(g);
+      int bi = float_to_accum_index(b);
       if (r > rgbplanedata.data[0].real_max) rgbplanedata.data[0].real_max = r;
       if (r < rgbplanedata.data[0].real_min) rgbplanedata.data[0].real_min = r;
       rgbplanedata.data[0].sum += r;
@@ -1328,7 +1336,7 @@ PVideoFrame __stdcall RGBAdjust::GetFrame(int n, IScriptEnvironment* env)
           char text[512];
           const bool StatsAsInteger16 = false;
           if(StatsAsInteger16)
-            sprintf(text,
+            snprintf(text, sizeof(text),
               "At 16 bits.  Frame: %-8u (   Red   /  Green  /  Blue   )\n"
               "           Average:      ( %7.2f / %7.2f / %7.2f )\n"
               "Standard Deviation:      ( %7.2f / %7.2f / %7.2f )\n"
@@ -1346,7 +1354,7 @@ PVideoFrame __stdcall RGBAdjust::GetFrame(int n, IScriptEnvironment* env)
               Amax_r, Amax_g, Amax_b
             );
           else // stats as Float
-            sprintf(text,
+            snprintf(text, sizeof(text),
               "             Frame: %-8u (   Red   /  Green  /  Blue   )\n"
               "           Average:      ( %7.5f / %7.5f / %7.5f )\n"
               "Standard Deviation:      ( %7.5f / %7.5f / %7.5f )\n"
@@ -1438,7 +1446,7 @@ PVideoFrame __stdcall RGBAdjust::GetFrame(int n, IScriptEnvironment* env)
 
           char text[512];
           if (bits_per_pixel == 8)
-            sprintf(text,
+            snprintf(text, sizeof(text),
               "             Frame: %-8u (  Red  / Green / Blue  )\n"
               "           Average:      ( %5.2f / %5.2f / %5.2f )\n"
               "Standard Deviation:      ( %5.2f / %5.2f / %5.2f )\n"
@@ -1456,7 +1464,7 @@ PVideoFrame __stdcall RGBAdjust::GetFrame(int n, IScriptEnvironment* env)
               Amax_r, Amax_g, Amax_b
             );
           else // if (bits_per_pixel <= 16)
-            sprintf(text,
+            snprintf(text, sizeof(text),
               "             Frame: %-8u (  Red  / Green / Blue  )\n"
               "           Average:      ( %7.2f / %7.2f / %7.2f )\n"
               "Standard Deviation:      ( %7.2f / %7.2f / %7.2f )\n"
@@ -1483,6 +1491,7 @@ PVideoFrame __stdcall RGBAdjust::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl RGBAdjust::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "RGBAdjust", { { 1, "r" }, { 2, "g" }, { 3, "b" }, { 4, "a" }, { 5, "rb" }, { 6, "gb" }, { 7, "bb" }, { 8, "ab" }, { 9, "rg" }, { 10, "gg" }, { 11, "bg" }, { 12, "ag" } }, env);
   return new RGBAdjust(args[ 0].AsClip(),
                        args[ 1].AsDblDef(1.0), args[ 2].AsDblDef(1.0), args[ 3].AsDblDef(1.0), args[ 4].AsDblDef(1.0),
                        args[ 5].AsDblDef(0.0), args[ 6].AsDblDef(0.0), args[ 7].AsDblDef(0.0), args[ 8].AsDblDef(0.0),
@@ -1603,10 +1612,12 @@ void Tweak::tweak_calc_luma(BYTE *srcp, int src_pitch, float minY, float maxY, i
       else if(pixelsize == 2)
         y0 = minY + (y0 + ditherval)*(float)dcont + 256.0f*(float)dbright; // dbright parameter always 0..255. Scale to 0..255*4, 0.. 255*256
       else if(pixelsize == 4)
-        y0 = minY + (y0 + ditherval)*(float)dcont + (float)dbright / 256.0f; // dbright parameter always 0..255, scale it to 0..1
+        y0 = minY + (y0 + ditherval)*(float)dcont + y8diff_tof((float)dbright); // dbright parameter always 0..255, scale it like ConvertBits
       else // pixelsize == 1
         y0 = minY + ((y0 + ditherval)*(float)dcont + 1.0f*(float)dbright); // dbright parameter always 0..255. Scale to 0..255*4, 0.. 255*256
 
+      if constexpr (sizeof(pixel_t) != 4)
+        y0 += 0.5f; // rounding, as in the lut
       reinterpret_cast<pixel_t *>(srcp)[x] = (pixel_t)clamp(y0, minY, maxY);
       /*
       int y = int(((ii - range_low * scale_dither_luma)*_cont + _bright * scale_dither_luma + bias_dither_luma) / scale_dither_luma + range_low + 0.5); // 256 _cont & _bright param range
@@ -1637,8 +1648,8 @@ Tweak::Tweak(PClip _child, double _hue, double _sat, double _bright, double _con
 
   pixelsize = vi.ComponentSize();
   bits_per_pixel = vi.BitsPerComponent();
-  max_pixel_value = (1 << bits_per_pixel) - 1;
-  lut_size = 1 << bits_per_pixel;
+  max_pixel_value = bits_per_pixel <= 16 ? (1 << bits_per_pixel) - 1 : 0; // float: n/a
+  lut_size = bits_per_pixel <= 16 ? 1 << bits_per_pixel : 0; // float: n/a
   int safe_luma_lookup_size = (pixelsize == 1) ? 256 : 65536; // avoids lut overflow in case of non-standard content of a 10 bit clip
 
   get_limits(limits, bits_per_pixel); // tv range limits
@@ -1660,7 +1671,9 @@ Tweak::Tweak(PClip _child, double _hue, double _sat, double _bright, double _con
     // lut scale settings
     scale_dither_luma = 256; // lower 256 is dither value
     divisor_dither_luma *= 256;
-    bias_dither_luma = -(256.0f * dither_strength - 1) / 2;
+    // Float: dither_strength is already /65536, so the 1 of the integer formula would be a large DC offset.
+    // Dither values are 0..255 * dither_strength, this centres them.
+    bias_dither_luma = pixelsize == 4 ? -(255.0f * dither_strength) / 2 : -(256.0f * dither_strength - 1) / 2;
     // original bias: -127.5 or -(256.0f * dither_strength - 1) / 2;
     // dither strength =1 = (1 << (8-8))
     // dither min: int( (0*1-127.5)/256+0.5) = -0.498046875 + 0.5 = 0,001953125
@@ -1674,7 +1687,8 @@ Tweak::Tweak(PClip _child, double _hue, double _sat, double _bright, double _con
 
     scale_dither_chroma = 16; // lower 16 is dither value
     divisor_dither_chroma *= 16;
-    bias_dither_chroma = -(16.0f * dither_strength - (pixelsize==4 ? 1/256.0f : 1)) / 2; // -7.5
+    // Dither values are 0..15 * dither_strength. Float: centred, integer: -7.5 for strength=1
+    bias_dither_chroma = pixelsize == 4 ? -(15.0f * dither_strength) / 2 : -(16.0f * dither_strength - 1) / 2;
   }
 
   // Flag to skip special processing if doing all pixels
@@ -1686,22 +1700,22 @@ Tweak::Tweak(PClip _child, double _hue, double _sat, double _bright, double _con
       env->ThrowError("Tweak: bright and cont are the only options available for greyscale.");
   }
 
-  if (_startHue < 0.0 || _startHue >= 360.0)
+  if (std::isnan(_startHue) || _startHue < 0.0 || _startHue >= 360.0)
         env->ThrowError("Tweak: startHue must be greater than or equal to 0.0 and less than 360.0");
 
-  if (_endHue <= 0.0 || _endHue > 360.0)
+  if (std::isnan(_endHue) || _endHue <= 0.0 || _endHue > 360.0)
         env->ThrowError("Tweak: endHue must be greater than 0.0 and less than or equal to 360.0");
 
   if (_minSat >= _maxSat)
         env->ThrowError("Tweak: MinSat must be less than MaxSat");
 
-  if (_minSat < 0.0 || _minSat >= 150.0)
+  if (std::isnan(_minSat) || _minSat < 0.0 || _minSat >= 150.0)
         env->ThrowError("Tweak: minSat must be greater than or equal to 0 and less than 150.");
 
-  if (_maxSat <= 0.0 || _maxSat > 150.0)
+  if (std::isnan(_maxSat) || _maxSat <= 0.0 || _maxSat > 150.0)
         env->ThrowError("Tweak: maxSat must be greater than 0 and less than or equal to 150.");
 
-  if (p>=150.0 || p<0.0)
+  if (std::isnan(p) || p >= 150.0 || p < 0.0)
         env->ThrowError("Tweak: Interp must be greater than or equal to 0 and less than 150.");
 
   Sat = (int) (_sat * 512);    // 9 bits extra precision
@@ -1827,8 +1841,8 @@ Tweak::Tweak(PClip _child, double _hue, double _sat, double _bright, double _con
           const double destv = v - limits.middle_chroma;
           int iSat = Sat;
           if (allPixels || ProcessPixel(destv * uv_range_corr, destu * uv_range_corr, _startHue, _endHue, maxSat, minSat, p, iSat)) {
-            int du = int((destu*COS + destv*SIN) * iSat) >> 9; // back from the extra 9 bits Sat precision
-            int dv = int((destv*COS - destu*SIN) * iSat) >> 9;
+            int du = int((destu*COS + destv*SIN) * iSat + 0x100) >> 9; // back from the extra 9 bits Sat precision
+            int dv = int((destv*COS - destu*SIN) * iSat + 0x100) >> 9;
             du = clamp(du + limits.middle_chroma, range_low, range_high);
             dv = clamp(dv + limits.middle_chroma, range_low, range_high);
             if(pixelsize==1)
@@ -1919,8 +1933,8 @@ void Tweak::tweak_calc_chroma_impl(BYTE *srcpu, BYTE *srcpv, int src_pitch, int 
           reinterpret_cast<pixel_t *>(srcpu)[x] = (pixel_t)clamp(du, minUV, maxUV);
           reinterpret_cast<pixel_t *>(srcpv)[x] = (pixel_t)clamp(dv, minUV, maxUV);
         } else {
-          reinterpret_cast<pixel_t *>(srcpu)[x] = (pixel_t)clamp((int)(du * pixel_range), minUVi, maxUVi);
-          reinterpret_cast<pixel_t *>(srcpv)[x] = (pixel_t)clamp((int)(dv * pixel_range), minUVi, maxUVi);
+          reinterpret_cast<pixel_t *>(srcpu)[x] = (pixel_t)clamp((int)(du * pixel_range + 0.5f), minUVi, maxUVi);
+          reinterpret_cast<pixel_t *>(srcpv)[x] = (pixel_t)clamp((int)(dv * pixel_range + 0.5f), minUVi, maxUVi);
         }
       }
       else {
@@ -2024,8 +2038,8 @@ PVideoFrame __stdcall Tweak::GetFrame(int n, IScriptEnvironment* env)
               else
                 tweak_calc_luma<uint16_t, false, false>(srcp, src_pitch, minY, maxY, width, height);
             } else { // float
-              maxY = coring ? 235.0f / 256 : 1.0f; // scale into 0..1 range
-              minY = coring ? 16.0f / 256 : 0;
+              maxY = coring ? limits.tv_range_hi_luma_f : limits.full_range_hi_luma_f;
+              minY = coring ? limits.tv_range_low_luma_f : limits.full_range_low_luma_f;
               if(dither)
                 tweak_calc_luma<float, false, true>(srcp, src_pitch, minY, maxY, width, height);
               else
@@ -2184,6 +2198,7 @@ PVideoFrame __stdcall Tweak::GetFrame(int n, IScriptEnvironment* env)
 
 AVSValue __cdecl Tweak::Create(AVSValue args, void* , IScriptEnvironment* env)
 {
+    check_float_params(args, "Tweak", { { 1, "hue" }, { 2, "sat" }, { 3, "bright" }, { 4, "cont" }, { 14, "dither_strength" } }, env);
     return new Tweak(args[0].AsClip(),
         args[1].AsDblDef(0.0),     // hue
         args[2].AsDblDef(1.0),     // sat
@@ -2217,25 +2232,25 @@ MaskHS::MaskHS(PClip _child, double _startHue, double _endHue, double _maxSat, d
         env->ThrowError("MaskHS: clip must contain chroma.");
     }
 
-    if (dstartHue < 0.0 || dstartHue >= 360.0)
+    if (std::isnan(dstartHue) || dstartHue < 0.0 || dstartHue >= 360.0)
         env->ThrowError("MaskHS: startHue must be greater than or equal to 0.0 and less than 360.0");
 
-    if (dendHue <= 0.0 || dendHue > 360.0)
+    if (std::isnan(dendHue) || dendHue <= 0.0 || dendHue > 360.0)
         env->ThrowError("MaskHS: endHue must be greater than 0.0 and less than or equal to 360.0");
 
     if (dminSat >= dmaxSat)
         env->ThrowError("MaskHS: MinSat must be less than MaxSat");
 
-    if (dminSat < 0.0 || dminSat >= 150.0)
+    if (std::isnan(dminSat) || dminSat < 0.0 || dminSat >= 150.0)
         env->ThrowError("MaskHS: minSat must be greater than or equal to 0 and less than 150.");
 
-    if (dmaxSat <= 0.0 || dmaxSat > 150.0)
+    if (std::isnan(dmaxSat) || dmaxSat <= 0.0 || dmaxSat > 150.0)
         env->ThrowError("MaskHS: maxSat must be greater than 0 and less than or equal to 150.");
 
     pixelsize = vi.ComponentSize();
     bits_per_pixel = vi.BitsPerComponent();
-    max_pixel_value = (1 << bits_per_pixel) - 1;
-    lut_size = 1 << bits_per_pixel;
+    max_pixel_value = bits_per_pixel <= 16 ? (1 << bits_per_pixel) - 1 : 0; // float: n/a
+    lut_size = bits_per_pixel <= 16 ? 1 << bits_per_pixel : 0; // float: n/a
 
     get_limits(limits, bits_per_pixel);
 

@@ -297,6 +297,58 @@ Developer notes
 * sat = √((U-128)2 + (V-128)2)
 
 
+32 bit float
+------------
+
+``coring`` and ``bright`` follow the limited range rule of :doc:`ConvertBits <convertbits>`, so an 8 bit level
+means the same value as after the conversion. Dither is centred around zero. Changed in 3.7.7, the values below
+are shown in 8 bit steps (float value x 255):
+
++------------------------------------------+--------------------------------------+--------------+-----------+
+| Source (8 bit level, converted to float) | Script                               | Before       | Now       |
++==========================================+======================================+==============+===========+
+| Y 235                                    | ``Tweak()``                          | 234.08       | 235       |
++------------------------------------------+--------------------------------------+--------------+-----------+
+| Y 0                                      | ``Tweak()``                          | 15.94        | 16        |
++------------------------------------------+--------------------------------------+--------------+-----------+
+| Y 100                                    | ``Tweak(bright=128, coring=false)``  | 227.50       | 228       |
++------------------------------------------+--------------------------------------+--------------+-----------+
+| flat Y 128                               | ``Tweak(dither=true, coring=false)`` | mean 128.498 | mean 128  |
++------------------------------------------+--------------------------------------+--------------+-----------+
+| flat U 128                               | ``Tweak(dither=true, coring=false)`` | mean 128.031 | mean 128  |
++------------------------------------------+--------------------------------------+--------------+-----------+
+
+Rounding
+--------
+
+Since 3.7.7 integer results are rounded to the nearest value, on every path: with lookup table
+and with ``realcalc=true``, luma and chroma, at all bit depths. Before, these paths truncated:
+
+* ``realcalc=true`` luma, and chroma at any bit depth
+* chroma at 12-16 bit, which is always calculated
+* chroma from the lookup table without ``dither``
+
+So chroma was biased low by a part of a step, and a ``realcalc=true`` result could differ from
+the lookup table result. Output of ``Tweak`` with no change in its parameters and ``coring=false`` is
+the same as the source, as before.
+
+.. table::
+    :widths: auto
+
+    +--------------------------+------------------------------------+---------+--------------+-------+
+    | Source clip              | Call                               | Exact   | Before 3.7.7 | Now   |
+    +==========================+====================================+=========+==============+=======+
+    | YV24, U = V = 141        | ``Tweak(sat=1.2)``                 | 143.6   | 143          | 144   |
+    +--------------------------+------------------------------------+---------+--------------+-------+
+    | YV24, U = V = 141        | ``Tweak(sat=1.2, realcalc=true)``  | 143.6   | 143          | 144   |
+    +--------------------------+------------------------------------+---------+--------------+-------+
+    | YUV444P16, U = V = 36096 | ``Tweak(sat=1.2)``                 | 36761.6 | 36761        | 36762 |
+    +--------------------------+------------------------------------+---------+--------------+-------+
+    | YV24, Y = 101            | ``Tweak(cont=1.1)``                | 109.5   | 110          | 110   |
+    +--------------------------+------------------------------------+---------+--------------+-------+
+    | YV24, Y = 101            | ``Tweak(cont=1.1, realcalc=true)`` | 109.5   | 109          | 110   |
+    +--------------------------+------------------------------------+---------+--------------+-------+
+
 Changelog
 ---------
 
@@ -306,6 +358,11 @@ Changelog
     +-----------------+-------------------------------------------------------+
     | Version         | Changes                                               |
     +=================+=======================================================+
+    | 3.7.7           | Rounding of integer results on all paths.             |
+    +-----------------+-------------------------------------------------------+
+    | AviSynth+ 3.7.7 | 32 bit float: ``coring``, ``bright`` and ``dither``   |
+    |                 | fixed, see the table above.                           |
+    +-----------------+-------------------------------------------------------+
     | AviSynth r2487  || Added Luma LUT for 10-16 bits, Chroma LUT for 10 bit |
     |                 |  (old: LUT 8 bit only).                               |
     |                 || Added ``dither_strength`` parameter.                 |
@@ -323,7 +380,7 @@ Changelog
     | AviSynth 2.5.3  | Added ``coring`` parameter.                           |
     +-----------------+-------------------------------------------------------+
 
-$Date: 2022/09/17 15:28:44 $
+$Date: 2026/11/05 14:00:00 $
 
 .. _autoscaling:
     http://avisynth.nl/index.php/Autoscale_parameter

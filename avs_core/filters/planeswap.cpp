@@ -414,7 +414,7 @@ PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
     auto props = env->getFramePropsRW(dst);
     env->propDeleteKey(props, "_ChromaLocation");
     if (mode == AToY8)
-      env->propSetInt(props, "_ColorRange", ColorRange_Compat_e::AVS_COLORRANGE_FULL, AVSPropAppendMode::PROPAPPENDMODE_REPLACE);
+      env->propSetInt(props, "_Range", ColorRange_e::AVS_RANGE_FULL, AVSPropAppendMode::PROPAPPENDMODE_REPLACE);
     return dst;
   }
 
@@ -442,8 +442,8 @@ PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
     env->propDeleteKey(props, "_ChromaLocation");
     // keep _Matrix (?) fixme: really?
     if (mode == AToY8) // alpha is always full range, otherwise keep source
-      env->propSetInt(props, "_ColorRange", ColorRange_Compat_e::AVS_COLORRANGE_FULL, AVSPropAppendMode::PROPAPPENDMODE_REPLACE);
-    // else we keep _ColorRange value (if any)
+      env->propSetInt(props, "_Range", ColorRange_e::AVS_RANGE_FULL, AVSPropAppendMode::PROPAPPENDMODE_REPLACE);
+    // else we keep _Range value (if any)
     return sub;
   }
 
@@ -523,6 +523,20 @@ PVideoFrame __stdcall SwapUVToY::GetFrame(int n, IScriptEnvironment* env)
     fill_chroma<float>(dstp_u, dstp_v, height, rowsize, pitch, grey_val);
   }
 
+  // Output size follows chroma: source alpha may not fit, always opaque
+  if (vi.IsYUVA()) {
+    BYTE* dstp_a = dst->GetWritePtr(PLANAR_A);
+    const int pitch_a = dst->GetPitch(PLANAR_A);
+    const int height_a = dst->GetHeight(PLANAR_A);
+    const int rowsize_a = dst->GetRowSize(PLANAR_A);
+    if (vi.ComponentSize() == 1)
+      fill_plane<BYTE>(dstp_a, height_a, rowsize_a, pitch_a, 255);
+    else if (vi.ComponentSize() == 2)
+      fill_plane<uint16_t>(dstp_a, height_a, rowsize_a, pitch_a, (uint16_t)((1 << vi.BitsPerComponent()) - 1));
+    else
+      fill_plane<float>(dstp_a, height_a, rowsize_a, pitch_a, 1.0f);
+  }
+
   return dst;
 }
 
@@ -554,7 +568,12 @@ SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScr
     env->ThrowError("YToUV: Only Y, YA, YUV or YUVA data accepted");
   }
 
+  // The planes are copied as they are, so a source with other sample storage would not fit the output frame
   const VideoInfo& vi2 = clip->GetVideoInfo();
+  if (!vi2.IsYUV() && !vi2.IsYUVA())
+    env->ThrowError("YToUV: V clip: only Y, YA, YUV or YUVA data accepted");
+  if (vi.BitsPerComponent() != vi2.BitsPerComponent())
+    env->ThrowError("YToUV: different U and V clip bit depth");
   if (vi.height != vi2.height)
     env->ThrowError("YToUV: Clips do not have the same height (U & V mismatch) !");
   if (vi.width != vi2.width)
@@ -585,6 +604,10 @@ SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScr
 
   // Y clip parameter exists, Y channel will be copied from that
   const VideoInfo& vi3 = clipY->GetVideoInfo();
+  if (!vi3.IsYUV() && !vi3.IsYUVA())
+    env->ThrowError("YToUV: Y clip: only Y, YA, YUV or YUVA data accepted");
+  if (vi.BitsPerComponent() != vi3.BitsPerComponent())
+    env->ThrowError("YToUV: different U and Y clip bit depth");
   if (vi.IsYUY2() != vi3.IsYUY2())
     env->ThrowError("YToUV: YUY2 Clips must have same colorspace (UV & Y mismatch) !");
 
@@ -598,7 +621,12 @@ SwapYToUV::SwapYToUV(PClip _child, PClip _clip, PClip _clipY, PClip _clipA, IScr
   }
 
   if (clipA) {
+    // packed RGB with alpha: an intermediate ExtractA gives a greyscale clip in top-down row order
+    if (clipA->GetVideoInfo().IsRGB32() || clipA->GetVideoInfo().IsRGB64())
+      clipA = new SwapUVToY(clipA, SwapUVToY::AToY8, env);
     const VideoInfo& vi4 = clipA->GetVideoInfo();
+    if (!(vi4.IsYUV() || vi4.IsYUVA() || vi4.IsPlanarRGBA()) || vi4.IsYUY2())
+      env->ThrowError("YToUV: A clip: only Y, YA, YUV, YUVA, planar RGBA, RGB32 or RGB64 data accepted");
     if (vi4.width != vi3.width || vi4.height != vi3.height) // Y width == A width
       env->ThrowError("YToUV: different Y and A clip dimensions");
     if(vi4.BitsPerComponent() != vi3.BitsPerComponent())
@@ -709,8 +737,9 @@ PVideoFrame __stdcall SwapYToUV::GetFrame(int n, IScriptEnvironment* env) {
     src->GetReadPtr(PLANAR_Y), src->GetPitch(PLANAR_Y), src->GetRowSize(PLANAR_Y), src->GetHeight(PLANAR_Y));
 
   if (clipA) {
-    int source_plane = (clipA->GetVideoInfo().IsPlanarRGBA() ||
-      clipA->GetVideoInfo().IsYUVA()) ? PLANAR_A : PLANAR_Y;
+    const VideoInfo& vi4 = clipA->GetVideoInfo();
+    // own alpha plane if any (IsYUVA includes YA)
+    const int source_plane = (vi4.IsPlanarRGBA() || vi4.IsYUVA()) ? PLANAR_A : PLANAR_Y;
     src = clipA->GetFrame(n, env);
     env->BitBlt(dst->GetWritePtr(PLANAR_A), dst->GetPitch(PLANAR_A),
       src->GetReadPtr(source_plane), src->GetPitch(source_plane), src->GetRowSize(source_plane), src->GetHeight(source_plane));
@@ -724,19 +753,31 @@ PVideoFrame __stdcall SwapYToUV::GetFrame(int n, IScriptEnvironment* env) {
   }
 
   // if no Y script was given, fill Y plane with neutral value
-  // Luma = 126 (0x7e)
+  // Luma = 126 (0x7e) in 8 bit limited range, converted to the actual bit depth like ConvertBits does:
+  // a shift for integers, y8tof for float.
   BYTE* dstp = dst->GetWritePtr(PLANAR_Y);
   int rowsize = dst->GetRowSize(PLANAR_Y);
   int pitch = dst->GetPitch(PLANAR_Y);
 
   if (vi.ComponentSize() == 1)  // 8bit
     fill_plane<BYTE>(dstp, vi.height, rowsize, pitch, 0x7e);
-  else if (vi.ComponentSize() == 2) { // 16bit
-    uint16_t luma_val = 0x7e << (vi.BitsPerComponent() - 8);
-    fill_plane<uint16_t>(dstp, vi.height, rowsize, pitch, luma_val);
-  }
-  else { // 32bit(float)
-    fill_plane<float>(dstp, vi.height, rowsize, pitch, 126.0f / 256);
+  else if (vi.ComponentSize() == 2) // 16bit
+    fill_plane<uint16_t>(dstp, vi.height, rowsize, pitch, (uint16_t)(0x7e << (vi.BitsPerComponent() - 8)));
+  else // 32bit(float)
+    fill_plane<float>(dstp, vi.height, rowsize, pitch, y8tof(0x7e));
+
+  // No Y clip means no alpha clip either. A YUVA clipU keeps its format, so make the alpha plane fully opaque.
+  if (vi.IsYUVA()) {
+    dstp = dst->GetWritePtr(PLANAR_A);
+    rowsize = dst->GetRowSize(PLANAR_A);
+    pitch = dst->GetPitch(PLANAR_A);
+
+    if (vi.ComponentSize() == 1)  // 8bit
+      fill_plane<BYTE>(dstp, vi.height, rowsize, pitch, 255);
+    else if (vi.ComponentSize() == 2) // 16bit
+      fill_plane<uint16_t>(dstp, vi.height, rowsize, pitch, (uint16_t)((1 << vi.BitsPerComponent()) - 1));
+    else // 32bit(float)
+      fill_plane<float>(dstp, vi.height, rowsize, pitch, 1.0f);
   }
 
   return dst;
@@ -1314,8 +1355,8 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
       bool fullRange;
       {
         const AVSMap* props = env->getFramePropsRO(src);
-        if (env->propNumElements(props, "_ColorRange") > 0)
-          fullRange = env->propGetIntSaturated(props, "_ColorRange", 0, nullptr) == ColorRange_Compat_e::AVS_COLORRANGE_FULL;
+        if (env->propNumElements(props, "_Range") > 0)
+          fullRange = env->propGetIntSaturated(props, "_Range", 0, nullptr) == ColorRange_e::AVS_RANGE_FULL;
         else
           fullRange = vi.IsRGB(); // YUV default false, RGB true
       }
@@ -1327,7 +1368,7 @@ PVideoFrame __stdcall CombinePlanes::GetFrame(int n, IScriptEnvironment* env) {
           (uint16_t)(isChroma ? (1 << (bits_per_pixel - 1)) : isAlpha ? ((1 << bits_per_pixel) - 1) : fullRange ? 0 : (16 << (bits_per_pixel - 8))));
       else
         fill_plane<float>(dstp, height, rowsize, dst_pitch,
-          isChroma ? 0.0f : isAlpha ? 1.0f : fullRange ? 0.0f : 16.0f / 255);
+          isChroma ? 0.0f : isAlpha ? 1.0f : fullRange ? 0.0f : y8tof(16));
     }
   }
 

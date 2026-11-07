@@ -140,8 +140,8 @@ Histogram::Histogram(PClip _child, Mode _mode, AVSValue _option, int _show_bits,
     }
     optionValid = option.IsFloat();
     const double factor = option.AsDblDef(100.0); // Population limit % factor
-    if (factor < 0.0 || factor > 100.0) {
-      env->ThrowError("Histogram: Levels population clamping must be between 0 and 100%");
+    if (std::isnan(factor) || factor < 0.0 || factor > 100.0) {
+      env->ThrowError("Histogram: Levels population clamping must be between 0 and 100%%");
     }
     // put diagram on the right side
     if (keepsource) {
@@ -161,7 +161,7 @@ Histogram::Histogram(PClip _child, Mode _mode, AVSValue _option, int _show_bits,
     if (!vi.IsPlanar()) {
       env->ThrowError("Histogram: VectorScope modes (color, color2) only available in PLANAR.");
     }
-    if (vi.IsY()) {
+    if (vi.IsY() || vi.IsYA()) {
       env->ThrowError("Histogram: VectorScope modes (color, color2) are not available in greyscale.");
     }
     // put diagram on the right side
@@ -593,7 +593,7 @@ PVideoFrame Histogram::DrawModeLuma(int n, IScriptEnvironment* env) {
         for (int x = 0; x < w; x++) {
           const float pixel_f = reinterpret_cast<float*>(srcp)[x];
           const int pixel_i = (int)(pixel_f * 255.0f + 0.5f);
-          const int pixel = pixel_i << 4; // *16
+          const int pixel = (int)((unsigned)pixel_i << 4); // *16, also below 0.0
           int pixel_out = BYTE((pixel & 256) ? (255 - (pixel & 0xff)) : pixel & 0xff);
           const float pixel_out_f = pixel_out / 255.0f;
           reinterpret_cast<float*>(srcp)[x] = pixel_out_f;
@@ -727,7 +727,43 @@ static void DrawRadialLine(pixel_t* dstp, int pitch, int limit, int show_bit_shi
   }
 }
 
-// Set to black, alpha to 0.
+template<typename pixel_t>
+static pixel_t OpaqueAlpha(int bits_per_pixel)
+{
+  if constexpr (std::is_integral<pixel_t>::value)
+    return (pixel_t)((1 << bits_per_pixel) - 1);
+  else
+    return 1.0f;
+}
+
+template<typename pixel_t>
+static void SetOpaqueOutsideSource_impl(PVideoFrame& dst, int src_width, int src_height, int bits_per_pixel)
+{
+  const int height = dst->GetHeight(PLANAR_A);
+  const int pitch = dst->GetPitch(PLANAR_A);
+  const int width = dst->GetRowSize(PLANAR_A) / sizeof(pixel_t);
+  BYTE* dstp = dst->GetWritePtr(PLANAR_A);
+  const pixel_t alpha = OpaqueAlpha<pixel_t>(bits_per_pixel);
+  for (int y = 0; y < height; y++) {
+    const int start = y < src_height ? src_width : 0;
+    std::fill_n(reinterpret_cast<pixel_t*>(dstp + y * pitch) + start, width - start, alpha);
+  }
+}
+
+// Alpha is opaque everywhere outside the copied source. No-op if there is no alpha plane.
+static void SetOpaqueOutsideSource(PVideoFrame& dst, int src_width, int src_height, int bits_per_pixel)
+{
+  if (dst->GetHeight(PLANAR_A) == 0)
+    return;
+  if (bits_per_pixel == 8)
+    SetOpaqueOutsideSource_impl<uint8_t>(dst, src_width, src_height, bits_per_pixel);
+  else if (bits_per_pixel <= 16)
+    SetOpaqueOutsideSource_impl<uint16_t>(dst, src_width, src_height, bits_per_pixel);
+  else
+    SetOpaqueOutsideSource_impl<float>(dst, src_width, src_height, bits_per_pixel);
+}
+
+// Set to black, alpha to opaque.
 template<typename pixel_t>
 static void ClearArea(
   uint8_t* dstp, uint8_t* dstp_u, uint8_t* dstp_v, uint8_t* dstp_a,
@@ -736,16 +772,15 @@ static void ClearArea(
   int height, int heightUV, int heightA,
   int bits_per_pixel, bool full_range)
 {
-  pixel_t black, middle_chroma, alpha;
+  pixel_t black, middle_chroma;
+  const pixel_t alpha = OpaqueAlpha<pixel_t>(bits_per_pixel);
   if constexpr (std::is_integral<pixel_t>::value) {
     black = full_range ? 0 : (pixel_t)(16 << (bits_per_pixel - 8));
     middle_chroma = (pixel_t)(128 << (bits_per_pixel - 8));
-    alpha = 0;
   }
   else {
-    black = full_range ? 0.0f : 16.0f / 255.0f;
+    black = full_range ? 0.0f : y8tof(16);
     middle_chroma = 0.0f;
-    alpha = 0.0f;
   }
 
   // Y
@@ -806,7 +841,7 @@ PVideoFrame Histogram::VectorscopePrelude(
   if (keepsource) {
 
     if (src_height < dst_height) {
-      // in case of Histogram area is higher than source, clear the area below source copy to black + A=0
+      // in case of Histogram area is higher than source, clear the area below source copy to black + opaque alpha
       auto pdst_start = pdst + src_height * dst_pitch;
       auto pdstU_start = pdstU + src_heightUV * dst_pitchUV;
       auto pdstV_start = pdstV + src_heightUV * dst_pitchUV;
@@ -946,7 +981,7 @@ static void DrawModeColor2_draw_graticule(int bits_per_pixel, uint8_t* dstp8, in
     luma128 = (pixel_t)(128 << (bits_per_pixel - 8));
   }
   else {
-    luma128 = c8tof(128);
+    luma128 = y8tof(128);
   }
 
   const int show_bit_shift = show_bits - 8;
@@ -1014,23 +1049,23 @@ static void DrawModeColor2_draw_circle(int bits_per_pixel, uint8_t* dstp8, uint8
     81, 90, 240
   };
   float LC_f[21] = {
-    c8tof(145), uv8tof(54), uv8tof(34),
-    c8tof(145), uv8tof(54), uv8tof(34),
-    c8tof(210), uv8tof(16), uv8tof(146),
-    c8tof(210), uv8tof(16), uv8tof(146),
-    c8tof(81), uv8tof(90), uv8tof(240),
-    c8tof(81), uv8tof(90), uv8tof(240),
-    c8tof(81), uv8tof(90), uv8tof(240)
+    y8tof(145), uv8tof(54), uv8tof(34),
+    y8tof(145), uv8tof(54), uv8tof(34),
+    y8tof(210), uv8tof(16), uv8tof(146),
+    y8tof(210), uv8tof(16), uv8tof(146),
+    y8tof(81), uv8tof(90), uv8tof(240),
+    y8tof(81), uv8tof(90), uv8tof(240),
+    y8tof(81), uv8tof(90), uv8tof(240)
   };
   // cyan, 4x blue, magenta, red:
   float RC_f[21] = {
-    c8tof(170), uv8tof(166), uv8tof(16),
-    c8tof(41), uv8tof(240), uv8tof(110),
-    c8tof(41), uv8tof(240), uv8tof(110),
-    c8tof(41), uv8tof(240), uv8tof(110),
-    c8tof(41), uv8tof(240), uv8tof(110),
-    c8tof(106), uv8tof(202), uv8tof(222),
-    c8tof(81), uv8tof(90), uv8tof(240)
+    y8tof(170), uv8tof(166), uv8tof(16),
+    y8tof(41), uv8tof(240), uv8tof(110),
+    y8tof(41), uv8tof(240), uv8tof(110),
+    y8tof(41), uv8tof(240), uv8tof(110),
+    y8tof(41), uv8tof(240), uv8tof(110),
+    y8tof(106), uv8tof(202), uv8tof(222),
+    y8tof(81), uv8tof(90), uv8tof(240)
   };
 
   // example boundary of cyan and blue:
@@ -1140,7 +1175,7 @@ static void DrawModeColor2_draw_circle(int bits_per_pixel, uint8_t* dstp8, uint8
     else if constexpr (sizeof(pixel_t) == 2)
       dstp[deg15c[i] + deg15s[i] * pitch] = 235 << (bits_per_pixel - 8); // 235: Y-maxluma
     else // if constexpr (sizeof(pixel_t) == 4)
-      dstp[deg15c[i] + deg15s[i] * pitch] = c8tof(235); // 235: Y-maxluma
+      dstp[deg15c[i] + deg15s[i] * pitch] = y8tof(235); // 235: Y-maxluma
   }
 
 }
@@ -1251,8 +1286,9 @@ static void do_vectorscope_color2(
             const int uval = max(0, min(max_value, (int)pU[x]));
             const int vval = max(0, min(max_value, (int)pV[x]));
 
-            const int uval_posindex = (uval + rounder) >> shift;
-            const int vval_posindex = (vval + rounder) >> shift;
+            // rounding can reach 1 << show_bits
+            const int uval_posindex = min(max_pos, (uval + rounder) >> shift);
+            const int vval_posindex = min(max_pos, (vval + rounder) >> shift);
 
             pdstb[uval_posindex + vval_posindex * dst_pitch] = pY[x << swidth];
             pdstbU[(uval_posindex >> swidth) + (vval_posindex >> sheight) * dst_pitchUV] = (pixel_t)uval;
@@ -1405,7 +1441,7 @@ static void Draw_VectorScope_circle_targets_axes(int bits_per_pixel,
     box_v = (pixel_t)(120 << (bits_per_pixel - 8));
   }
   else {
-    box_luma = c8tof(80);
+    box_luma = y8tof(80);
     box_u = uv8tof(140);
     box_v = uv8tof(120);
   }
@@ -1491,7 +1527,7 @@ static void Draw_VectorScope_circle_targets_axes(int bits_per_pixel,
   if constexpr (std::is_integral<pixel_t>::value)
     line_luma = (pixel_t)(120 << (bits_per_pixel - 8));
   else
-    line_luma = c8tof(120);
+    line_luma = y8tof(120);
 
   // Angles to draw(matching PPro vectorscope) :
   // 0°, 90°, 180°, 270° — the axis cross
@@ -1547,7 +1583,7 @@ PVideoFrame Histogram::DrawModeColor2(int n, IScriptEnvironment* env) {
   int swidth = vi.GetPlaneWidthSubsampling(PLANAR_U);
   int sheight = vi.GetPlaneHeightSubsampling(PLANAR_U);
 
-  // Clear Vectorscope area (black background, init Alpha to 0 if present)
+  // Clear Vectorscope area (black background, opaque alpha if present)
   if (bits_per_pixel == 8)
     DrawModeColor2_ClearVectorscopeArea<uint8_t>(bits_per_pixel,
       panel, panelU, panelV, panelA,
@@ -1743,6 +1779,8 @@ PVideoFrame Histogram::DrawModeColor(int n, IScriptEnvironment* env) {
     dst_pitchUV, dst_heightUV,
     dst_pitchA, dst_heightA,
     panel, panelU, panelV, panelA);
+
+  SetOpaqueOutsideSource(dst, keepsource ? origwidth : 0, keepsource ? src->GetHeight() : 0, bits_per_pixel);
 
   // always planar
 
@@ -1982,7 +2020,7 @@ PVideoFrame Histogram::DrawModeLevels(int n, IScriptEnvironment* env) {
 
   int show_size = 1 << show_bits;
 
-  const bool isGrey = vi.IsY();
+  const bool isGrey = vi.IsY() || vi.IsYA();
   const int planecount = isGrey ? 1 : 3;
   const bool RGB = vi.IsRGB();
   const bool isFloat = (bits_per_pixel == 32);
@@ -1996,14 +2034,15 @@ PVideoFrame Histogram::DrawModeLevels(int n, IScriptEnvironment* env) {
     RGB ? 0 : (128 << color_shift)
   };
   float plane_default_black_f[3] = {
-    RGB ? 0 : 16 / 255.0f,
+    RGB ? 0 : y8tof(16),
     RGB ? 0 : 0.0f,
     RGB ? 0 : 0.0f
   };
 
   const int planesYUV[4] = { PLANAR_Y, PLANAR_U, PLANAR_V, PLANAR_A};
   const int planesRGB[4] = { PLANAR_G, PLANAR_B, PLANAR_R, PLANAR_A};
-  const int *planes = vi.IsYUV() || vi.IsYUVA() ? planesYUV : planesRGB;
+  const int planesGrey[2] = { PLANAR_Y, PLANAR_A }; // alpha only for YA
+  const int *planes = isGrey ? planesGrey : vi.IsYUV() || vi.IsYUVA() ? planesYUV : planesRGB;
 
   if (keepsource) {
     if (src->GetHeight() < dst->GetHeight()) {
@@ -2017,8 +2056,7 @@ PVideoFrame Histogram::DrawModeLevels(int n, IScriptEnvironment* env) {
       case 4: std::fill_n((float *)(dstp + fillStart), fillSize / sizeof(float), plane_default_black_f[0]); break;
       }
 
-      // first plane is already processed
-      // dont't touch Alpha
+      // first plane is already processed, alpha is set below
       for (int p = 1; p < planecount; p++) {
         const int plane = planes[p];
         BYTE* ptr = dst->GetWritePtr(plane);
@@ -2033,6 +2071,9 @@ PVideoFrame Histogram::DrawModeLevels(int n, IScriptEnvironment* env) {
       }
     }
   }
+
+  if (vi.IsPlanar())
+    SetOpaqueOutsideSource(dst, keepsource ? origwidth : 0, keepsource ? src->GetHeight() : 0, bits_per_pixel);
 
   // counters
   int bufsize = sizeof(uint32_t)*show_size;
@@ -2194,7 +2235,7 @@ PVideoFrame Histogram::DrawModeLevels(int n, IScriptEnvironment* env) {
         const float dst_offset_plus_round = d.dst_offset + 0.5f;
         for (int y = 0; y < h; y++) {
           for (int x = 0; x < w; x++) {
-            hist[clamp((int)(srcp32[x] * d.mul_factor + dst_offset_plus_round), 0, max_show_pixel_value)]++;
+            hist[clamp((int)((srcp32[x] - d.src_offset) * d.mul_factor + dst_offset_plus_round), 0, max_show_pixel_value)]++;
           }
           srcp32 += pitch;
         }
@@ -2233,7 +2274,7 @@ PVideoFrame Histogram::DrawModeLevels(int n, IScriptEnvironment* env) {
       if (!RGB && markers) {
         // Draw Unsafe zone (Y-graph)
         const int color_unsafeZones[3] = { 32, 16, 160 };
-        const float color_unsafeZones_f[3] = { c8tof(32), uv8tof(16), uv8tof(160) };
+        const float color_unsafeZones_f[3] = { y8tof(32), uv8tof(16), uv8tof(160) };
         int color_usz = color_unsafeZones[p];
         int color_i = color_usz << color_shift;
         float color_f = color_unsafeZones_f[p];
@@ -2306,8 +2347,8 @@ PVideoFrame Histogram::DrawModeLevels(int n, IScriptEnvironment* env) {
             // lower: x=0-16, R=0, G=B=255; x=128, R=G=B=0; x=240-255, R=255, G=B=0
               const int color1_upper_lower_gradient[2][3] = { { 210 / 2, 16 + 112 / 2, 128 },{ 170 / 2, 128, 16 + 112 / 2 } };
               const int color2_upper_lower_gradient[2][3] = { { 41 / 2, 240 - 112 / 2, 128 },{ 81 / 2, 128, 240 - 112 / 2 } };
-              float color1_upper_lower_gradient_f[2][3] = { { c8tof(210 / 2), uv8tof(16 + 112 / 2), uv8tof(128) },{ c8tof(170 / 2), uv8tof(128), uv8tof(16 + 112 / 2) } };
-              float color2_upper_lower_gradient_f[2][3] = { { c8tof(41 / 2), uv8tof(240 - 112 / 2), uv8tof(128) },{ c8tof(81 / 2), uv8tof(128), uv8tof(240 - 112 / 2) } };
+              float color1_upper_lower_gradient_f[2][3] = { { y8tof(210 / 2), uv8tof(16 + 112 / 2), uv8tof(128) },{ y8tof(170 / 2), uv8tof(128), uv8tof(16 + 112 / 2) } };
+              float color2_upper_lower_gradient_f[2][3] = { { y8tof(41 / 2), uv8tof(240 - 112 / 2), uv8tof(128) },{ y8tof(81 / 2), uv8tof(128), uv8tof(240 - 112 / 2) } };
               int color = color1_upper_lower_gradient[gradient_upper_lower][p];
               int color_i = color << color_shift;
               float color_f = color1_upper_lower_gradient_f[gradient_upper_lower][p];
@@ -2610,6 +2651,7 @@ PVideoFrame Histogram::DrawModeClassic(int n, IScriptEnvironment* env)
       // preserve alpha. no-op if no alpha (0 pitch/rowsize/height)
       env->BitBlt(dst->GetWritePtr(PLANAR_A), dst->GetPitch(PLANAR_A), src->GetReadPtr(PLANAR_A), src->GetPitch(PLANAR_A), src->GetRowSize(PLANAR_A), src->GetHeight(PLANAR_A));
     }
+    SetOpaqueOutsideSource(dst, xstart, keepsource ? src->GetHeight() : 0, bits_per_pixel);
 
     // luma
     const int height = src->GetHeight(PLANAR_Y);
@@ -2648,7 +2690,8 @@ PVideoFrame Histogram::DrawModeClassic(int n, IScriptEnvironment* env)
       {
         // float
         const float *srcp32 = reinterpret_cast<const float *>(srcp);
-        const float multiplier = (float)(show_size - 1);
+        // limited range: same position as the shift at integer bit depths, 235 is 235 << (show_bits - 8)
+        const float multiplier = full_range ? (float)(show_size - 1) : (float)(255 << (show_bits - 8));
         for (int x = 0; x < source_width; x++) {
           hist[(intptr_t)(clamp(srcp32[x], 0.0f, 1.0f)*multiplier + 0.5f)]++; // luma, no shift needed
         }

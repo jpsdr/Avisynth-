@@ -1178,6 +1178,9 @@ static bool PropNamesToArray(const char* filtername, AVSValue& _propNames, std::
     // - regex with ^ $ delimiters
 
     std::string nameStr(name);
+    // the frame holds it as _Range
+    if (nameStr == "_ColorRange")
+      nameStr = "_Range";
 
     // Check if it's already a regex
     if (nameStr.front() == '^' && nameStr.back() == '$') {
@@ -1638,12 +1641,13 @@ PVideoFrame __stdcall ShowProperties::GetFrame(int n, IScriptEnvironment* env)
         if (propNumElements > 1)
           ss << "]";
 
-        if (propName_s == "_ColorRange") {
+        if (propName_s == "_Range") {
           ss << " = ";
           switch (arr[0]) {
-          case ColorRange_Compat_e::AVS_COLORRANGE_LIMITED: ss << "limited"; break;
-          case ColorRange_Compat_e::AVS_COLORRANGE_FULL: ss << "full"; break;
+          case ColorRange_e::AVS_RANGE_LIMITED: ss << "limited"; break;
+          case ColorRange_e::AVS_RANGE_FULL: ss << "full"; break;
           }
+          ss << " (_ColorRange = " << std::to_string(range_value_flip(arr[0])) << ")";
         }
         else if (propName_s == "_Matrix") {
           ss << " = ";
@@ -1750,6 +1754,7 @@ int __stdcall ShowProperties::SetCacheHints(int cachehints, int frame_range)
 
 AVSValue __cdecl ShowProperties::Create(AVSValue args, void*, IScriptEnvironment* env)
 {
+  check_float_params(args, "propShow", { { 7, "x" }, { 8, "y" } }, env);
   // 0   1        2       3         4             5        6     7   8     9       10
   // c[size]i[showtype]b[font]s[text_color]i[halo_color]i[bold]b[x]f[y]f[align]i[props]s+
 
