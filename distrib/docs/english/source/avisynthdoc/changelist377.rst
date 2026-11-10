@@ -17,6 +17,8 @@ Additions, changes
 
 Build environment, Interface
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- Interface version 14.1 (``AVISYNTHPLUS_INTERFACE_BUGFIX_VERSION`` 1), no API change: it marks the ``_Range`` /
+  ``_ColorRange`` alias. C API loader: new ``has_at_least_v14_1``.
 - Fix: GCC build with LTO (link-time optimization) failed with "inlining failed in call to 'always_inline'
   ... target specific option mismatch" in the SSE4.1 Overlay/Layer mask row preparation (x86/x64).
   (`issue #531 <https://github.com/AviSynth/AviSynthPlus/issues/531>`_)
@@ -132,9 +134,11 @@ comparing them, and by the sanitizer builds (planes left unset kept the content 
 
 Crash or hang on unusual parameters or input
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Found by AddressSanitizer (ASan) builds: memory access outside the frame or the buffer, division by zero, endless
+Mostly found by AddressSanitizer (ASan) builds: memory access outside the frame or the buffer, division by zero, endless
 loop. Most need an unusual parameter or input.
 
+- Fix: ``LoadPlugin("")`` and ``LoadCPlugin("")`` (an empty file name) terminated the whole program (uncaught
+  ``std::filesystem`` exception), now the usual "Cannot load file" error. Regression since 3.7.6.
 - Fix: RGBAdjust, ColorYUV ``analyze=true``: stack buffer overflow in the text of the statistics on very large float pixel
   values or on only NaN pixels.
 - Fix: RGBAdjust ``analyze=true``, planar RGB 32 bit float: crash on NaN pixels, which can come from ``Expr`` or from a NaN parameter.

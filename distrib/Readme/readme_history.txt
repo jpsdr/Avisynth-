@@ -40,6 +40,10 @@ Additions, changes:
 - Subtitle(gdi=true): the chroma processing range has a one chroma block margin, for the same reason.
 
 Build environment:
+- Interface version 14.1: AVISYNTHPLUS_INTERFACE_BUGFIX_VERSION = 1 (avisynth.h, avisynth_c.h), no API change.
+  It marks the _Range / _ColorRange alias, so a plugin can check whether the AviSynth it runs on understands
+  _Range (before, only _ColorRange): AEP_INTERFACE_VERSION > 14, or 14 with AEP_INTERFACE_BUGFIX >= 1.
+  C API loader: new has_at_least_v14_1.
 - Fix #531: GCC build with LTO (-flto) failed at link time on x86/x64 Linux:
   "inlining failed in call to 'always_inline' prepare_effective_mask_for_row_float_sse41: target specific
   option mismatch". The force-inlined SSE4.1 function, defined in another source file, was called from a
@@ -181,8 +185,12 @@ Bugfixes, same output on every CPU, OS and compiler:
   Existed since AviSynth+ r2487.
 
 Bugfixes, crash or hang on unusual parameters or input:
-  Found by AddressSanitizer (ASan) builds: memory access outside the frame or the buffer, division by zero, endless
+  Most of them found by AddressSanitizer (ASan) builds: memory access outside the frame or the buffer, division by zero, endless
   loop. Most need an unusual parameter or input.
+- Fix: LoadPlugin("") and LoadCPlugin("") (an empty file name) terminated the whole program: GetFullPathNameWrapUtf8
+  called the throwing std::filesystem::absolute, which throws on an empty path, and nothing caught it. It uses the
+  error_code overload now and leaves the name as it is, the caller reports "Cannot load file ''".
+  Regression since 3.7.6 (the #462 UTF-8 autoload rework); 3.7.5 gave the error.
 - Fix: RGBAdjust, ColorYUV analyze=true: stack buffer overflow in the text of the statistics on very large float pixel
   values or on only NaN pixels.
 - Fix: RGBAdjust analyze=true, planar RGB 32 bit float: crash on NaN pixels, which can come from Expr or from a NaN parameter.
