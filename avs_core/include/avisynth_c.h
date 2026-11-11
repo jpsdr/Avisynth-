@@ -191,6 +191,11 @@
 //   Check the returned pointer for NULL as well.
 // - V14: C filters registered as AVS_MT_NICE_FILTER: concurrent calls on the same instance shared the
 //   error fields, an error could be lost or reported for another frame (#519).
+// - V14: avs_add_function, avs_add_function_r on V11 (3.7.4, 3.7.5): a script call could run the callback
+//   of another function of the same plugin when several were registered with the same user_data (NULL,
+//   or on x64 any shared pointer). Only Windows builds made with MSVC or clang-cl (the official ones);
+//   MinGW, Linux and macOS builds are not affected. Workaround: give each function its own user_data
+//   pointer whose lowest byte is nonzero and differs from the others (commit 8a4edc62).
 // - V14: avs_set_to_array with a NULL src and nonzero size: before V14 do not call it this way.
 
 
@@ -1455,7 +1460,7 @@ AVSC_API(int64_t, avs_get_cpu_flags_ex)(AVS_ScriptEnvironment *); // V12
 AVSC_API(int, avs_check_version)(AVS_ScriptEnvironment *, int version);
 
 AVSC_API(char *, avs_save_string)(AVS_ScriptEnvironment *, const char* s, int length);
-AVSC_API(char *, avs_sprintf)(AVS_ScriptEnvironment *, const char * fmt, ...);
+AVSC_API_VARARGS(char *, avs_sprintf)(AVS_ScriptEnvironment *, const char * fmt, ...);
 
 AVSC_API(char *, avs_vsprintf)(AVS_ScriptEnvironment *, const char * fmt, va_list val);
 
