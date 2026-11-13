@@ -16,8 +16,9 @@
   #include <avs/posix.h>
 #endif
 
-#ifdef AVS_WINDOWS
-    #include <imagehlp.h>
+#include <algorithm>
+#if defined(AVS_HAIKU)
+#include <FindDirectory.h> // find_path, B_FIND_PATH_IMAGE_PATH; B_APP_IMAGE_SYMBOL via its image.h
 #endif
 #include "parser/script.h"
 #include "parser/expression.h" // TODO we only need FunctionInstance from here
@@ -650,20 +651,30 @@ std::string ExeFilePath;
 #ifdef AVS_WINDOWS
   // get folder of our executable as wide char and convert to UTF-8
   {
-    WCHAR ExeFilePathW[AVS_MAX_PATH];
-    // Ensure buffer is zeroed (older Windows may not null-terminate)
-    // e.g. WinXP does not terminate the result of GetModuleFileName with a zero, so me must zero our buffer
-    memset(ExeFilePathW, 0, sizeof(ExeFilePathW));
-    DWORD len = GetModuleFileNameW(NULL, ExeFilePathW, AVS_MAX_PATH);
-    if (len == 0) {
+    // A full buffer means the path may be cut (and on XP it is not zero terminated): retry with a larger one.
+    std::vector<wchar_t> ExeFilePathW(AVS_MAX_PATH);
+    DWORD len;
+    while ((len = GetModuleFileNameW(NULL, ExeFilePathW.data(), (DWORD)ExeFilePathW.size())) >= ExeFilePathW.size()
+      && ExeFilePathW.size() < 32768 * 2)
+      ExeFilePathW.assign(ExeFilePathW.size() * 2, L'\0');
+    if (len == 0 || len >= ExeFilePathW.size()) {
       // Fallback to empty string on failure
       ExeFilePath.clear();
     }
     else {
+      ExeFilePathW[len] = L'\0';
       // Convert wide-char path to UTF-8 for internal use
-      auto exe_utf8 = WideCharToUtf8(ExeFilePathW);
+      auto exe_utf8 = WideCharToUtf8(ExeFilePathW.data());
       ExeFilePath = exe_utf8.get();
     }
+  }
+#elif defined(AVS_HAIKU)
+  {
+    // Haiku API (libroot, linked by default): find_path with B_APP_IMAGE_SYMBOL refers to the program image,
+    // B_FIND_PATH_IMAGE_PATH returns the path of its file. B_BUFFER_OVERFLOW if it does not fit.
+    char buf[PATH_MAX + 1] {};
+    if (find_path(B_APP_IMAGE_SYMBOL, B_FIND_PATH_IMAGE_PATH, NULL, buf, sizeof(buf)) == B_OK)
+      ExeFilePath = buf;
   }
 #else // AVS_POSIX
   char buf[PATH_MAX + 1] {};
@@ -679,13 +690,19 @@ std::string ExeFilePath;
 #endif
   std::string ExeFileDir(ExeFilePath);
   replace(ExeFileDir, '\\', '/');
-#ifndef AVS_HAIKU
-// Haiku's exe path stuff differs enough from the *nix OSes
-// that it fails spectacularly when loading the library in a client
-// like avs2yuv or FFmpeg.  Try to skip this for now and hope
-// this doesn't cause more errors.
-  ExeFileDir = ExeFileDir.erase(ExeFileDir.rfind('/'), std::string::npos);
-#endif
+  // Earlier this cut was skipped on Haiku, with this comment:
+  //   "Haiku's exe path stuff differs enough from the *nix OSes
+  //    that it fails spectacularly when loading the library in a client
+  //    like avs2yuv or FFmpeg.  Try to skip this for now and hope
+  //    this doesn't cause more errors."
+  // Likely cause: Haiku had no path code, the path stayed empty, and erase(rfind('/')) = erase(npos) throws
+  // std::out_of_range. Now Haiku gets the path from find_path, and without a '/' (e.g. the path could not be read)
+  // PROGRAMDIR is empty on any system instead of the exception.
+  const size_t last_slash = ExeFileDir.rfind('/');
+  if (last_slash != std::string::npos)
+    ExeFileDir.erase(last_slash);
+  else
+    ExeFileDir.clear();
 #endif // !AVS_BSD
 
   // variable expansion
@@ -977,23 +994,35 @@ bool PluginManager::LoadPlugin(const char* path, bool throwOnError, AVSValue *re
   return LoadPlugin(pf, throwOnError, result);
 }
 #ifdef AVS_WINDOWS
-static bool Is64BitDLL(std::string sDLL, bool &bIs64BitDLL)
+// Reads the machine type from the PE header. Wide path: imagehlp's MapAndLoad takes only an ANSI path.
+static bool Is64BitDLL(const std::wstring& path_w, bool &bIs64BitDLL)
 {
   bIs64BitDLL = false;
-  LOADED_IMAGE li;
-
-  if (!MapAndLoad((LPSTR)sDLL.c_str(), NULL, &li, TRUE, TRUE))
-  {
-    //error handling (check GetLastError())
+  HANDLE h = CreateFileW(path_w.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE)
     return false;
+
+  bool ok = false;
+  IMAGE_DOS_HEADER dos;
+  DWORD read = 0;
+  if (ReadFile(h, &dos, sizeof(dos), &read, NULL) && read == sizeof(dos) &&
+    dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0)
+  {
+    LARGE_INTEGER pos;
+    pos.QuadPart = dos.e_lfanew;
+    DWORD signature = 0;
+    IMAGE_FILE_HEADER file_header;
+    if (SetFilePointerEx(h, pos, NULL, FILE_BEGIN) &&
+      ReadFile(h, &signature, sizeof(signature), &read, NULL) && read == sizeof(signature) &&
+      signature == IMAGE_NT_SIGNATURE &&
+      ReadFile(h, &file_header, sizeof(file_header), &read, NULL) && read == sizeof(file_header))
+    {
+      bIs64BitDLL = file_header.Machine != IMAGE_FILE_MACHINE_I386; // 64 bit image
+      ok = true;
+    }
   }
-
-  if (li.FileHeader->FileHeader.Machine != IMAGE_FILE_MACHINE_I386) //64 bit image
-    bIs64BitDLL = true;
-
-  UnMapAndLoad(&li);
-
-  return true;
+  CloseHandle(h);
+  return ok;
 }
 #endif //AVS_WINDOWS
 bool PluginManager::LoadPlugin(PluginFile &plugin, bool throwOnError, AVSValue *result)
@@ -1015,13 +1044,17 @@ bool PluginManager::LoadPlugin(PluginFile &plugin, bool throwOnError, AVSValue *
   plugin.isPluginC = false;
 
 #ifdef AVS_WINDOWS
+  // FilePath is UTF-8: use the wide API, the ANSI one would read it in the ANSI code page.
+  // LOAD_WITH_ALTERED_SEARCH_PATH needs backslashes.
+  std::wstring path_w = Utf8ToWideChar(plugin.FilePath.c_str()).get();
+  std::replace(path_w.begin(), path_w.end(), L'/', L'\\');
+
   // Search for dependent DLLs in the plugin's directory too
-  size_t slash_pos = plugin.FilePath.rfind('/');
-  std::string plugin_dir = plugin.FilePath.substr(0, slash_pos);;
-  DllDirChanger dllchange(plugin_dir.c_str());
+  std::wstring plugin_dir_w = path_w.substr(0, path_w.rfind(L'\\'));
+  DllDirChanger dllchange(plugin_dir_w.c_str());
 
   // Load the dll into memory
-  plugin.Library = LoadLibraryEx(plugin.FilePath.c_str(), 0, LOAD_WITH_ALTERED_SEARCH_PATH);
+  plugin.Library = LoadLibraryExW(path_w.c_str(), 0, LOAD_WITH_ALTERED_SEARCH_PATH);
   if (plugin.Library == NULL)
   {
     DWORD errCode = GetLastError();
@@ -1029,7 +1062,7 @@ bool PluginManager::LoadPlugin(PluginFile &plugin, bool throwOnError, AVSValue *
     // Bitness mixing always throws an error, regardless of throwOnError state
     // By this new behaviour even plugin auto-load will fail
     bool bIs64BitDLL;
-    bool succ = Is64BitDLL(plugin.FilePath, bIs64BitDLL);
+    bool succ = Is64BitDLL(path_w, bIs64BitDLL);
     if (succ) {
       const bool selfIs32 = sizeof(void *) == 4;
       if (selfIs32 && bIs64BitDLL)

@@ -612,9 +612,11 @@ template<ConversionDirection direction, typename pixel_t, bool lessthan16bit, bo
 static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], const BYTE* srcp[3], const int srcPitch[3], int width, int height, const ConversionMatrix& m,
   int bits_per_pixel, int bits_per_pixel_target)
 {
-  // int64_t needed for exact 16 bit pixels in integer workflow
+  // Integer workflow is int32 for all bit depths. Exact 16 bit uses the pivot of the SSE2/AVX2 paths:
+  // the luma/RGB input is moved to the signed range (pixel - 32768), the (32768 + offset_in) * coefficient
+  // part goes into a constant per output. No int64 is needed, so compilers can vectorize it (4 x int32 lanes).
   // float input always uses float workflow
-  typedef typename std::conditional<sizeof(pixel_t) == 1 || lessthan16bit, int, int64_t>::type safe_int_t;
+  typedef int safe_int_t;
 
   // Remark: for RGB->YUV and RGB->Y 16 bit original, we later redirect the constexpr values to a full-float-workflow.
   // Though int64_t would work here in C just fine, but has serious performance issues at Intel SIMD,
@@ -633,6 +635,11 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
   constexpr bool would_need_64bit_v_patch = !lessthan16bit && !final_is_float && (INT_ARITH_SHIFT == 15);
   // RGB_TO_YUV, RGB_TO_Y 16 bit origin case needs 64 bit extension at one point to avoid overflow
   // but it makes it much slower than the full-float path, so we force float path for that case as well
+
+  // Float output always uses the float workflow (the dispatcher passes FORCE_FLOAT): more exact and not slower
+  // than an integer matrix + conversion, and no int32 overflow (16 bit limited RGB to full range scales the
+  // coefficients by 255/219). So the integer workflow below never has a float target.
+  static_assert(!final_is_float || conv_type == YuvRgbConversionType::FORCE_FLOAT, "float target: FORCE_FLOAT only");
 
   // effectively full-float-inside for int full range conversion, but with the same output rules as other float conversions
   constexpr bool force_float = (conv_type == YuvRgbConversionType::FORCE_FLOAT) || would_need_64bit_v_patch;
@@ -653,9 +660,8 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
 
   const int bit_diff = need_int_conversion ? bits_per_pixel_target - bits_per_pixel : 0;
   const int target_shift = need_int_conversion_narrow_range ? INT_ARITH_SHIFT - bit_diff : INT_ARITH_SHIFT;
-  const int ROUNDER = (final_is_float || float_matrix_workflow) ? 0 : (1 << (target_shift - 1));
+  const int ROUNDER = float_matrix_workflow ? 0 : (1 << (target_shift - 1));
 
-  const float out_offset_f = m.offset_out_f_32;
   const int half_pixel_offset = 1 << (bits_per_pixel - 1);
   const int half_pixel_offset_target = 1 << (bits_per_pixel_target - 1);
   const int max_pixel_value_target = bits_per_pixel_target <= 16 ? (1 << bits_per_pixel_target) - 1 : 0; // float: n/a
@@ -664,10 +670,7 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
   const bool full_scale_d = m.full_scale_d;
   get_bits_conv_constants(conversion_ranges, false, full_scale_d, full_scale_d, bits_per_pixel, bits_per_pixel_target);
 
-  constexpr int int_arithmetic_shift = 1 << INT_ARITH_SHIFT;
   float scale_f = conversion_ranges.mul_factor;
-  if (final_is_float && !float_matrix_workflow)
-    scale_f = scale_f / int_arithmetic_shift;
 
   const int offset_in_scalar = m.offset_in;
   const int offset_out_scalar = m.offset_out;
@@ -675,9 +678,63 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
   int round_mask_plus_offset_out_i;
   int round_mask_plus_offset_out_chroma_i;
 
+  // Integer workflow: rounder + output offset (+ exact 16 bit: the pivot patch) per output
+  int round_and_offset_0 = 0, round_and_offset_1 = 0, round_and_offset_2 = 0;
   if constexpr (!float_matrix_workflow) {
-    round_mask_plus_offset_out_i = final_is_float ? 0 : ROUNDER + (offset_out_scalar << INT_ARITH_SHIFT);
-    round_mask_plus_offset_out_chroma_i = final_is_float ? 0 : ROUNDER + (half_pixel_offset << INT_ARITH_SHIFT);
+    round_mask_plus_offset_out_i = ROUNDER + (offset_out_scalar << INT_ARITH_SHIFT);
+    round_mask_plus_offset_out_chroma_i = ROUNDER + (half_pixel_offset << INT_ARITH_SHIFT);
+
+    if constexpr (direction == ConversionDirection::RGB_TO_YUV || direction == ConversionDirection::YUV_TO_YUV) {
+      round_and_offset_0 = round_mask_plus_offset_out_i; // Y
+      round_and_offset_1 = round_mask_plus_offset_out_chroma_i; // U
+      round_and_offset_2 = round_mask_plus_offset_out_chroma_i; // V
+    }
+    else { // YUV_TO_RGB, RGB_TO_RGB: same offset for all; RGB_TO_Y: Y only
+      round_and_offset_0 = round_and_offset_1 = round_and_offset_2 = round_mask_plus_offset_out_i;
+    }
+
+    if constexpr (!lessthan16bit) {
+      // exact 16 bit pivot: coef * (pixel + offset_in) = coef * (pixel - 32768) + coef * (32768 + offset_in)
+      // Chroma inputs are already centered (pixel - 32768), they need no patch.
+      const int pivot = 32768 + offset_in_scalar;
+      if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::YUV_TO_YUV) {
+        // YUV input: only Y (in0) is pivoted
+        round_and_offset_0 += pivot * m.y_g;
+        round_and_offset_1 += pivot * m.y_b;
+        round_and_offset_2 += pivot * m.y_r;
+      }
+      else { // RGB_TO_YUV, RGB_TO_RGB, RGB_TO_Y: G, B and R are pivoted
+        round_and_offset_0 += pivot * (m.y_g + m.y_b + m.y_r);
+        round_and_offset_1 += pivot * (m.u_g + m.u_b + m.u_r);
+        round_and_offset_2 += pivot * (m.v_g + m.v_b + m.v_r);
+      }
+    }
+  }
+
+  // Float workflow: coefficients pre-multiplied by scale_f, output offsets scaled, summed in the same
+  // order as SSE2: ((k0*in0 + offset) + k1*in1) + k2*in2. Bit identical to SSE2 (AVX2 may fuse to FMA).
+  // kN_M: output N, input M. Inputs: Y,U,V for YUV sources, G,B,R for RGB sources.
+  float k0_0 = 0, k0_1 = 0, k0_2 = 0, k1_0 = 0, k1_1 = 0, k1_2 = 0, k2_0 = 0, k2_1 = 0, k2_2 = 0;
+  float off0_f = 0, off1_f = 0, off2_f = 0;
+  if constexpr (float_matrix_workflow) {
+    if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::YUV_TO_YUV) {
+      k0_0 = m.y_g_f * scale_f; k0_1 = m.u_g_f * scale_f; k0_2 = m.v_g_f * scale_f; // G or Y
+      k1_0 = m.y_b_f * scale_f; k1_1 = m.u_b_f * scale_f; k1_2 = m.v_b_f * scale_f; // B or U
+      k2_0 = m.y_r_f * scale_f; k2_1 = m.u_r_f * scale_f; k2_2 = m.v_r_f * scale_f; // R or V
+    }
+    else { // RGB_TO_YUV, RGB_TO_RGB, RGB_TO_Y
+      k0_0 = m.y_g_f * scale_f; k0_1 = m.y_b_f * scale_f; k0_2 = m.y_r_f * scale_f; // Y or G
+      k1_0 = m.u_g_f * scale_f; k1_1 = m.u_b_f * scale_f; k1_2 = m.u_r_f * scale_f; // U or B
+      k2_0 = m.v_g_f * scale_f; k2_1 = m.v_b_f * scale_f; k2_2 = m.v_r_f * scale_f; // V or R
+    }
+    const float out_offset_scaled = m.offset_out_f * scale_f;
+    if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::RGB_TO_RGB) {
+      off0_f = off1_f = off2_f = out_offset_scaled; // RGB output: same offset for all
+    }
+    else { // YUV or Y output
+      off0_f = out_offset_scaled;
+      off1_f = off2_f = final_is_float ? 0.0f : (float)half_pixel_offset_target; // chroma center
+    }
   }
 
   for (int y = 0; y < height; y++) {
@@ -712,7 +769,7 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
       }
 
       float out0_f, out1_f, out2_f;
-      safe_int_t out0_raw, out1_raw, out2_raw; // Keep as int64_t for 16-bit (see would_need_64bit_v_patch remarks above)
+      safe_int_t out0_raw, out1_raw, out2_raw; // int32 also for exact 16 bit (pivot, see safe_int_t)
 
       if constexpr (float_matrix_workflow) {
         // Float workflow
@@ -743,47 +800,11 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
           }
         }
 
-        // Matrix multiply - coefficient order depends on direction
-        // Note: C is slightly different from Intel SIMD SSE2/AVX2 implementation:
-        // C is using (a+b+c)*scale, SIMD is using a*scale+b*scale+c*scale logic regarding the coeff scaling
-        // and summation. They may not be bit identical here in the float_matrix_workflow (e.g. fullrange destination)
-        if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::YUV_TO_YUV) {
-          // YUV input: in0=Y, in1=U, in2=V
-          out0_f = (m.y_g_f * in0_f + m.u_g_f * in1_f + m.v_g_f * in2_f) * scale_f; // G or Y
-          out1_f = (m.y_b_f * in0_f + m.u_b_f * in1_f + m.v_b_f * in2_f) * scale_f; // B or U
-          out2_f = (m.y_r_f * in0_f + m.u_r_f * in1_f + m.v_r_f * in2_f) * scale_f; // R or V
-        }
-        else if constexpr (direction == ConversionDirection::RGB_TO_YUV || direction == ConversionDirection::RGB_TO_RGB) {
-          // RGB input: in0=G, in1=B, in2=R
-          out0_f = (m.y_g_f * in0_f + m.y_b_f * in1_f + m.y_r_f * in2_f) * scale_f; // Y or G
-          out1_f = (m.u_g_f * in0_f + m.u_b_f * in1_f + m.u_r_f * in2_f) * scale_f; // U or B
-          out2_f = (m.v_g_f * in0_f + m.v_b_f * in1_f + m.v_r_f * in2_f) * scale_f; // V or R
-        }
-        else if constexpr (direction == ConversionDirection::RGB_TO_Y) {
-          // RGB input: in0=G, in1=B, in2=R
-          out0_f = (m.y_g_f * in0_f + m.y_b_f * in1_f + m.y_r_f * in2_f) * scale_f; // Y or G
-        }
-
-        // Add output offset
-        if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::RGB_TO_RGB) {
-          // RGB output: same offset for all
-          float rgb_offset_scaled = m.offset_out_f * scale_f;
-          out0_f += rgb_offset_scaled;
-          out1_f += rgb_offset_scaled;
-          out2_f += rgb_offset_scaled;
-        }
-        else if constexpr (direction == ConversionDirection::RGB_TO_YUV || direction == ConversionDirection::YUV_TO_YUV) {
-          // YUV output: different offsets
-          float y_offset_scaled = m.offset_out_f * scale_f;
-          float uv_center = final_is_float ? 0.0f : (float)half_pixel_offset_target;
-          out0_f += y_offset_scaled; // Y
-          out1_f += uv_center; // U
-          out2_f += uv_center; // V
-        }
-        else if constexpr (direction == ConversionDirection::RGB_TO_Y) {
-          // Y output: single Y offsets
-          float y_offset_scaled = m.offset_out_f * scale_f;
-          out0_f += y_offset_scaled; // Y
+        // Matrix multiply, same order as SSE2 (see the coefficient setup above)
+        out0_f = ((k0_0 * in0_f + off0_f) + k0_1 * in1_f) + k0_2 * in2_f;
+        if constexpr (direction != ConversionDirection::RGB_TO_Y) {
+          out1_f = ((k1_0 * in0_f + off1_f) + k1_1 * in1_f) + k1_2 * in2_f;
+          out2_f = ((k2_0 * in0_f + off2_f) + k2_1 * in1_f) + k2_2 * in2_f;
         }
 
         if constexpr (final_is_float) {
@@ -811,39 +832,22 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
       }
       else {
         // Integer workflow
-        // Apply input offset and centering
+        // Apply input offset and centering. Exact 16 bit: luma/RGB pivot, the rest is in round_and_offset_N.
         if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::YUV_TO_YUV) {
           // YUV input
-          in0_i = in0_i + offset_in_scalar; // Y
+          in0_i = lessthan16bit ? in0_i + offset_in_scalar : in0_i - 32768; // Y
           in1_i = in1_i - half_pixel_offset; // U (centered)
           in2_i = in2_i - half_pixel_offset; // V (centered)
         }
         else if constexpr (direction == ConversionDirection::RGB_TO_YUV || direction == ConversionDirection::RGB_TO_RGB || direction == ConversionDirection::RGB_TO_Y) {
           // RGB input
-          in0_i = in0_i + offset_in_scalar; // G
-          in1_i = in1_i + offset_in_scalar; // B
-          in2_i = in2_i + offset_in_scalar; // R
+          const int rgb_in_offset = lessthan16bit ? offset_in_scalar : -32768;
+          in0_i = in0_i + rgb_in_offset; // G
+          in1_i = in1_i + rgb_in_offset; // B
+          in2_i = in2_i + rgb_in_offset; // R
         }
 
-        // Matrix multiply with appropriate rounding/offset
-        int round_and_offset_0, round_and_offset_1, round_and_offset_2;
-
-        if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::RGB_TO_RGB) {
-          // RGB output: same offset for all
-          round_and_offset_0 = round_mask_plus_offset_out_i;
-          round_and_offset_1 = round_mask_plus_offset_out_i;
-          round_and_offset_2 = round_mask_plus_offset_out_i;
-        }
-        else if constexpr (direction == ConversionDirection::RGB_TO_YUV || direction == ConversionDirection::YUV_TO_YUV) {
-          // YUV output: different offsets
-          round_and_offset_0 = round_mask_plus_offset_out_i; // Y
-          round_and_offset_1 = round_mask_plus_offset_out_chroma_i; // U
-          round_and_offset_2 = round_mask_plus_offset_out_chroma_i; // V
-        }
-        else if constexpr (direction == ConversionDirection::RGB_TO_Y) {
-          // Y output: single Y offset
-          round_and_offset_0 = round_mask_plus_offset_out_i; // Y
-        }
+        // Matrix multiply with rounding/offset (round_and_offset_N, set up before the loop)
 
         if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::YUV_TO_YUV) {
           // YUV input: in0=Y, in1=U, in2=V
@@ -862,28 +866,8 @@ static void convert_yuv_to_planarrgb_c_internal(BYTE* dstp[3], int dstPitch[3], 
           out0_raw = (safe_int_t)m.y_g * in0_i + (safe_int_t)m.y_b * in1_i + (safe_int_t)m.y_r * in2_i + round_and_offset_0;
         }
 
-        if constexpr (final_is_float) {
-          // Integer workflow + float output
-          out0_f = static_cast<float>(out0_raw) * scale_f + out_offset_f;
-          if constexpr (direction == ConversionDirection::YUV_TO_RGB || direction == ConversionDirection::RGB_TO_RGB) {
-            // offset for the rest two only RGB output
-            out1_f = static_cast<float>(out1_raw) * scale_f + out_offset_f;
-            out2_f = static_cast<float>(out2_raw) * scale_f + out_offset_f;
-          }
-          else if constexpr (direction == ConversionDirection::RGB_TO_YUV || direction == ConversionDirection::YUV_TO_YUV) {
-            // for YUV the U and V float offset is different : 0.0f
-            out1_f = static_cast<float>(out1_raw) * scale_f; // U
-            out2_f = static_cast<float>(out2_raw) * scale_f; // V
-          }
-
-          d0[x] = static_cast<pixel_t_dst>(out0_f);
-          if constexpr (direction != ConversionDirection::RGB_TO_Y) {
-            d1[x] = static_cast<pixel_t_dst>(out1_f);
-            d2[x] = static_cast<pixel_t_dst>(out2_f);
-          }
-        }
-        else {
-          // Integer workflow + integer output
+        {
+          // Integer workflow + integer output (float output always takes the float workflow)
           int out0_i = static_cast<int>(out0_raw >> target_shift);
           out0_i = std::clamp(out0_i, 0, max_pixel_value_target);
           d0[x] = static_cast<pixel_t_dst>(out0_i);
@@ -965,7 +949,7 @@ void convert_yuv_to_planarrgb_c(BYTE* dstp[3], int dstPitch[3], const BYTE* srcp
           convert_yuv_to_planarrgb_c_internal<direction, pixel_t_src, lessthan16bit, false, uint16_t, YuvRgbConversionType::BITCONV_INT_LIMITED>(dstp, dstPitch, srcp, srcPitch, width, height, m, bits_per_pixel, bits_per_pixel_target);
       }
       else {
-        convert_yuv_to_planarrgb_c_internal<direction, pixel_t_src, lessthan16bit, false, float, YuvRgbConversionType::FLOAT_OUTPUT>(dstp, dstPitch, srcp, srcPitch, width, height, m, bits_per_pixel, bits_per_pixel_target);
+        convert_yuv_to_planarrgb_c_internal<direction, pixel_t_src, lessthan16bit, false, float, YuvRgbConversionType::FORCE_FLOAT>(dstp, dstPitch, srcp, srcPitch, width, height, m, bits_per_pixel, bits_per_pixel_target);
       }
     }
   }
