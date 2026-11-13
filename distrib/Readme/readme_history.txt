@@ -101,6 +101,30 @@ Bugfixes, bugs in normal use:
   ScriptFile() "試験.", StrFromUtf8("テスト漢字") "テス".
   The *Utf8 variants (ScriptDirUtf8 ...) and Import itself were correct.
   Existed since AviSynth+ r2487 (2017, Unicode script names in Import; StrFromUtf8 since r2502).
+- Fix: LoadPlugin and plugin autoload: a plugin DLL in a folder with non-ASCII characters (e.g. "C:\Videók\" or
+  "C:\Users\Pintér\") failed with "Cannot load file ... Platform returned code 126" on a non-UTF-8 ANSI code page
+  (1250, 1252 ...), also with utf8=true. Plugin paths are UTF-8 inside since 3.7.6, but LoadLibraryEx, the DLL
+  directory setting and the 32/64 bit check got them through the ANSI Windows API, which read the UTF-8 bytes in the
+  ANSI code page ("Videók" became "VideĂłk"). It worked only with a UTF-8 ANSI code page. Now the wide API is used:
+  LoadLibraryExW, Get/SetDllDirectoryW, and the 32/64 bit check reads the PE header itself (no imagehlp dependency).
+  The DLL search directory is now always set back after loading. It stayed the plugin's folder when the host had
+  none set (the usual case); now it becomes "" then, which keeps a host's SetDllDirectory("") (e.g. ffmpeg).
+  Regression since 3.7.6; 3.7.5 loaded them by the ANSI path.
+- Fix: WriteFile, WriteFileIf, WriteFileStart, WriteFileEnd on Linux/macOS: the file name was made absolute with
+  realpath, which fails for a file that does not exist yet; the name then stayed relative. With flush=true (the
+  default) the file is reopened at each frame, and by then the current directory is the host's again (Import sets it
+  to the script's folder only while the script is parsed), so the lines went to a file in another folder.
+  Now std::filesystem::absolute + lexically_normal is used, which does not need the file to exist, and folds "."
+  and ".." in the text as GetFullPathName does on Windows (so "nodir/../log.txt" works there too, the folders need
+  not exist). An empty or invalid name gives "Write: invalid file name" on both. Windows: GetFullPathName, as
+  _fullpath did, but an invalid or too long name was not checked (_fullpath result ignored, the name buffer
+  stayed unset); the _MAX_PATH limit is gone.
+  Existed since 3.5.0 (Linux support).
+- Fix: Import of a script whose full path is exactly 260 characters long, or of a long UNC path, failed with
+  "Import: couldn't open". The \\?\ long path prefix was added only above FILENAME_MAX (260) characters, but
+  MAX_PATH (260) includes the terminating zero, so 260 needs it too. A UNC path "\\server\share\..." got
+  "\\?\\\server\..." instead of "\\?\UNC\server\share\...", so long UNC paths always failed. "\\.\" device paths
+  are left as they are. Existed since 3.7.0 (long path support).
 - Fix: non-Intel builds (aarch64): crash in YUV with alpha to RGB when the bit depth changes, e.g. ConvertToRGB32 from
   10-16 bit or 32 bit float YUVA, or ConvertToPlanarRGBA(bits=8).
 - Fix: AVX2 YUV to planar RGB (and RGB to YUV/Y) conversion from 8-16 bit source to 32 bit float output:
@@ -200,6 +224,16 @@ Bugfixes, accuracy: rounding, limited range levels:
 - Fix: YToUV without Y clip, 32 bit float: the grey Y plane was 126/256. The value now comes from the common bit
   depth conversion constants (8 bit limited range to the actual bit depth, like ConvertBits), which gives 126/255.
   10-16 bits stay 126 << (bits-8). Existed since AviSynth+ r2487.
+- Planar YUV <-> RGB matrix conversions with 32 bit float target (bits=32) from an 8-16 bit source: always the float
+  workflow (C, SSE2, AVX2), the same as quality=true; before, the integer matrix was used and only its result was
+  converted to float. One algorithm instead of a special integer path: more exact, the integer coefficient rounding
+  is gone, e.g. 709 limited white to RGB: 1.0 (was 1.0000389 at 8 bit, 0.9999528 at 14 bit), full RGB white to
+  limited Y: 235/255 exactly. Output changes up to 7.5e-5 (0.02 of an 8 bit step). quality=false and quality=true
+  are now identical for float targets. Not slower: SIMD within noise, the C path 40-50% faster.
+- Fix: 16 bit planar RGB to YUV/Y with float output: the integer matrix sum overflowed int32 for limited range RGB
+  input (_Range=0) to full range output, where the coefficients are scaled by 255/219: values above nominal white
+  wrapped around, e.g. RGB 65535 gave Y -0.904 instead of 1.096 (SIMD; C was right with int64). Fixed by the
+  float workflow above (16 bit RGB -> YUV/Y with integer output already used it for the same overflow reason).
 
 Bugfixes, same output on every CPU, OS and compiler:
   The C, the x86 SIMD and the aarch64 NEON paths, or two runs of the same script, gave different output. Found by
@@ -235,6 +269,44 @@ Bugfixes, crash or hang on unusual parameters or input:
   called the throwing std::filesystem::absolute, which throws on an empty path, and nothing caught it. It uses the
   error_code overload now and leaves the name as it is, the caller reports "Cannot load file ''".
   Regression since 3.7.6 (the #462 UTF-8 autoload rework); 3.7.5 gave the error.
+- Fix: SegmentedAVISource, SegmentedDirectShowSource: a file name without extension (e.g. "clip") wrote through a NULL
+  pointer and crashed the host; a name longer than 259 characters overflowed a stack buffer (strcpy, wsprintf into
+  char[260]). Now any length works. "clip" looks for "clip.00" ... "clip.99"; the extension dot is searched in the
+  file name only, "C:\my.dir\clip" no longer splits at the folder name.
+  SegmentedAVISource(utf8=true): the existence check of the segments used the ANSI API on the UTF-8 name, so a
+  non-ASCII name was never found ("no files found!"). Existed since classic AviSynth (crash), r2768 (utf8, 2018).
+- Fix: opening a script through Video for Windows (AVIFile, e.g. VirtualDub): the script path was converted to ANSI
+  into a char[MAX_PATH] buffer. When the ANSI form did not fit (a path over 259 bytes: a long path, or about 130
+  CJK characters on a DBCS code page), WideCharToMultiByte failed after filling the buffer without a terminating
+  zero, and lstrlen/lstrcpy read past it. Now the buffer is sized by the converted length. The script itself was
+  and is opened by its UTF-8 name. Existed since classic AviSynth.
+- Fix: PROGRAMDIR in AddAutoloadDir: the program path was read with GetModuleFileNameW into a fixed buffer of
+  AVS_MAX_PATH (1040) characters. A longer path was cut, and on Windows XP left without a terminating zero (the
+  memset did not help when the buffer was full). Now the buffer grows until the path fits. Existed since 3.7.6.
+  POSIX: CWDChanger (Import) saved the current folder with getcwd(buffer, FILENAME_MAX) into a PATH_MAX buffer, so a
+  folder longer than FILENAME_MAX was not set back after Import. Equal on Linux and macOS; smaller on some systems
+  (e.g. Haiku). Now the buffer size is used.
+- Haiku: PROGRAMDIR in AddAutoloadDir is the program's folder, read with find_path(B_APP_IMAGE_SYMBOL,
+  B_FIND_PATH_IMAGE_PATH, ...) (Haiku API, libroot). Haiku had no program path code: the path stayed empty, and the
+  folder part was then cut with erase(rfind('/')), which throws std::out_of_range on a path without '/'. That made
+  hosts like avs2yuv or FFmpeg fail, so the cut was skipped on Haiku and PROGRAMDIR stayed empty. Now the cut is
+  guarded on all systems: a program path which cannot be read gives an empty PROGRAMDIR instead of the exception.
+  Haiku: written from the Haiku API reference and headers (FindDirectory.h), not built or tested.
+- Fix: AviSynth 2.5 C++ plugins and C plugins before interface version 11 (and C hosts asking for a version below 11):
+  GetVar, GetVarDef (C API: avs_get_var, avs_get_var_try) returned a variable holding a 64 bit 'l'ong or 'd'ouble as
+  it is. These plugins don't know the two types: their own compiled-in IsInt/IsFloat (avs_is_int/avs_is_float) said no.
+  E.g. x = 3000000000, y = Pi(). Now 'i'nt and 'f'loat, the same conversion as for Invoke25/InvokePreV11C results;
+  C plugins: array elements at any depth as well, 2.5 plugins: the top level, like Invoke25.
+  Done in the compatibility interfaces (GetVar25/GetVarDef25, GetVarPreV11C/GetVarDefPreV11C/GetVarTryPreV11C).
+  Existed since 3.7.4.
+- Fix: Animate user_fn passed as Func(name) which cannot be called with "stage": the error message crashed the host
+  (since 3.7.4; OnCPU/OnCUDA the same, since 3.6.0). A non-number, NaN or infinity result is now an error.
+- Animate user_fn: not called for the start and end frames, these use the given arguments. In between the results may
+  over- and undershoot, they are not clamped to start..end (3.7.6 clamped them); integers saturate at 64 bit.
+- Fix: Animate, linear integer interpolation is exact (128 bit intermediates); it could be one off already within 32 bit.
+  Float interpolation is exact for equal start and end values: in 3.7.5 e.g. Tweak endHue=360.0 at both ends came out
+  above 360, an error (Doom9 report). A frame range over 2^31 (negative start_frame) overflowed, only theoretical.
+- Fix: ApplyRange, Animate without extra arguments: assertion in debug builds (empty array access).
 - Fix: RGBAdjust, ColorYUV analyze=true: stack buffer overflow in the text of the statistics on very large float pixel
   values or on only NaN pixels.
 - Fix: RGBAdjust analyze=true, planar RGB 32 bit float: crash on NaN pixels, which can come from Expr or from a NaN parameter.
@@ -276,6 +348,12 @@ Bugfixes, undefined behaviour, NaN parameters, cosmetics:
   e.g. Format("{}", Pow(2.0, -24)): was 5.9604644775390625e-08, now 5.960464477539063e-08
   Below a power of two the representable values are half as far apart, so the nearest decimal can miss the
   narrower lower half interval while the next decimal up reads back. Now that one is tried as well.
+- Planar YUV <-> RGB matrix conversions, float workflow (quality=true, full range, 16 bit RGB to YUV/Y, float
+  sources): the C path uses the coefficients pre-multiplied by the scale and the summation order of SSE2:
+  ((k0*a + offset) + k1*b) + k2*c, instead of (c0*a + c1*b + c2*c)*scale + offset. Without FMA contraction C and
+  SSE2/SSE4 are bit identical (x64 GCC, 432 test cases); before, they differed by 1 LSB at rounding ties.
+  AVX2 and aarch64 builds (FMA contraction by the compiler) can still differ at ties.
+  Why: C vs SIMD comparison tests no longer show these 1 LSB differences.
 
 Optimizations:
 - Optimization: Text and Subtitle(gdi=false): non-fading luma loops skip empty bitmap bytes; chroma walks only the
@@ -285,6 +363,12 @@ Optimizations:
   Blur/Sharpen and the 10-14 bit resizers): 2 instructions (saturating subtract trick) instead of 5
   (compare + blend). The pack + clamp-to-limit helpers in avs_simd_c.h (MSVC SSE2 build, e.g. the C resizer):
   min against the biased limit right after the biased signed pack, 5 instructions instead of 9. Output is unchanged.
+- Optimization: planar YUV <-> RGB matrix conversions, C path, exact 16 bit integer workflow (16 bit YUV to RGB/YUV,
+  also to 10-14 bit and to float): int32 instead of int64, with the pivot of the SSE2/AVX2 paths: the luma/RGB input
+  is moved to the signed range (pixel - 32768), (32768 + offset_in) * coefficient is added to the rounder constant.
+  The C path is the main one on aarch64: Clang (21, 22) left the int64 loop scalar, GCC (12, 15) used 2 x 64 bit
+  lanes; now both use 4 x 32 bit lanes. Output is unchanged (old C vs new C bit identical; 0 / 32768 / 65535 edge
+  values in all planes, 8 matrices, 16 bit to 8-16 bit and float).
 
 
 20261025 3.7.6.r4909

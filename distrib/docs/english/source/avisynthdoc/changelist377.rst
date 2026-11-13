@@ -66,6 +66,17 @@ Bugs in normal use
   up to 3 bytes (UTF-8) for one UTF-16 character, the buffer was sized for one byte each. The ``*Utf8`` variants were
   correct.
   Existed since AviSynth+ r2487 (2017).
+- Fix: ``LoadPlugin`` and plugin autoload: a plugin DLL in a folder with non-ASCII characters (e.g. ``C:\Videók\`` or
+  ``C:\Users\Pintér\``) failed with "Cannot load file ... code 126" on a non-UTF-8 ANSI code page, also with
+  ``utf8=true``. The UTF-8 path was passed to the ANSI Windows API. After loading, the DLL search directory is set
+  back, the plugin's folder no longer stays in the host's search path. Regression since 3.7.6.
+- Fix: WriteFile, WriteFileIf, WriteFileStart, WriteFileEnd on Linux/macOS: a relative name of a file which did not
+  exist yet stayed relative; with ``flush=true`` (the default) the file is reopened at each frame, when the current
+  directory is the host's again, so the lines went to another folder. Now the name is made absolute as on Windows,
+  ``.`` and ``..`` folded in the text. An empty, invalid or (Windows) too long name gives an error. Existed since 3.5.0 (Linux support).
+- Fix: Import of a script whose full path is exactly 260 characters long, or a UNC path (``\\server\share\...``)
+  of 260 or more, failed with "couldn't open": the long path prefix was not added, or was wrong for UNC.
+  Existed since 3.7.0 (long path support).
 - Fix: non-Intel builds (aarch64): crash in YUV with alpha to RGB when the bit depth changes, e.g. ``ConvertToRGB32`` from
   10-16 bit or 32 bit float YUVA, or ``ConvertToPlanarRGBA(bits=8)``. Existed since 3.7.6.
 - Fix: YUV to planar RGB (and RGB to YUV/Y) conversion from 8-16 bit to 32 bit float, AVX2: memory
@@ -142,6 +153,11 @@ Output changes by a rounding step; the values now match ConvertBits and the othe
   16 or 240 as out of range.
 - Fix: YToUV without ``clipY``, 32 bit float: the grey Y plane was 126/256, now 126/255, the same as 8 bit limited
   range 126 converted by ConvertBits. Existed since AviSynth+ r2487.
+- Planar YUV <-> RGB conversions to 32 bit float (``bits=32``) from 8-16 bit: always calculated in float, the same as
+  ``quality=true``. The result is more exact: limited range white gives 1.0 (was up to 1.000039 or 0.999953), and
+  ``quality=false`` and ``quality=true`` give the same float output. Not slower.
+- Fix: 16 bit planar RGB to YUV or Y with 32 bit float output: limited range RGB (``_Range`` 0) to full range
+  output wrapped around above nominal white (65535 gave Y -0.904 instead of 1.096), fixed by the above.
 
 Same output on every CPU, OS and compiler
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -170,11 +186,33 @@ comparing them, and by the sanitizer builds (planes left unset kept the content 
 
 Crash or hang on unusual parameters or input
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-Mostly found by AddressSanitizer (ASan) builds: memory access outside the frame or the buffer, division by zero, endless
+Some were found by AddressSanitizer (ASan) builds: memory access outside the frame or the buffer, division by zero, endless
 loop. Most need an unusual parameter or input.
 
 - Fix: ``LoadPlugin("")`` and ``LoadCPlugin("")`` (an empty file name) terminated the whole program (uncaught
   ``std::filesystem`` exception), now the usual "Cannot load file" error. Regression since 3.7.6.
+- Fix: SegmentedAVISource, SegmentedDirectShowSource: a file name without extension crashed the host, a name longer
+  than 259 characters overflowed a stack buffer. ``clip`` now looks for ``clip.00`` ... ``clip.99``.
+  SegmentedAVISource ``utf8=true`` did not find non-ASCII file names. Existed since classic AviSynth.
+- Fix: opening a script through Video for Windows (e.g. VirtualDub): a path whose ANSI form is longer than 259
+  bytes left a buffer without terminating zero, read past its end. Existed since classic AviSynth.
+- Fix: ``PROGRAMDIR`` in ``AddAutoloadDir``: a program path longer than 1039 characters was cut, without terminating
+  zero on Windows XP. POSIX: the current folder was set back after ``Import`` only when it was shorter than
+  ``FILENAME_MAX`` instead of ``PATH_MAX``; they differ on some systems (e.g. Haiku), not on Linux and macOS.
+- Haiku: ``PROGRAMDIR`` in ``AddAutoloadDir`` is the program's folder; it was empty. A program path which cannot be
+  read gives an empty ``PROGRAMDIR`` on any system, it threw ``std::out_of_range`` before.
+- Fix: AviSynth 2.5 plugins and C plugins before interface version 11: ``GetVar``, ``GetVarDef`` (C: ``avs_get_var``,
+  ``avs_get_var_try``) returned a variable holding a 64 bit ``long`` or ``double`` as it is, a type these plugins
+  don't know. Now ``int`` and ``float``, as ``Invoke`` results already were; C plugins: array elements as well.
+  Existed since 3.7.4.
+- Fix: Animate ``user_fn``: a function passed as ``Func(name)`` which cannot be called with ``stage`` crashed the host
+  (error message), since 3.7.4; ``OnCPU``, ``OnCUDA`` the same, since 3.6.0. A non-number, NaN or infinity result is an error.
+- Animate: the custom function is not called for the start and end frames, these use the given arguments. In between
+  its result may over- and undershoot, the values are not clamped to the start..end range (3.7.6 clamped them).
+- Fix: Animate, linear integer interpolation is exact, rounded; it could be one off already within 32 bit (since 3.7.4).
+  A frame range longer than 2^31 (negative ``start_frame``) overflowed; it works now, though such a range has no
+  practical use.
+- Fix: ApplyRange, Animate without extra arguments: assertion in debug builds.
 - Fix: RGBAdjust, ColorYUV ``analyze=true``: stack buffer overflow in the text of the statistics on very large float pixel
   values or on only NaN pixels.
 - Fix: RGBAdjust ``analyze=true``, planar RGB 32 bit float: crash on NaN pixels, which can come from ``Expr`` or from a NaN parameter.
@@ -207,6 +245,8 @@ tested platforms. Found by UndefinedBehaviorSanitizer (UBSan) builds.
   more than needed for a few powers of two: 37 of the 2098 double and 3 of the 277 float powers of two,
   e.g. 2^-24 gave ``5.9604644775390625e-08`` (17 digits) instead of ``5.960464477539063e-08``. The value
   read back exactly; only the last digit was superfluous. Existed since 3.7.6.
+- Planar YUV <-> RGB conversions, float inside calculation (``quality=true``, full range, 16 bit RGB to YUV, float
+  sources): the C path computes in the same order as SSE2 (pre-scaled coefficients), so C vs SIMD tests compare clean.
 
 Optimizations
 ~~~~~~~~~~~~~
@@ -214,6 +254,9 @@ Optimizations
   of the bitmap. About 20-35% quicker (19 lines of text, frame copies excluded) without halo and fading.
 - Optimization: x86 SSE2 (no SSE4.1) emulation of unsigned 16 bit min/max (Limiter, Blur/Sharpen, 10-14 bit
   resizers) and the pack + clamp-to-limit in the MSVC SSE2 build of the C resizer: fewer instructions.
+- Optimization: planar YUV <-> RGB conversions, C path (aarch64, no SIMD), exact 16 bit integer calculation: int32
+  with the pivot of the SSE2/AVX2 paths instead of int64. GCC and Clang vectorize it now (Clang left it scalar,
+  GCC used 2 lanes). Output is unchanged.
 
 Documentation
 ~~~~~~~~~~~~~

@@ -450,7 +450,7 @@ std::wstring CWDChanger::GetCurrentWorkingDirectory() {
 #else
 
 std::string CWDChanger::GetCurrentWorkingDirectory() {
-  char buffer[FILENAME_MAX];
+  char buffer[PATH_MAX]; // FILENAME_MAX can be smaller (e.g. 256 on Haiku)
   if (getcwd(buffer, sizeof(buffer)) == nullptr) return {};
 
   return std::string(buffer);
@@ -488,25 +488,29 @@ CWDChanger::~CWDChanger(void)
     SetCurrentDirectoryW(old_working_directory.get());
 }
 
-DllDirChanger::DllDirChanger(const char* new_dir)
+// Wide API: plugin paths may be outside the ANSI code page.
+// GetDllDirectory gives an empty string both when none is set and when the host set "" (e.g. ffmpeg, to drop
+// the current directory from the DLL search). Restore "" then: NULL (default search order) would undo the
+// host's setting, while not restoring would leave the plugin's directory in the search path.
+DllDirChanger::DllDirChanger(const wchar_t* new_dir)
 {
-  uint32_t len = GetDllDirectory (0, NULL);
-  old_directory = std::make_unique<char[]>(len + 1); // instead of new char[len+1]
-  uint32_t save_success = GetDllDirectory (len, old_directory.get());
-  bool set_success = SetDllDirectory(new_dir);
-  restore = (save_success && set_success);
+  DWORD len = GetDllDirectoryW(0, NULL); // with the terminating zero
+  old_directory = std::make_unique<wchar_t[]>((size_t)len + 1); // zero filled
+  if (len > 0 && GetDllDirectoryW(len, old_directory.get()) >= len)
+    old_directory[0] = 0;
+  restore = SetDllDirectoryW(new_dir) != 0;
 }
 
 DllDirChanger::~DllDirChanger(void)
 {
   if (restore)
-    SetDllDirectory(old_directory.get());
+    SetDllDirectoryW(old_directory.get());
 }
 #else // copied from AvxSynth
 CWDChanger::CWDChanger(const char* new_cwd)
 {
 
-  char* path = getcwd(old_working_directory, FILENAME_MAX);
+  char* path = getcwd(old_working_directory, sizeof(old_working_directory)); // PATH_MAX, not FILENAME_MAX
   bool save_cwd_success = (NULL != path);
   bool set_cwd_success = (0 == chdir(new_cwd));
   restore = (save_cwd_success && set_cwd_success);
@@ -641,10 +645,16 @@ AVSValue Import(AVSValue args, void*, IScriptEnvironment* env)
     auto dir_part = WideCharToAnsi_maxn(full_path_w.get(), dir_part_len);
     auto dir_part_utf8 = WideCharToUtf8_maxn(full_path_w.get(), dir_part_len);
 
-    // supply L"\\\\?\\" if necessary for long file path support
+    // supply L"\\\\?\\" if necessary for long file path support: MAX_PATH (260) includes the terminating zero.
+    // A UNC path (\\server\share\...) gets \\?\UNC\server\share\...
     std::wstring full_path_ex = std::wstring(full_path_w.get());
-    if (full_path_ex.length() > FILENAME_MAX && full_path_ex.substr(0, 4) != L"\\\\?\\")
-      full_path_ex = L"\\\\?\\" + full_path_ex;
+    if (full_path_ex.length() >= MAX_PATH && full_path_ex.compare(0, 4, L"\\\\?\\") != 0
+      && full_path_ex.compare(0, 4, L"\\\\.\\") != 0) {
+      if (full_path_ex.compare(0, 2, L"\\\\") == 0)
+        full_path_ex = L"\\\\?\\UNC\\" + full_path_ex.substr(2);
+      else
+        full_path_ex = L"\\\\?\\" + full_path_ex;
+    }
 
     HANDLE h = ::CreateFileW(full_path_ex.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (h == INVALID_HANDLE_VALUE)
