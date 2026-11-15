@@ -14,12 +14,22 @@ Additions, changes
   ``_ColorRange`` stays reserved and it is its older name with 0 and 1 swapped: the two are one property, the frame holds it
   as ``_Range``. Plugins and scripts of any version reach it by both names. Key lists give ``_Range`` only, ``propGetAll``
   and ``propShow`` both. See :doc:`frame properties <syntax/syntax_internal_functions_frame_properties>`.
+- New :doc:`AudioStats <corefilters/audiostats>`: audio levels (peak, RMS, clipped samples, loose peak), also per
+  channel, as an array of named values at script load time.
 
 Build environment, Interface
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 - Fix: GCC build with LTO (link-time optimization) failed with "inlining failed in call to 'always_inline'
   ... target specific option mismatch" in the SSE4.1 Overlay/Layer mask row preparation (x86/x64).
   (`issue #531 <https://github.com/AviSynth/AviSynthPlus/issues/531>`_)
+- Linux/macOS: the core exports only the C API (``avs_*``) and ``CreateScriptEnvironment`` / ``CreateScriptEnvironment2``,
+  as the Windows DLL does (about 5000 symbols before). Hidden default symbol visibility, and on ELF platforms
+  (Linux, BSD) also a linker version script generated from ``avisynth_c.h``. Plugins no longer get the core's ``BitBlt``,
+  ``GetBitmapFont``, ``DrawString*``, ``UnQuote``, ``AVS_linkage`` etc. substituted for their own copies when a host
+  loads the core with ``RTLD_GLOBAL``.
+- New macro ``AVS_PLUGIN_EXPORT`` (``avs/capi.h``) for plugin entry points: ``__declspec(dllexport)`` on Windows,
+  default symbol visibility on POSIX, for plugins built with ``-fvisibility=hidden``. ``AVSC_EXPORT`` of C plugins
+  does the same. See :ref:`Exporting the plugin entry point <cplusplus_plugin_export>`.
 - Interface version 14.1 (``AVISYNTHPLUS_INTERFACE_BUGFIX_VERSION`` 1), no API change: it marks the ``_Range`` /
   ``_ColorRange`` alias. C API loader: new ``has_at_least_v14_1``.
 - C API loader moved from the installed headers to the ``FilterSDK/c_loader`` samples (source: ``distrib/``).
@@ -138,6 +148,12 @@ Output changes by a rounding step; the values now match ConvertBits and the othe
   16 at 8 bit, 65 instead of 64 at 10 bit. Existed since 3.5.0 (2020).
 - Fix: Histogram ``classic``, 32 bit float, limited range, ``bits`` above 8: bars were not at the same position as at
   integer bit depths.
+- AmplifydB: the dB to factor conversion is calculated in double: ``AmplifydB(-peak_db)`` of an
+  :doc:`AudioStats <corefilters/audiostats>` value gives the exact factor (was up to one float step off). See
+  :doc:`Amplify <corefilters/amplify>`.
+- Fix: Histogram ``"audiolevels"``: the RMS level was calculated from a mean square rounded down to an integer, too
+  low near silence (e.g. -96 dB instead of -92.5 dB). dB values use the same formula as ``AmplifydB``; full scale shows
+  ``0.00dB`` instead of ``-0.00dB``.
 - Fix: Subtitle (``gdi=true``), 10-16 bit YUV: levels were level * 257 instead of a limited range shift: white Y was
   60393 instead of 60160, neutral U 32895 instead of 32768 at 16 bit. 8 bit output is the same as before, see
   :doc:`Subtitle <corefilters/subtitle>`. Existed since the 10-16 bit support of text overlay (2016).
@@ -228,6 +244,9 @@ loop. Most need an unusual parameter or input.
 - Fix: 8 and 16 bit horizontal resize, AVX-512: some kernels could read up to ~120 bytes past the end of the
   source frame buffer on the last row (possible access violation; the output was not affected).
   Existed since 3.7.6.
+- Fix: Histogram ``"audiolevels"``: stack overflow (the host crashed) on a low frame rate with a high sample rate
+  or many channels, when one frame's audio was above about 1 MB: e.g. 5.1 48 kHz at fps 0.5 (2 s per image), or
+  5.1 96 kHz at 1 fps. Existed since classic AviSynth.
 
 Undefined behaviour, NaN parameters, cosmetics
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -236,6 +255,10 @@ integer or a shift by 32 bits; the compiler may do anything. Here the result was
 tested platforms. Found by UndefinedBehaviorSanitizer (UBSan) builds.
 
 - Float parameters of the built-in filters which are not a number (NaN) or infinite give an error, when the filter uses them.
+- Fix: Normalize on a silent track: the factor was infinite, float output NaN, 16 bit undefined. The track is left
+  as it is now.
+- Fix: Normalize, 16 bit: the peak search stopped at the first 32767 (or -32767), a later -32768 was not seen: the
+  factor could be one step too large, e.g. ``Normalize(0.5)`` of a full scale square wave gave -0.500015.
 - Fix: resizers, Bob, and ``param1``, ``param2``, ``param3`` of the ``ConvertTo...`` filters, AddBorders and LetterBox: NaN
   and Inf were accepted, the result was undefined and differed by platform. Now an error, as are ``src_left``, ``src_top``,
   ``src_width``, ``src_height`` too large for the resizer.

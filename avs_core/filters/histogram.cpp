@@ -303,13 +303,15 @@ PVideoFrame Histogram::DrawModeAudioLevels(int n, IScriptEnvironment* env) {
   // Get audio for current frame.
   const int64_t start = vi.AudioSamplesFromFrames(n);
   const int count = (int)(vi.AudioSamplesFromFrames(1));
-  signed short* samples = static_cast<signed short*>(_alloca(sizeof(signed short)* count * channels));
+  // heap: a low frame rate with many channels can be megabytes
+  std::vector<int16_t> sample_buf((size_t)count * channels);
+  const int16_t* samples = sample_buf.data();
 
-  aud_clip->GetAudio(samples, max((int64_t)0ll,start), count, env);
+  aud_clip->GetAudio(sample_buf.data(), max((int64_t)0ll,start), count, env);
 
   // Find maximum volume and rms.
-  int*     channel_max = static_cast<int*>(_alloca(channels * sizeof(int)));
-  int64_t* channel_rms = static_cast<int64_t*>(_alloca(channels * sizeof(int64_t)));;
+  std::vector<int> channel_max(channels);
+  std::vector<int64_t> channel_rms(channels);
 
   const int c = count*channels;
   for (int ch = 0; ch<channels; ch++) {
@@ -356,16 +358,17 @@ PVideoFrame Histogram::DrawModeAudioLevels(int n, IScriptEnvironment* env) {
   }
 
   for (int ch = 0; ch<channels; ch++) {
+    // dB as AudioStats and AmplifydB: 20*log10(|x|/32768), here from squares: 10*log10(x^2/32768^2)
     int max = channel_max[ch];
     double ch_db = 96;
     if (max > 0) {
-      ch_db = -8.685889638/2.0 * log((double)max/(32768.0*32768.0));
+      ch_db = -10.0 * std::log10((double)max/(32768.0*32768.0));
     }
 
-    int64_t rms = channel_rms[ch] / count;
+    const double rms = count > 0 ? (double)channel_rms[ch] / count : 0.0; // mean square, not truncated
     double ch_rms = 96;
     if (rms > 0) {
-      ch_rms = -8.685889638/2.0 * log((double)rms/(32768.0*32768.0));
+      ch_rms = -10.0 * std::log10(rms/(32768.0*32768.0));
     }
 
     int x_pos = ((ch*2)+1)*bar_w+8;
@@ -411,9 +414,9 @@ PVideoFrame Histogram::DrawModeAudioLevels(int n, IScriptEnvironment* env) {
       }
     }
     // Draw text
-    snprintf(text, sizeof(text), "%6.2fdB", (float)-ch_db);
+    snprintf(text, sizeof(text), "%6.2fdB", (float)(0.0 - ch_db)); // 0.0 - x: no "-0.00" at full scale
     DrawStringPlanar(vi, src, ((ch*2)+1)*bar_w, vi.height- 2 * TEXT_HEIGHT + TEXT_HEIGHT / 2, text, env);
-    snprintf(text, sizeof(text), "%6.2fdB", (float)-ch_rms);
+    snprintf(text, sizeof(text), "%6.2fdB", (float)(0.0 - ch_rms));
     DrawStringPlanar(vi, src, ((ch*2)+1)*bar_w, vi.height- 1 * TEXT_HEIGHT + TEXT_HEIGHT / 2, text, env);
 
   }
