@@ -39,6 +39,10 @@ Additions, changes:
   The safety columns of the text bitmap are gone.
 - Subtitle(gdi=true): the chroma processing range has a one chroma block margin, for the same reason.
 
+- New AudioStats(clip, float "threshold", bool "per_channel"): reads the audio once, returns its levels as a
+  dictionary-style array at script load time: min, max, peak, peak_db, peak_sample, rms, rms_db, mean, clipped,
+  loose_peak, loose_peak_db; per_channel=true adds "channels", keyed by the channel mask names (FL, FC, LFE...) or
+  "0", "1"... Normalize uses the same peak search.
 Build environment:
 - Fix #531: GCC build with LTO (-flto) failed at link time on x86/x64 Linux:
   "inlining failed in call to 'always_inline' prepare_effective_mask_for_row_float_sse41: target specific
@@ -208,6 +212,13 @@ Bugfixes, accuracy: rounding, limited range levels:
 - Fix: Expr cmin, scale_inputs="floatUV", 8-16 bit clips: it was half a step too high and rounded up, 17 instead of
   16 at 8 bit, 65 instead of 64 at 10 bit. Existed since 3.5.0 (2020).
 - Fix: Histogram "classic", 32 bit float, limited range, bits above 8: position was x*(2^bits-1) instead of x*255<<(bits-8).
+- AmplifydB: 10^(dB/20) in double from the double script value, rounded to float once (was powf on float): the
+  factor can change by one float step. AmplifydB(-peak_db) with an AudioStats value now gives exactly 1.0 peak
+  (was 0.99999994 or 1.00000012, the latter clipped when converted to integer).
+- Fix: Histogram("audiolevels"): RMS level: the mean square of the 16 bit samples was an integer division, rounded down
+  before the log: too low near silence, e.g. a mean square of 0.6 showed -96 dB (the "no signal" value) instead of
+  -92.5 dB. Now in double. dB values are 10*log10(x^2/32768^2), the same formula as AmplifydB; the
+  truncated 8.685889638 (20/ln 10) constant is gone. Full scale shows 0.00dB instead of -0.00dB.
 - Fix: Subtitle (gdi=true), 10-16 bit YUV: the colour addends of the text have a *256.99 scale (right for the 8 bit >>8,
   right for full range RGB, 255 is 65535), so limited range got Y*257: 16 bit white 60393 instead of 60160, neutral U
   32895 instead of 32768. Now they are scaled back to a plain shift, exact at full coverage for all 8 bit levels.
@@ -327,12 +338,22 @@ Bugfixes, crash or hang on unusual parameters or input:
   row this could read up to ~120 bytes past the buffer, beyond the guaranteed 64 byte slack. The values were
   never used (output unchanged), but it could fault. Now every window start is checked.
   Existed since 3.7.6.
+- Fix: Histogram("audiolevels"): stack overflow (the host crashed) on a low frame rate with a high sample rate or
+  many channels. The audio of one frame (rate x channels x 2 bytes / fps) was allocated on the stack; above about
+  1 MB, the usual stack size of a Windows program, it overflowed. E.g. 5.1 48 kHz at fps 0.5 (a slide show with
+  2 s per image), or 5.1 96 kHz at 1 fps. The buffers are on the heap now.
+  Existed since classic AviSynth.
 
 Bugfixes, undefined behaviour, NaN parameters, cosmetics:
   Undefined behaviour (UB): an operation whose result the C++ standard leaves open, e.g. a NaN converted to an
   integer or a shift by 32 bits; the compiler may do anything. Here the result was not used or was the same on the
   tested platforms. Found by UndefinedBehaviorSanitizer (UBSan) builds.
 - Float parameters of the built-in filters which are not a number (NaN) or infinite give an error, when the filter uses them.
+- Fix: Normalize on a silent track (peak 0): factor = volume / 0, infinite: float output 0 * inf = NaN, 16 bit
+  int(inf * 131072) is undefined. The factor is 1.0 now, the track is left as it is.
+- Fix: Normalize, 16 bit: the peak search stopped at the first sample of 32767 or -32767 (an early exit, "full
+  scale reached"), but -32768 is larger: e.g. Normalize(0.5) of a full scale square wave gave -0.500015 instead of
+  -0.5. It stops only at -32768 now, nothing can exceed that.
 - Fix: resizers, Bob, and param1, param2, param3 of the ConvertTo... filters, AddBorders and LetterBox: NaN and Inf
   were accepted, the result was undefined and differed by platform. Now an error, as are src_left, src_top, src_width,
   src_height too large for the resizer.
