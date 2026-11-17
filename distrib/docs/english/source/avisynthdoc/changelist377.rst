@@ -22,6 +22,9 @@ Build environment, Interface
 - Fix: GCC build with LTO (link-time optimization) failed with "inlining failed in call to 'always_inline'
   ... target specific option mismatch" in the SSE4.1 Overlay/Layer mask row preparation (x86/x64).
   (`issue #531 <https://github.com/AviSynth/AviSynthPlus/issues/531>`_)
+- Fix: MinGW/llvm-mingw builds (Windows ARM64, GCC x86/x64) had no version resource in ``AviSynth.dll``, so the
+  File and Product version showed n/a. The resource is now compiled for MinGW too, as it is for MSVC. Its copyright
+  sign is written as ``(C)``, because llvm-rc rejects the cp1252 character. Existed since 3.4.0.
 - Linux/macOS: the core exports only the C API (``avs_*``) and ``CreateScriptEnvironment`` / ``CreateScriptEnvironment2``,
   as the Windows DLL does (about 5000 symbols before). Hidden default symbol visibility, and on ELF platforms
   (Linux, BSD) also a linker version script generated from ``avisynth_c.h``. Plugins no longer get the core's ``BitBlt``,
@@ -87,6 +90,10 @@ Bugs in normal use
 - Fix: Import of a script whose full path is exactly 260 characters long, or a UNC path (``\\server\share\...``)
   of 260 or more, failed with "couldn't open": the long path prefix was not added, or was wrong for UNC.
   Existed since 3.7.0 (long path support).
+- Fix: Windows ARM64 (and MinGW/GCC x86/x64) builds: the ``USER_CLASSIC_PLUGINS`` and ``MACHINE_CLASSIC_PLUGINS``
+  autoload folders were not expanded, ``ListAutoloadDirs`` showed ``<current folder>\USER_CLASSIC_PLUGINS\`` instead of
+  e.g. the ``plugins64`` folder. ARM64 now reads them from ``PluginDir2_5`` as x86/x64 MSVC builds do (the ARM64
+  installer sets it); GCC builds have no classic plugin folder, the macros are removed. Existed since 3.7.4.
 - Fix: non-Intel builds (aarch64): crash in YUV with alpha to RGB when the bit depth changes, e.g. ``ConvertToRGB32`` from
   10-16 bit or 32 bit float YUVA, or ``ConvertToPlanarRGBA(bits=8)``. Existed since 3.7.6.
 - Fix: YUV to planar RGB (and RGB to YUV/Y) conversion from 8-16 bit to 32 bit float, AVX2: memory
