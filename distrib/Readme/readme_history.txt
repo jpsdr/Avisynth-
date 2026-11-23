@@ -9,8 +9,27 @@ For online documentation check https://avisynthplus.readthedocs.io/en/latest/
 Actual:
 https://avisynthplus.readthedocs.io/en/latest/avisynthdoc/changelist377.html
 
-20261110 3.7.6.rXXXX (pre 3.7.7)
+20261123 3.7.6.r5024 (pre 3.7.7)
 --------------------------------
+TL;DR, the most important changes since 3.7.6 (details below):
+- Frame cache and Prefetch: AvsPmod bookmarks are cached again (regression of 3.7.6), stepping back after playing
+  no longer eats memory (#379), Prefetch follows any constant step (SelectEven, playing backward), random seeking
+  is quicker.
+- Non-ASCII names on a non-UTF-8 code page work again: autoload of .avsi files (#462), LoadPlugin from a folder like
+  C:\Videók\ (regressions of 3.7.6); ScriptDir/ScriptName were cut on CJK and UTF-8 code pages.
+- Crash fixes: conversions to 32 bit float (AVX2) on narrow clips, closing a script with Prefetch, YUVA to RGB on
+  aarch64, LoadPlugin(""), Histogram "audiolevels", and more.
+- Output changes (by design): chroma mask kernels of Overlay, Layer, Subtitle and Text on subsampled formats;
+  32 bit float limited range levels and rounding now match ConvertBits; YUV <-> RGB to float is always calculated
+  in float.
+- Same output on every CPU: several C vs SIMD vs NEON differences and random (unset) planes fixed.
+- NaN or infinite float parameters of the built-in filters are an error now.
+- New: _Range frame property (H.273 numbers, _ColorRange is its alias), AudioStats, ListAutoloadedFunctions.
+- Plugin authors: Linux/macOS core exports only the C API now, use AVS_PLUGIN_EXPORT with -fvisibility=hidden;
+  the C API loader moved from the installed headers to the FilterSDK/c_loader samples.
+- Windows packages: the default build is for Windows 10 and later, Windows 7 has its own _win7 installer; the XP
+  installer installs its VC++ redistributable now (it never did); no DevIL.dll in the system folder any more.
+
 Additions, changes:
 - Frame properties: _Range is added, the number follows ITU-T H.273, as in VapourSynth: 1 is full, 0 is limited.
   _ColorRange stays reserved and it is its older name with 0 and 1 swapped: the two are one property, the frame holds it
@@ -39,11 +58,63 @@ Additions, changes:
   The safety columns of the text bitmap are gone.
 - Subtitle(gdi=true): the chroma processing range has a one chroma block margin, for the same reason.
 
+- New ListAutoloadedFunctions(utf8): the names of the functions of the autoloaded plugins, one per line, exactly as
+  registered (spaces kept), both the plain and the canonical "<plugin file name>_<function>" names.
+  Why: $PluginFunctions$ is one string with the names separated by spaces, so a canonical name containing a space
+  (plugin DLL/.so file name with a space, e.g. "TimeStretch 泳装 ű.dll") could not be held in it: the space split it
+  into two entries. $PluginFunctions$ now writes such spaces as _ (see the fix below): one entry per name again, but
+  not the exact name, a script cannot call it in that form. ListAutoloadedFunctions gives the exact names; use
+  $Plugin!<name>!Param$ for the parameters of each name. The autoload must have run (AutoloadPlugins()).
 - New AudioStats(clip, float "threshold", bool "per_channel"): reads the audio once, returns its levels as a
   dictionary-style array at script load time: min, max, peak, peak_db, peak_sample, rms, rms_db, mean, clipped,
   loose_peak, loose_peak_db; per_channel=true adds "channels", keyed by the channel mask names (FL, FC, LFE...) or
   "0", "1"... Normalize uses the same peak search.
+- Frame cache sizing (LruCache.h), new algorithm. Every cache starts empty and sizes itself:
+  - Evicted frame numbers are remembered in a ghost list (hashed, max(1024, 4 x capacity) entries) with how many
+    times each was evicted.
+  - A request for a frame evicted at least once adds one slot, but at most 32 in a row ("unproven" growth).
+  - A request for a frame evicted at least twice proves steady reuse and resets that budget, so a cycle (bookmarks
+    visited in turn, a range played again) is cached as a whole.
+  - Patterns whose frames come back only once, at a growing distance, stop after 32 slots: stepping back after
+    playing (#379), Bob/Merge mixes (#270).
+  - Shrink: over a window of max(64, 4 x capacity) misses the deepest hit position is noted; if all hits came from
+    the front (deepest + 8 < capacity), up to a quarter of the slots is given back.
+  - When a cache grows to keep a frame, the caches below it in the same request do not grow for it. They still store
+    it at their current size (CACHE_FAST_START, default), or do not store it (SetCacheMode(CACHE_OPTIMAL_SIZE)).
+    From 3.6.1 to 3.7.6 CACHE_OPTIMAL_SIZE stopped the storing only after a growth and CACHE_FAST_START let the
+    whole chain grow.
+  The single per-frame threshold before could not tell these cases apart: "grow on the first re-request of an
+  evicted frame" (up to 3.7.5) grew without limit in #270 and #379; "on the second" (3.7.6) left AvsPmod bookmarks
+  uncached.
+  Measured with QTGMC(Preset="Fast").Prefetch(8) on a DV clip, AvsPmod access (script + RGB32 display output),
+  last cycle (3.7.6 -> 3.7.7, with the Prefetch change below):
+    30 bookmarks 100 frames apart, 6 cycles: 138 ms per jump, never cached -> 0 ms from the 3rd cycle, 284 MB
+    10 bookmarks: 131 ms -> 0 ms from the 3rd cycle
+    play 60 frames, step back, repeat (#379): 4.5 ms, 2.4 GB and still growing -> 0.06 ms from the 4th pass, 410 MB
+    player reading 28 frames ahead: same speed, 3.3 GB -> 339 MB
+    encoding 1000 frames: 7.7 s -> 5.6 s, 413 MB -> 301 MB
+  MDegrain3 / MDegrain6 (mvtools2, +-3 / +-6 frames) on a DV clip: 30 bookmarks 369 / 728 ms per jump -> 0 ms,
+  300 frames backward 25.0 / 50.4 s -> 6.5 / 12.9 s, encoding unchanged.
+  (issues #270, #379; doom9 AviSynth+ thread, gispos, 3.7.6 bookmark regression)
+- Prefetch: no frames are prefetched while no steady step is locked, except right after a short jump
+  (0 < |step| <= max(4, prefetch frames)). Before, every request prefetched n+1, n+2.. even after a jump to a
+  random place: work for frames nobody asked for, which kept the threads busy and pushed useful frames out of the
+  caches. Forward reading out of order (steps 1,3,1,3 of SelectEvery(4,0,1), or MT-like arrival) keeps its
+  read-ahead. The same frame requested again (a second output, e.g. AvsPmod's display clip) does not count as a
+  jump. QTGMC: 120 random jumps 18.4 s -> 11.0 s, AvsPmod 10 bookmarks 3.3 s -> 0.5 s; encoding, playing,
+  stepping unchanged.
+
 Build environment:
+- Fix: CMake with a single-configuration generator (Ninja, NMake) and MSVC, clang-cl or icx-cl, without
+  -DCMAKE_BUILD_TYPE: an unoptimized Debug build (/MDd /Zi /Ob0 /Od /RTC1, "-- Build type: Debug") instead of Release.
+  For MSVC, project() itself sets CMAKE_BUILD_TYPE to Debug on these generators, so the "if(NOT CMAKE_BUILD_TYPE)
+  -> Release" fallback added in 3.7.5 (after project()) never fired; it worked for GCC/Clang only. The default is set
+  before project() now, as a cache entry (visible in CMakeCache.txt, for GCC too); multi-config generators (Visual
+  Studio, Ninja Multi-Config, Xcode) are left alone. The CMake presets always gave a build type and were not affected.
+- Fix: the same builds warned D9025 "overriding '/EHs' with '/EHa'" for every file: CMake's default CMAKE_CXX_FLAGS
+  has /EHsc, the targets add /EHa. The Visual Studio generator merges both into one project setting and hid it.
+  /EHsc is removed from CMAKE_CXX_FLAGS after project() for MSVC-like compilers; all targets (core and plugins) keep
+  /EHa only. Found with the CMake build of AVSMeter, which got the same two fixes.
 - Fix #531: GCC build with LTO (-flto) failed at link time on x86/x64 Linux:
   "inlining failed in call to 'always_inline' prepare_effective_mask_for_row_float_sse41: target specific
   option mismatch". The force-inlined SSE4.1 function, defined in another source file, was called from a
@@ -78,12 +149,43 @@ Build environment:
   mixed up. The loader's avs_add_function(_r) now registers each one with its own user_data and passes the
   plugin's own user_data on to it.
 - C API loader: compiles in strict ISO C mode on Linux too (gcc -std=c11: PATH_MAX was missing).
+- Windows release: avisynth-build-win\make_release.bat (make_release.ps1) builds the whole release in one run:
+  dependencies from pinned sources (DevIL with its image libraries, SoundTouch, DirectShow base classes), all variants,
+  check stage (PDB names, Vista+ imports in the XP DLLs), files-only pack, PDB archives, installers, SHA-256 list.
+  Variants: default x86/x64 for Windows 10 and later (clang-cl with -ClangCL, then MSVC v145 is the _msvc download;
+  without -ClangCL MSVC v145 is the default); _win7 (v143 toolset 14.44 and its redistributable); _xp (v141_xp,
+  VC++ 14.27 redistributable); _arm64 (llvm-mingw). build_release.bat stays as it was.
+  See contributing/release_full_build.rst.
+- Windows installers: ImageSeq has DevIL and its image libraries (libpng, libjpeg-turbo, libtiff, JasPer, ...) linked
+  in statically, in every installer, ARM64 and XP included. No DevIL.dll is installed into the system folder any more.
+  XP: JasPer is patched to use GlobalMemoryStatusEx instead of the Vista+ GetPhysicallyInstalledSystemMemory; the
+  patch checks the source pattern and fails on a JasPer version where it does not match.
+- Installer script (avisynth+.iss): build folders (BuildDir32/BuildDir64), redistributable names (VcRedistX86/X64)
+  and the minimum Windows version (MinVer) are defines, so one script builds the Windows 10+, Windows 7 and XP
+  installers (avisynth+_arm64.iss: BuildDir64). Missing optional files (DevIL.dll, css) are skipped.
 
 Bugfixes:
   Most of these bugs were found by AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) builds, or by
   comparing the output of the different CPU paths, then analysed and fixed with AI tools. Some were reported by users.
 
 Bugfixes, bugs in normal use:
+- Fix: Prefetch pattern lock (Prefetcher.cpp): while unlocked, the step of each request was compared to the stored
+  step, but the new step was never stored. The stored step stayed 1 (or the last step seen while locked), so from
+  a cold start only step +1 could lock. SelectEven / SelectEvery(4) after Prefetch, playing backward, or a GUI
+  stepping by 2 never locked and kept prefetching n+1, n+2.., frames nobody asked for. Any constant step locks now
+  after 4 equal steps; a different step still locks when switched to while locked, as before.
+  QTGMC(Preset="Fast").Prefetch(8): step 2 3.9 s -> 2.7 s, step 4 7.4 s -> 4.2 s, 300 frames backward 6.4 s -> 2.1 s.
+  Existed since AviSynth+ MT (2014, "More intelligent pattern detection in Prefetcher").
+- Fix: AvsPmod with 10 or more bookmarks on a slow script (QTGMC) recalculated every bookmark on every visit: the
+  frame caches did not grow for them since the 3.7.6 change for #270/#379 (grow only for frames evicted twice).
+  See the new frame cache sizing above. Regression since 3.7.6.
+- Fix: near the SetMemoryMax limit (MC_NodAndExpandCache), a growing cache took one slot from the least recently
+  used cache of the device, but read the size of itself instead of that cache (cache-> instead of old_cache->), and
+  set the other cache's limit to that size - 1: it shrank too much, or not at all. Existed since AviSynth+ MT (2014).
+- Fix: the $PluginFunctions$ list, read by tools such as AVSMeter, split the function names of a plugin whose DLL
+  file name contains spaces (e.g. TimeStretch 泳装 ű.dll gave the entries 泳装 and ű_TimeStretch). The space is
+  written as _ in the listed name now, so every entry stays one token and the pairs stay aligned. The name
+  cannot be called from a script anyway. Existed since 3.7.6.
 - Fix #462 (part 2): autoload of .avsi files with non-ASCII names, e.g. "CleanÁrvíztűrőTükörfúrógép.avsi" or
   "Clean_SC(シーンチェンジフレーム置換).avsi" (report on Doom9). The first #462 fix (3.7.6) made autoload UTF-8, but
   passed the UTF-8 .avsi path to Import without utf8=true, so Import read it as ANSI. On a non-UTF-8 ANSI code page
@@ -256,10 +358,22 @@ Bugfixes, accuracy: rounding, limited range levels:
   input (_Range=0) to full range output, where the coefficients are scaled by 255/219: values above nominal white
   wrapped around, e.g. RGB 65535 gave Y -0.904 instead of 1.096 (SIMD; C was right with int64). Fixed by the
   float workflow above (16 bit RGB -> YUV/Y with integer output already used it for the same overflow reason).
+- Fix: the XP installer never installed its Visual C++ redistributable (14.27). The installer copied the files under
+  their versioned names (VC_redist_14.27.29114.0 x86/x64) while the [Run] section started VC_redist.x86.exe and
+  VC_redist.x64.exe, and IncludeVcRedist() returned true only when WITH_VC_REDIST (the modern redistributable) was
+  defined, not with WITH_VC_REDIST_XP. On an XP without the runtime, AviSynth+ did not start ("MSVCP140.dll was not
+  found"). Now the files get the started names (DestName) and the XP define enables them. Tested on a clean
+  Windows XP SP3. Existed in the 3.7.6 XP installer.
 
 Bugfixes, same output on every CPU, OS and compiler:
   The C, the x86 SIMD and the aarch64 NEON paths, or two runs of the same script, gave different output. Found by
   comparing them, and by the sanitizer builds (planes left unset kept the content of a reused frame buffer).
+- Fix: Tone() (Sine, Square, Triangle, Sawtooth): the samples depended on how the audio was requested. The phase
+  was accumulated sample by sample from the start of each request, so one long GetAudio and smaller requests, or
+  a seek, gave different last float bits. The phase is now computed from the absolute sample position,
+  strictly as in the formula of the Tone documentation. The difference was about 1e-12 at 440 Hz, inaudible,
+  but it made the output depend on the read pattern. The output is now deterministic for tests.
+  Existed since 2.5.4.
 - Fix: Expr: pow with a negative base, x86 JIT: it gave 2.4e38 on any power which was not a constant 2, 3 or 4. Now it follows
   IEEE 754 as the C paths do: an integer power has a real result (-2 ^ 3 is -8), a fractional power is NaN. Also
   0 ^ 0.25 was 3.3e-10, now 0. Results of a positive base are not changed.
@@ -359,6 +473,18 @@ Bugfixes, undefined behaviour, NaN parameters, cosmetics:
   Undefined behaviour (UB): an operation whose result the C++ standard leaves open, e.g. a NaN converted to an
   integer or a shift by 32 bits; the compiler may do anything. Here the result was not used or was the same on the
   tested platforms. Found by UndefinedBehaviorSanitizer (UBSan) builds.
+- Fix: AudioSamplesFromFrames (used by Trim, AudioDub, BlankClip, AssumeFPS and others): the 64 bit product of
+  frames, sample rate and frame rate denominator overflowed on degenerate frame rates. E.g. at 192 kHz with a
+  denominator of about 2^30, after about 46 000 frames, the sample positions became garbage or negative. The
+  result is now exact, saturated to the 64 bit maximum when it does not fit. Other values are not changed.
+  Existed since classic AviSynth.
+- Fix: FramesFromAudioSamples (used by several filters, e.g. Trim and Histogram): samples * fps_numerator
+  overflowed 64 bits for a large frame rate numerator and many samples (above about 2^31 samples with a numerator
+  near 2^32). The result is now exact, saturated to the int range. Other values are not changed.
+  Existed since classic AviSynth.
+- Fix: the C API helpers avs_audio_samples_from_frames and avs_frames_from_audio_samples in avisynth_c.h had the same
+  overflow. They are inline functions, so a plugin gets the fix only when it is rebuilt with the new header.
+  Plain C99, no 128 bit integer type. Existed since classic AviSynth.
 - Float parameters of the built-in filters which are not a number (NaN) or infinite give an error, when the filter uses them.
 - Fix: Normalize on a silent track (peak 0): factor = volume / 0, infinite: float output 0 * inf = NaN, 16 bit
   int(inf * 131072) is undefined. The factor is 1.0 now, the track is left as it is.
@@ -388,6 +514,13 @@ Bugfixes, undefined behaviour, NaN parameters, cosmetics:
   Why: C vs SIMD comparison tests no longer show these 1 LSB differences.
 
 Optimizations:
+- Optimization: frame allocation near the SetMemoryMax limit (GetNewFrame): the caches are shrunk, then a frame
+  buffer released by them is reused, then the other unused buffers are freed. Before, ShrinkCache freed every unused
+  buffer of the device first (free threshold 0 on CPU), also those of the requested size, so the reuse step found
+  nothing and a new buffer was allocated: a free + malloc for every frame while at the limit.
+- Optimization: autoloading plugins: the function list $PluginFunctions$ is published once at the end of the autoload
+  instead of being saved again after each function. Its memory and time grew with the square of the number of
+  functions (1332 names of a plugin set: 26 MB and 0.04 s, now 1 MB and 0.005 s). The list is the same.
 - Optimization: Text and Subtitle(gdi=false): non-fading luma loops skip empty bitmap bytes; chroma walks only the
   set bits of the bitmap, without branching on them; rectangle weights are computed once per column.
   About 20-35% quicker without halo and fading (19 lines of text, frame copies excluded).
@@ -402,6 +535,13 @@ Optimizations:
   lanes; now both use 4 x 32 bit lanes. Output is unchanged (old C vs new C bit identical; 0 / 32768 / 65535 edge
   values in all planes, 8 matrices, 16 bit to 8-16 bit and float).
 
+Documentation:
+- New: contributing/release_full_build.rst, the full Windows release build (make_release.bat): installers,
+  files-only pack, PDB files and checksums in one run, dependencies from pinned sources, version bump and tagging order.
+- Resize, UserDefined2Resize: link to the external command line tool SincDownsizeCoeffs by DTL (MIT license, C++17
+  source, https://github.com/DTL2020/SincDownsizeCoeffs/releases), which computes b, c and s for different use
+  cases. Input: a mode (1 to 4), the downsize ratio and the overshoot of the source in percent, measured on the
+  source upsampled with SincResize to 2x or more. Doom9: https://forum.doom9.org/showthread.php?p=2052516#post2052516
 
 20261025 3.7.6.r4909
 --------------------

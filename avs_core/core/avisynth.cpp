@@ -95,6 +95,11 @@
 
 #include "FilterGraph.h"
 #include "DeviceManager.h"
+#ifdef AVS_CACHE_EXPERIMENT
+// helper/cache_harness statistics, defined in cache.cpp
+#include <atomic>
+extern std::atomic<unsigned long long> g_mem_allocs, g_mem_shrinks, g_mem_frees, g_mem_peak;
+#endif
 #include "AVSMap.h"
 #include "../convert/frame_prop_enums.h"
 
@@ -911,6 +916,7 @@ public:
   void SetGraphAnalysis(bool enable) { graphAnalysisEnable = enable; }
 
   char* ListAutoloadDirs();
+  char* ListAutoloadedFunctions();
 
   void IncEnvCount() { InterlockedIncrement(&EnvCount); }
   void DecEnvCount() { InterlockedDecrement(&EnvCount); }
@@ -1055,7 +1061,8 @@ private:
   VideoFrame* GetNewFrame(size_t vfb_size, size_t margin, Device* device);
   VideoFrame* GetFrameFromRegistry(size_t vfb_size, Device* device);
   void RegisterSubFrameInRegistry(size_t vfb_size, VideoFrameBuffer* vfb, VideoFrame* new_frame);
-  void ShrinkCache(Device* device);
+  int ShrinkCache(Device* device);
+  void FreeUnusedFrameBuffers(Device* device);
   VideoFrame* AllocateFrame(size_t vfb_size, size_t margin, Device* device);
   std::recursive_mutex memory_mutex;
   std::recursive_mutex invoke_mutex; // 3.7.2
@@ -2150,6 +2157,11 @@ public:
   char* __stdcall ListAutoloadDirs()
   {
     return core->ListAutoloadDirs();
+  }
+
+  char* __stdcall ListAutoloadedFunctions()
+  {
+    return core->ListAutoloadedFunctions();
   }
 
   void __stdcall SetFilterProp(const char* filter, const char* key, const AVSValue& value, int mode)
@@ -3675,6 +3687,14 @@ char* ScriptEnvironment::ListAutoloadDirs()
   return threadEnv->SaveString(str.c_str(), (int)str.size());
 }
 
+char* ScriptEnvironment::ListAutoloadedFunctions()
+{
+  std::unique_lock<std::recursive_mutex> env_lock(plugin_mutex);
+
+  std::string str = plugin_manager->ListAutoloadedFunctions();
+  return threadEnv->SaveString(str.c_str(), (int)str.size());
+}
+
 void ScriptEnvironment::AutoloadPlugins()
 {
   std::unique_lock<std::recursive_mutex> env_lock(plugin_mutex);
@@ -3752,6 +3772,14 @@ VideoFrame* ScriptEnvironment::AllocateFrame(size_t vfb_size, size_t margin, Dev
   }
 
   device->memory_used += vfb_size;
+#ifdef AVS_CACHE_EXPERIMENT
+  g_mem_allocs++;
+  {
+    const unsigned long long used = device->memory_used.load();
+    unsigned long long peak = g_mem_peak.load();
+    while (used > peak && !g_mem_peak.compare_exchange_weak(peak, used)) {}
+  }
+#endif
   vfb->Attach(threadEnv->GetCurrentGraphNode());
 
   // automatically inserts keys if they not exist!
@@ -4148,13 +4176,24 @@ VideoFrame* ScriptEnvironment::GetNewFrame(size_t vfb_size, size_t margin, Devic
   * Couldn't allocate, shrink cache and get more unused frames
   * -----------------------------------------------------------
   */
-  ShrinkCache(device);
+  const int shrinkcount = ShrinkCache(device);
 
   /* -----------------------------------------------------------
-  *   Try to return an unused frame again
+  *   Try to return an unused frame again: a buffer just released
+  *   by the shrunk caches is reused before anything is freed
   * -----------------------------------------------------------
   */
   frame = GetFrameFromRegistry(vfb_size, device);
+
+  /* -----------------------------------------------------------
+  *   Then free the other unused buffers (any size) to get back
+  *   under the memory limit. Freeing first would also delete the
+  *   buffers of the requested size, and we would allocate a new one.
+  * -----------------------------------------------------------
+  */
+  if (shrinkcount != 0)
+    FreeUnusedFrameBuffers(device);
+
   if (frame != NULL)
     return frame;
 
@@ -4189,6 +4228,9 @@ VideoFrame* ScriptEnvironment::GetNewFrame(size_t vfb_size, size_t margin, Devic
       if (device == vfb->device && 0 == vfb->refcount) // vfb refcount check
       {
         vfb->device->memory_used -= vfb->GetDataSize(); // frame->vfb->GetDataSize();
+#ifdef AVS_CACHE_EXPERIMENT
+        g_mem_frees++;
+#endif
         delete vfb;
         for (auto &it3: it2->second)
         {
@@ -4246,7 +4288,10 @@ VideoFrame* ScriptEnvironment::GetNewFrame(size_t vfb_size, size_t margin, Devic
   return NULL;
 }
 
-void ScriptEnvironment::ShrinkCache(Device *device)
+// Takes one slot from each cache on 'device' that holds frames (least recently used caches first
+// in the registry order). Released frames go back to the frame registry; returns the number of
+// caches shrunk. FreeUnusedFrameBuffers frees the unused buffers afterwards.
+int ScriptEnvironment::ShrinkCache(Device *device)
 {
   /* -----------------------------------------------------------
   *   Shrink cache to keep memory limit
@@ -4276,16 +4321,22 @@ void ScriptEnvironment::ShrinkCache(Device *device)
 
   if (shrinkcount != 0)
   {
+#ifdef AVS_CACHE_EXPERIMENT
+    g_mem_shrinks++;
+#endif
     OneTimeLogTicket ticket(LOGTICKET_W1003);
     LogMsgOnce(ticket, LOGLEVEL_WARNING, "Caches have been shrunk due to low memory limit. This will probably degrade performance. You can try increasing the limit using SetMemoryMax().");
   }
+  return shrinkcount;
+}
 
+void ScriptEnvironment::FreeUnusedFrameBuffers(Device* device)
+{
   /* -----------------------------------------------------------
   * Count up free_count and free if it exceeds the threshold
   * -----------------------------------------------------------
   */
   // Free up in one pass in FrameRegistry2
-  if (shrinkcount)
   {
     _RPT1(0, "EnsureMemoryLimit GC start: memused=%" PRIu64 "\n", device->memory_used.load());
     [[maybe_unused]] int freed_vfb_count = 0;
@@ -4309,6 +4360,9 @@ void ScriptEnvironment::ShrinkCache(Device *device)
           device->memory_used -= vfb->GetDataSize();
 #ifdef _DEBUG
           VFBStorage *_vfb = vfb;
+#endif
+#ifdef AVS_CACHE_EXPERIMENT
+          g_mem_frees++;
 #endif
           delete vfb;
           ++freed_vfb_count;
@@ -4902,7 +4956,7 @@ void* ScriptEnvironment::ManageCache(int key, void* data) {
         if (old_cache->GetDevice() != device) {
           continue;
         }
-        int osize = cache->SetCacheHints(CACHE_GET_SIZE, 0);
+        int osize = old_cache->SetCacheHints(CACHE_GET_SIZE, 0);
         if (osize != 0)
         {
           old_cache->SetCacheHints(CACHE_SET_MAX_CAPACITY, osize - 1);

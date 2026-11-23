@@ -1,6 +1,26 @@
 Changes from 3.7.6 to 3.7.7
 ---------------------------
 
+TL;DR
+~~~~~
+The most important changes since 3.7.6; details in the sections below.
+
+- Frame cache and Prefetch: AvsPmod bookmarks are cached again (regression of 3.7.6), stepping back after playing
+  no longer eats memory (#379), Prefetch follows any constant step (SelectEven, playing backward), random seeking is quicker.
+- Non-ASCII names on a non-UTF-8 code page work again: autoload of ``.avsi`` files (#462), ``LoadPlugin`` from a
+  folder like ``C:\Videók\`` (regressions of 3.7.6); ``ScriptDir``/``ScriptName`` were cut on CJK and UTF-8 code pages.
+- Crash fixes: conversions to 32 bit float (AVX2) on narrow clips, closing a script with ``Prefetch``, YUVA to RGB on
+  aarch64, ``LoadPlugin("")``, Histogram ``audiolevels``, and more.
+- Output changes (by design): chroma mask kernels of Overlay, Layer, Subtitle and Text on subsampled formats;
+  32 bit float limited range levels and rounding now match ConvertBits; YUV <-> RGB to float is always calculated in float.
+- Same output on every CPU: several C vs SIMD vs NEON differences and random (unset) planes fixed.
+- NaN or infinite float parameters of the built-in filters are an error now.
+- New: ``_Range`` frame property (H.273 numbers, ``_ColorRange`` is its alias), ``AudioStats``, ``ListAutoloadedFunctions``.
+- Plugin authors: Linux/macOS core exports only the C API now, use ``AVS_PLUGIN_EXPORT`` with ``-fvisibility=hidden``;
+  the C API loader moved from the installed headers to the ``FilterSDK/c_loader`` samples.
+- Windows packages: the default build is for Windows 10 and later, Windows 7 has its own ``_win7`` installer; the XP
+  installer installs its VC++ redistributable now (it never did); no ``DevIL.dll`` in the system folder any more.
+
 Additions, changes
 ~~~~~~~~~~~~~~~~~~
 - Overlay, Layer, Subtitle, Text: chroma of subsampled formats: low-pass filter kernels instead of point samples.
@@ -14,14 +34,36 @@ Additions, changes
   ``_ColorRange`` stays reserved and it is its older name with 0 and 1 swapped: the two are one property, the frame holds it
   as ``_Range``. Plugins and scripts of any version reach it by both names. Key lists give ``_Range`` only, ``propGetAll``
   and ``propShow`` both. See :doc:`frame properties <syntax/syntax_internal_functions_frame_properties>`.
+- New ``ListAutoloadedFunctions(utf8)``: the names of the functions of the autoloaded plugins, one per line, exactly
+  as registered. Needed because ``$PluginFunctions$`` is one space separated string: the canonical name
+  ``<plugin file name>_<function>`` of a plugin whose DLL/.so file name has a space could not be held in it, the space
+  split it in two. There such spaces are now written as ``_`` (one entry per name, but not the exact name, it cannot be
+  called in that form). Use ``$Plugin!<name>!Param$`` for the parameters of each name.
+  See :doc:`plugins <syntax/syntax_plugins>`.
 - New :doc:`AudioStats <corefilters/audiostats>`: audio levels (peak, RMS, clipped samples, loose peak), also per
   channel, as an array of named values at script load time.
+- Frame cache sizing: a cache grows when an evicted frame is requested again, but at most 32 slots in a row
+  unless frames come back steadily (evicted at least twice); it gives slots back when only its front is used.
+  AvsPmod bookmarks (30 bookmarks on QTGMC: 138 ms per jump in 3.7.6, cached from the 3rd cycle on) and stepping
+  back after playing (#379: 2.4 GB and still growing, now 410 MB) are both cached; encoding is unchanged or faster.
+  When a cache grows to keep a frame, the caches below it do not grow for it; ``SetCacheMode(CACHE_OPTIMAL_SIZE)``
+  makes them not store it either. See :ref:`SetCacheMode <setcachemode>`.
+  (`issue #270 <https://github.com/AviSynth/AviSynthPlus/issues/270>`_,
+  `issue #379 <https://github.com/AviSynth/AviSynthPlus/issues/379>`_)
+- Prefetch: while no steady step is found (random jumps, bookmarks, seeking), no frames are prefetched, except
+  right after a jump of at most max(4, frames) frames. Random seeking on QTGMC 40% quicker, AvsPmod bookmark
+  cycling about 6x quicker; playing, encoding and out-of-order forward reading are unchanged.
 
 Build environment, Interface
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 - Fix: GCC build with LTO (link-time optimization) failed with "inlining failed in call to 'always_inline'
   ... target specific option mismatch" in the SSE4.1 Overlay/Layer mask row preparation (x86/x64).
   (`issue #531 <https://github.com/AviSynth/AviSynthPlus/issues/531>`_)
+- Fix: CMake with Ninja (or NMake) and MSVC, clang-cl or icx-cl, without ``-DCMAKE_BUILD_TYPE``, gave an unoptimized
+  Debug build (``/Od /RTC1``) instead of Release; and every file warned D9025 "overriding '/EHs' with '/EHa'".
+  The Release default is set before ``project()`` now, and CMake's default ``/EHsc`` is removed (the targets use
+  ``/EHa``). The Visual Studio generator and GCC/Clang were not affected. The Release default of 3.7.5 never worked
+  for MSVC; both existed since the CMake build has /EHa.
 - Fix: MinGW/llvm-mingw builds (Windows ARM64, GCC x86/x64) had no version resource in ``AviSynth.dll``, so the
   File and Product version showed n/a. The resource is now compiled for MinGW too, as it is for MSVC. Its copyright
   sign is written as ``(C)``, because llvm-rc rejects the cp1252 character. Existed since 3.4.0.
@@ -59,6 +101,14 @@ Build environment, Interface
   plugin's own ``user_data`` on to it.
   See :ref:`Dynamic loading<c_api_dynamic_loading>`.
 - C API loader: compiles in strict ISO C mode on Linux too (``gcc -std=c11``: ``PATH_MAX`` was missing).
+- Windows release: ``make_release.bat`` builds the whole release in one run (all variants, installers, files-only pack,
+  PDB files, checksums). The default x86/x64 build is for Windows 10 and later (clang-cl with ``-ClangCL``, MSVC v145 without it;
+  MSVC is then the ``_msvc`` download); Windows 7 has its own build and installer (``_win7``, v143 toolset 14.44 and its
+  redistributable); XP and ARM64 are separate packages. See :doc:`contributing/release_full_build`.
+- Windows installers: ImageSeq has DevIL and its image libraries linked in statically, in every installer
+  (ARM64 and XP included): no ``DevIL.dll`` is installed into the system folder any more.
+- Installer script: build folders, redistributable names and the minimum Windows version are defines, so one script builds
+  the Windows 10+, Windows 7, XP and ARM64 installers.
 
 Bugfixes
 ~~~~~~~~
@@ -68,6 +118,18 @@ the output of the different CPU paths, then analysed and fixed with AI tools. So
 
 Bugs in normal use
 ^^^^^^^^^^^^^^^^^^
+- Fix: Prefetch locked only to step +1 from a cold start: SelectEven/SelectEvery after Prefetch, playing backward or
+  a GUI stepping by 2 kept prefetching the next frames, which nobody asked for. Any constant step locks now
+  (step 2: 30% quicker, step 4 and backward about 45% on QTGMC). Existed since AviSynth+ MT (2014).
+- Fix: AvsPmod with many bookmarks (10 or more on QTGMC) recalculated every bookmark on every visit since 3.7.6, the
+  frame caches did not grow for them. Regression since 3.7.6, see the frame cache sizing change above.
+- Fix: near the ``SetMemoryMax`` limit, a growing cache took a slot from the least recently used cache using its own
+  size instead of the other cache's size, so the other cache shrank too much or not at all. Existed since AviSynth+
+  MT (2014).
+- Fix: the ``$PluginFunctions$`` list, read by tools such as AVSMeter, split the function names of a plugin whose DLL
+  file name contains spaces (e.g. ``TimeStretch 泳装 ű.dll`` gave the entries ``泳装`` and ``ű_TimeStretch``). The
+  space is written as ``_`` in the listed name now, so every entry stays one token and the pairs stay aligned.
+  The name cannot be called from a script anyway. Existed since 3.7.6.
 - Fix #462 (part 2): autoload of ``.avsi`` files with non-ASCII names (e.g. Hungarian or Japanese characters) failed
   with "Import: couldn't open" on a non-UTF-8 ANSI code page. Regression since 3.7.6; 3.7.5 crashed on names
   outside the ANSI code page. (`issue #462 <https://github.com/AviSynth/AviSynthPlus/issues/462>`_)
@@ -187,6 +249,12 @@ Same output on every CPU, OS and compiler
 The C, the x86 SIMD and the aarch64 NEON paths, or two runs of the same script, gave different output. Found by
 comparing them, and by the sanitizer builds (planes left unset kept the content of a reused frame buffer).
 
+- Fix: ``Tone()`` (Sine, Square, Triangle, Sawtooth): the samples depended on how the audio was requested. The phase
+  was accumulated sample by sample from the start of each request, so one long ``GetAudio`` and smaller requests, or
+  a seek, gave different last float bits. The phase is now computed from the absolute sample position,
+  strictly as in the formula of :doc:`Tone <corefilters/tone>`. The difference was about 1e-12 at 440 Hz,
+  inaudible, but it made the output depend on the read pattern. The output is now deterministic for tests.
+  Existed since 2.5.4.
 - Fix: Expr: ``pow`` with a negative base, x86 JIT: it gave 2.4e38 on any power which was not a constant 2, 3 or 4. Now it follows
   IEEE 754 as the C paths do: an integer power has a real result (``-2 ^ 3`` is -8), a fractional power is NaN. Also
   ``0 ^ 0.25`` was 3.3e-10, now 0. Results of a positive base are not changed.
@@ -255,12 +323,24 @@ loop. Most need an unusual parameter or input.
   or many channels, when one frame's audio was above about 1 MB: e.g. 5.1 48 kHz at fps 0.5 (2 s per image), or
   5.1 96 kHz at 1 fps. Existed since classic AviSynth.
 
-Undefined behaviour, NaN parameters, cosmetics
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Undefined behaviour, NaN or degenerated parameters, cosmetics
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Undefined behaviour (UB): an operation whose result the C++ standard leaves open, e.g. a NaN converted to an
 integer or a shift by 32 bits; the compiler may do anything. Here the result was not used or was the same on the
-tested platforms. Found by UndefinedBehaviorSanitizer (UBSan) builds.
+tested platforms. Some were found by UndefinedBehaviorSanitizer (UBSan) builds.
 
+- Fix: ``AudioSamplesFromFrames`` (used by Trim, AudioDub, BlankClip, AssumeFPS and others): the 64 bit product of
+  frames, sample rate and frame rate denominator overflowed on degenerate frame rates. E.g. at 192 kHz with a
+  denominator of about 2^30, after about 46 000 frames, the sample positions became garbage or negative. The
+  result is now exact, saturated to the 64 bit maximum when it does not fit. Other values are not changed.
+  Existed since classic AviSynth.
+- Fix: ``FramesFromAudioSamples`` (used by several filters, e.g. Trim and Histogram): ``samples * fps_numerator``
+  overflowed 64 bits for a large frame rate numerator and many samples (above about 2^31 samples with a numerator
+  near 2^32). The result is now exact, saturated to the int range. Other values are not changed.
+  Existed since classic AviSynth.
+- Fix: the C API helpers ``avs_audio_samples_from_frames`` and ``avs_frames_from_audio_samples`` in ``avisynth_c.h``
+  had the same overflow. They are inline functions, so a plugin gets the fix only when it is rebuilt with the new
+  header. Plain C99, no 128 bit integer type. Existed since classic AviSynth.
 - Float parameters of the built-in filters which are not a number (NaN) or infinite give an error, when the filter uses them.
 - Fix: Normalize on a silent track: the factor was infinite, float output NaN, 16 bit undefined. The track is left
   as it is now.
@@ -277,9 +357,18 @@ tested platforms. Found by UndefinedBehaviorSanitizer (UBSan) builds.
   read back exactly; only the last digit was superfluous. Existed since 3.7.6.
 - Planar YUV <-> RGB conversions, float inside calculation (``quality=true``, full range, 16 bit RGB to YUV, float
   sources): the C path computes in the same order as SSE2 (pre-scaled coefficients), so C vs SIMD tests compare clean.
+- Fix: the XP installer never installed its Visual C++ redistributable (14.27): the file was copied under its versioned name
+  while the installer started ``VC_redist.x86.exe``/``VC_redist.x64.exe``, and the redistributable was included only in builds
+  defined with the modern one. On a clean XP, AviSynth+ then did not start (``MSVCP140.dll`` not found). Existed in the 3.7.6 XP installer.
 
 Optimizations
 ~~~~~~~~~~~~~
+- Optimization: near the ``SetMemoryMax`` limit, a frame buffer released by shrinking the caches is reused before the
+  unused buffers are freed. Before, all unused buffers were freed first, also those of the requested size, and a new
+  one was allocated for every frame.
+- Optimization: autoloading plugins: the function list ``$PluginFunctions$`` is published once at the end of the
+  autoload instead of being saved again after each function. Its memory and time grew with the square of the number
+  of functions (1332 names of a plugin set: 26 MB and 0.04 s, now 1 MB and 0.005 s). The list is the same.
 - Optimization: Text and Subtitle(gdi=false): luma loops skip empty bitmap bytes, chroma visits only the set bits
   of the bitmap. About 20-35% quicker (19 lines of text, frame copies excluded) without halo and fading.
 - Optimization: x86 SSE2 (no SSE4.1) emulation of unsigned 16 bit min/max (Limiter, Blur/Sharpen, 10-14 bit
@@ -290,11 +379,14 @@ Optimizations
 
 Documentation
 ~~~~~~~~~~~~~
+- New: :doc:`Full Windows release build (make_release.bat) <contributing/release_full_build>`: the release
+  installers, files-only pack, PDB files and checksums in one run, with all dependencies (DevIL and its image
+  libraries, SoundTouch, the DirectShow base classes) built from pinned sources; version bump and tagging order.
+- :doc:`Resize <corefilters/resize>`: ``UserDefined2Resize`` links the external tool SincDownsizeCoeffs
+  (by DTL), which computes ``b``, ``c`` and ``s`` from the downsize ratio and the overshoot of the source.
 
 Please report bugs at `github AviSynthPlus page`_ - or - `Doom9's AviSynth+
 forum`_
-
-$Date: 2026/11/10 21:00:00 $
 
 .. _github AviSynthPlus page:
     https://github.com/AviSynth/AviSynthPlus
