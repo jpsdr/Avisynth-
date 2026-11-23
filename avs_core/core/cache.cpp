@@ -53,9 +53,52 @@
 #endif
 
 
+#ifdef AVS_CACHE_EXPERIMENT
+// Cache growth experiment build only (helper/cache_harness).
+#include <atomic>
+#include <vector>
+#include <string>
+#include <cstdlib>
+
+// Prefetcher totals over all Prefetch instances, see Prefetcher.cpp
+std::atomic<unsigned long long> g_prefetch_jobs{ 0 }; // frames queued for prefetching
+std::atomic<unsigned long long> g_prefetch_hits{ 0 }; // requests found ready in a Prefetcher cache
+// frame memory, see avisynth.cpp: new buffers allocated, ShrinkCache calls that shrank caches, buffers freed
+std::atomic<unsigned long long> g_mem_allocs{ 0 }, g_mem_shrinks{ 0 }, g_mem_frees{ 0 };
+// highest memory_used seen at an allocation since the last CacheExperimentStats call
+std::atomic<unsigned long long> g_mem_peak{ 0 };
+
+static std::mutex g_stat_mutex;
+static std::vector<AvsCache*> g_stat_caches;
+static int g_stat_next_id = 0;
+
+// CacheExperimentStats(): one line per live AvsCache, see AvsCache::StatLine
+static AVSValue __cdecl CacheExperimentStats(AVSValue, void*, IScriptEnvironment* env_)
+{
+  InternalEnvironment* env = GetAndRevealCamouflagedEnv(env_);
+  Device* dev = env->GetCurrentDevice();
+  std::string s;
+  {
+    std::lock_guard<std::mutex> lock(g_stat_mutex);
+    for (AvsCache* c : g_stat_caches)
+      s += c->StatLine();
+  }
+  // last line: Prefetcher totals (all Prefetch instances)
+  s += "prefetch;" + std::to_string(g_prefetch_jobs.load()) + ";" + std::to_string(g_prefetch_hits.load()) + "\n";
+  s += "mem;" + std::to_string(g_mem_allocs.load()) + ";" + std::to_string(g_mem_shrinks.load()) + ";" + std::to_string(g_mem_frees.load())
+    + ";" + std::to_string(g_mem_peak.load() >> 20) + ";" + std::to_string(dev->memory_used.load() >> 20)
+    + ";" + std::to_string(dev->memory_max >> 20) + "\n"; // MB
+  g_mem_peak = dev->memory_used.load();
+  return env->SaveString(s.c_str(), (int)s.size());
+}
+#endif
+
 extern const AVSFunction Cache_filters[] = {
   { "Cache", BUILTIN_FUNC_PREFIX, "c[name]s", CacheGuard::Create },
   { "InternalCache", BUILTIN_FUNC_PREFIX, "c[name]s", CacheGuard::Create },
+#ifdef AVS_CACHE_EXPERIMENT
+  { "CacheExperimentStats", BUILTIN_FUNC_PREFIX, "", CacheExperimentStats },
+#endif
   { 0 }
 };
 
@@ -91,6 +134,13 @@ struct CachePimpl
   int64_t ac_expected_next;
   int ac_too_small_count;
   long ac_currentscore;
+
+#ifdef AVS_CACHE_EXPERIMENT
+  std::atomic<uint64_t> stat_requests{ 0 };     // GetFrame calls
+  std::atomic<uint64_t> stat_hits{ 0 };         // served from the cache
+  std::atomic<uint64_t> stat_miss_stored{ 0 };  // child called, result stored
+  std::atomic<uint64_t> stat_miss_nocache{ 0 }; // child called, not stored (capacity 0 or suppressed)
+#endif
 
   CachePimpl(const PClip& _child, CacheMode mode) :
     child(_child),
@@ -148,10 +198,41 @@ AvsCache::AvsCache(const PClip& _child, Device* device, std::mutex& CacheGuardMu
   default:
     env->ThrowError("Cache: Filter returned invalid response to CACHE_GETCHILD_AUDIO_MODE. %d", childAudioPolicy);
   }
+#ifdef AVS_CACHE_EXPERIMENT
+  {
+    std::lock_guard<std::mutex> lock(g_stat_mutex);
+    stat_id = ++g_stat_next_id;
+    g_stat_caches.push_back(this);
+  }
+#endif
 }
+
+#ifdef AVS_CACHE_EXPERIMENT
+// id;name;width;height;capacity;requested_capacity;size;ghost_capacity;
+// requests;hits;miss_stored;miss_nocache;ghost_hits;grows;evictions;shrinks
+std::string AvsCache::StatLine() const
+{
+  const auto& vc = *_pimpl->VideoCache;
+  char buf[512];
+  snprintf(buf, sizeof(buf), "%d;%s;%d;%d;%zu;%zu;%zu;%zu;%llu;%llu;%llu;%llu;%zu;%zu;%zu;%zu\n",
+    stat_id, stat_name.empty() ? "?" : stat_name.c_str(), _pimpl->vi.width, _pimpl->vi.height,
+    vc.capacity(), vc.requested_capacity(), vc.size(), vc.ghost_capacity(),
+    (unsigned long long)_pimpl->stat_requests.load(), (unsigned long long)_pimpl->stat_hits.load(),
+    (unsigned long long)_pimpl->stat_miss_stored.load(), (unsigned long long)_pimpl->stat_miss_nocache.load(),
+    vc.stat_ghost_hits, vc.stat_grows, vc.stat_evictions, vc.stat_shrinks);
+  return buf;
+}
+#endif
 
 AvsCache::~AvsCache()
 {
+#ifdef AVS_CACHE_EXPERIMENT
+  {
+    std::lock_guard<std::mutex> lock(g_stat_mutex);
+    for (auto it = g_stat_caches.begin(); it != g_stat_caches.end(); ++it)
+      if (*it == this) { g_stat_caches.erase(it); break; }
+  }
+#endif
   _RPT5(0, "AvsCache::AvsCache unregister. cache_id=%p child=%p w=%d h=%d VideoCacheSize=%Iu\n", (void *)this, (void *)_pimpl->child, _pimpl->vi.width, _pimpl->vi.height, _pimpl->VideoCache->size()); // P.F.
   Env->ManageCache(MC_UnRegisterCache, reinterpret_cast<void*>(this));
   delete _pimpl;
@@ -178,6 +259,9 @@ PVideoFrame __stdcall AvsCache::GetFrame(int n, IScriptEnvironment* env_)
   LruCache<size_t, PVideoFrame>::handle cache_handle;
 
   CacheStack cache_stack(env);
+#ifdef AVS_CACHE_EXPERIMENT
+  _pimpl->stat_requests++;
+#endif
 
 #ifdef _DEBUG
   std::chrono::time_point<std::chrono::high_resolution_clock> t_start, t_end;
@@ -210,6 +294,9 @@ PVideoFrame __stdcall AvsCache::GetFrame(int n, IScriptEnvironment* env_)
 #ifdef _DEBUG
         snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame LRU_LOOKUP_NOT_FOUND Start: [%s] n=%6d child=%p\n", name.c_str(), n, (void*)_pimpl->child); // P.F.
         _RPT0(0, buf.get());
+#endif
+#ifdef AVS_CACHE_EXPERIMENT
+        _pimpl->stat_miss_stored++;
 #endif
         //cache_handle.first->value = _pimpl->child->GetFrame(n, env);
         result = _pimpl->child->GetFrame(n, env); // P.F. fill result immediately
@@ -252,6 +339,9 @@ PVideoFrame __stdcall AvsCache::GetFrame(int n, IScriptEnvironment* env_)
     }
   case LRU_LOOKUP_FOUND_AND_READY:
     {
+#ifdef AVS_CACHE_EXPERIMENT
+      _pimpl->stat_hits++;
+#endif
       // theoretically cache_handle here may point to wrong entry,
       // because the lock in lookup is released before this readout
       // solution:
@@ -272,6 +362,9 @@ PVideoFrame __stdcall AvsCache::GetFrame(int n, IScriptEnvironment* env_)
 #ifdef _DEBUG
     snprintf(buf.get(), BUFSIZE, "AvsCache::GetFrame <Before GetFrame> LRU_LOOKUP_NO_CACHE: [%s] n=%6d child=%p\n", name.c_str(), n, (void*)_pimpl->child); // P.F.
     _RPT0(0, buf.get());
+#endif
+#ifdef AVS_CACHE_EXPERIMENT
+    _pimpl->stat_miss_nocache++;
 #endif
     result = _pimpl->child->GetFrame(n, env);
 #ifdef _DEBUG
@@ -522,10 +615,15 @@ int __stdcall AvsCache::SetCacheHints(int cachehints, int frame_range)
       return 2;
       break;
 
+    // CACHE_WINDOW (and CACHE_25_RANGE, mapped to it): the 2.x way a filter told its child cache how many
+    // consecutive frames it reads per output frame (e.g. TemporalSoften: 2*radius+1). Ignored: the cache size
+    // is found from the requests. Tried as a minimum capacity under memory pressure (2026-11, 8K at
+    // SetMemoryMax 2-4 GB): the window was kept but nothing measurable changed, so it stays a no-op.
+    // Filters keep sending it, it is the only place where they declare their window.
+    case CACHE_WINDOW:
     case CACHE_GENERIC:
     case CACHE_FORCE_GENERIC:
     case CACHE_NOTHING:
-    case CACHE_WINDOW:
     case CACHE_PREFETCH_FRAME:          // Queue request to prefetch frame N.
     case CACHE_PREFETCH_GO:             // Action video prefetches.
       break;
@@ -651,6 +749,9 @@ PClip CacheGuard::GetCache(IScriptEnvironment* env_, bool use_child_if_notfound)
   if (hints.AudioPolicy != hints.default_AudioPolicy || hints.AudioSize != hints.default_AudioSize)
     cache->SetCacheHints(hints.AudioPolicy, hints.AudioSize);
 
+#ifdef AVS_CACHE_EXPERIMENT
+  cache->stat_name = name;
+#endif
   deviceCaches.emplace_back(device, cache);
   return deviceCaches.back().second;
 }
@@ -829,10 +930,10 @@ int __stdcall CacheGuard::SetCacheHints(int cachehints, int frame_range)
     return 2;
     break;
 
+  case CACHE_WINDOW: // ignored, see AvsCache::SetCacheHints
   case CACHE_GENERIC:
   case CACHE_FORCE_GENERIC:
   case CACHE_NOTHING:
-  case CACHE_WINDOW:
   case CACHE_PREFETCH_FRAME:          // Queue request to prefetch frame N.
   case CACHE_PREFETCH_GO:             // Action video prefetches.
     break;

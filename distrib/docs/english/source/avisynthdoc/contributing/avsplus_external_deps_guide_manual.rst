@@ -689,6 +689,15 @@ deflate
         mkdir x64 x86
 
 
+.. Note::
+    (2026, ``make_release.bat``) libdeflate 1.26 and newer require a C11 compiler, which for
+    Visual Studio means 2019 v16.8 or newer: with ``v141_xp`` (the VS 2017 compiler) the build stops
+    at ``#error "MSVC versions older than Visual Studio 2019 v16.8 are no longer supported"``.
+    For XP use libdeflate 1.25 (VS 2015 or newer): ``git checkout v1.25`` after the clone.
+    ``helpers\makedevil.ps1`` does this for ``-Toolset v141_xp``.
+..
+
+
 x86-64
 ++++++
 
@@ -785,6 +794,15 @@ zstd
         mkdir zstd-build && ^
         cd zstd-build && ^
         mkdir x64 x86
+
+
+.. Note::
+    (2026, ``make_release.bat``) For XP add ``-DZSTD_MULTITHREAD_SUPPORT:bool=off`` to the cmake
+    lines below. zstd's multithreading uses Windows condition variables
+    (``InitializeConditionVariable`` etc.), which exist only from Vista on. The build succeeds with
+    ``v141_xp`` without any message, but a DLL linking it (ImageSeq) does not load on XP
+    ("entry point not found"). libtiff needs only the single-threaded zstd.
+..
 
 
 x86-64
@@ -1064,6 +1082,44 @@ JasPer
 
         cd %AVS_DEPS_BUILD_HOME%\avsplus-build-deps\jasper
         sed -e '97s/^^/\/\//' -e '659,669s/^^/\/\//' src/libjasper/base/jas_malloc.c
+
+
+.. Note::
+    (2026, ``make_release.bat``, JasPer 4.2.9) The kludge above comments out the include of
+    ``sysinfoapi.h`` and the Windows branch of ``jas_get_total_mem_size()``, which calls
+    ``GetPhysicallyInstalledSystemMemory`` (Vista SP1 and newer). The function then returns 0
+    (memory size unknown), and JasPer additionally warns on stderr, on every jp2 read or write, that
+    its memory limit "exceeds system memory size (... > 0)". ``helpers\makedevil.ps1``
+    (``-Toolset v141_xp``) instead removes only the include and
+    replaces the call with ``GlobalMemoryStatusEx`` (available on XP), so JasPer still knows the
+    memory size::
+
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        if (!GlobalMemoryStatusEx(&ms)) {
+            return 0;
+        }
+        return (ms.ullTotalPhys < SIZE_MAX) ? JAS_CAST(size_t, ms.ullTotalPhys) : SIZE_MAX;
+
+    The line numbers in the ``sed`` command belong to one JasPer version, so check them before running
+    it, and the result after. Before (in 4.2.9 this prints line 97 for the include, 659 for the Windows
+    branch and 669 for the end of the ``return``; other numbers mean the file has changed, and the command
+    would comment out the wrong lines and still compile)::
+
+        grep -n -E "sysinfoapi\.h|^#elif defined\(_WIN32\)|: SIZE_MAX;" src/libjasper/base/jas_malloc.c
+
+    After (no live line may call the Vista+ function, else ``ImageSeq.dll`` imports it and does not
+    load on XP; this must print nothing)::
+
+        grep -v "^//" src/libjasper/base/jas_malloc.c | grep GetPhysicallyInstalledSystemMemory
+
+    ``helpers\makedevil.ps1`` does not use line numbers: it matches the include and the body of the query
+    by pattern and stops with an error unless it finds exactly one include and one body, the body is short
+    and contains the Vista+ call, the call is gone afterwards, ``GlobalMemoryStatusEx`` is used once and the
+    braces of the file stay balanced. A newer JasPer that changes this function therefore fails the build
+    instead of producing a wrong patch. Checks of the result: the XP DLL import check in
+    ``make_release.ps1`` (Vista+ imports) and the round-trip test of ImageSeq on XP.
+..
 
 
 x86-64
